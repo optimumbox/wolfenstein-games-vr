@@ -90,6 +90,7 @@ impl Game for Wolf {
             &PRESENT,
             &eye_site::EYES,
             &LOOK,
+            &cooking::body_forward::MOVE_HEADING_COMPONENT,
             &GUNS,
             &GUN,
             &HAND_RIG,
