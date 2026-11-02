@@ -52,11 +52,19 @@ pub const DLSS: Opt = opt(
 )
 .on(Shown::Rendering)
 .only_when("stereo", "same");
+/// Contrast-adaptive sharpening after DLSS (as Killing Floor 2 VR's): DLSS's own sharpening is gone
+/// from its newer models.
+pub const DLSS_SHARPNESS: Opt =
+    opt("dlss_sharpness", "DLSS sharpness", "Sharpens the upscaled image. 0 turns sharpening off.", Kind::Number { min: 0.0, max: 1.0, step: 0.05, default: 0.5 })
+        .on(Shown::Rendering)
+        .only_when("stereo", "same");
 
-/// DLSS settings (`dlss`, and `dlss_jitter_sign` on the command line only).
+/// DLSS settings (`dlss`, `dlss_sharpness`, and `dlss_jitter_sign` on the command line only).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Dlss {
     pub quality: monaka_dlss11::Quality,
+    /// CAS sharpening 0..1 after DLSS (`dlss_sharpness`; 0 turns it off).
+    pub sharpness: Option<f32>,
     /// 1 or -1: whether DLSS is told the content shift or its opposite.
     pub jitter_sign: f32,
 }
@@ -135,6 +143,7 @@ impl EyeSettings {
             framegen: FrameGenerator::chosen(&FRAMEGEN, options) == FrameGenerator::Fsr,
             dlss: options.text("dlss").and_then(monaka_dlss11::Quality::parse).map(|quality| Dlss {
                 quality,
+                sharpness: Some(options.number("dlss_sharpness", 0.0, 1.0, 0.5)).filter(|&s| s > 0.0),
                 jitter_sign: if options.number("dlss_jitter_sign", -1.0, 1.0, 1.0) < 0.0 { -1.0 } else { 1.0 },
             }),
             units_per_metre: UNITS_PER_METRE,

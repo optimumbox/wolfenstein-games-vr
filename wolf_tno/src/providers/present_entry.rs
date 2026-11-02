@@ -108,8 +108,11 @@ fn dlss(start: &Start<'_, Wolf>) -> Option<GlDlss> {
         log!("DLSS is off: no eye size asked for");
         return None;
     };
-    let pack = Module::containing(dlss as *const () as usize).and_then(|m| m.path()).and_then(|p| p.parent().map(std::path::Path::to_path_buf));
-    let dlls = start.options.text("dlss_dll").map(std::path::PathBuf::from).or(pack)?;
+    let Some(dlls) = dlss_folder(start) else {
+        log!("DLSS is off: {DLSS_DLL} was not found beside the pack");
+        return None;
+    };
+    log!("DLSS model from {}", dlls.display());
     eye_site::arm_dlss(settings.quality);
     crate::providers::window_size::arm_dlss(settings.quality, display);
     let leak = |p: std::path::PathBuf| -> &'static std::path::Path { Box::leak(p.into_boxed_path()) };
@@ -121,7 +124,43 @@ fn dlss(start: &Start<'_, Wolf>) -> Option<GlDlss> {
         dlls: leak(dlls),
         data: leak(start.session.dir().join("ngx")),
         jitter_sign: settings.jitter_sign,
+        sharpness: settings.sharpness,
     })
+}
+
+const DLSS_DLL: &str = "nvngx_dlss.dll";
+
+/// The folder holding NVIDIA's DLSS model: the `dlss_dll` option's, else the installed pack's. The
+/// launcher runs a copy of the producer from the run folder, so the pack's own folder is read from
+/// the run log's `producer:` line, then the copy's folder and Monaka's usual pack folder are tried.
+fn dlss_folder(start: &Start<'_, Wolf>) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let mut tried: Vec<PathBuf> = start.options.text("dlss_dll").map(PathBuf::from).into_iter().collect();
+    let run_log = std::fs::read_to_string(start.session.dir().join("monaka.log")).unwrap_or_default();
+    tried.extend(producer_folder(&run_log));
+    tried.extend(Module::containing(dlss as *const () as usize).and_then(|m| m.path()).and_then(|p| p.parent().map(Path::to_path_buf)));
+    tried.extend(std::env::var_os("LOCALAPPDATA").map(|l| PathBuf::from(l).join(r"monaka\games\wolfenstein-games-vr")));
+    tried.into_iter().find(|dir| dir.join(DLSS_DLL).is_file())
+}
+
+/// The producer's folder from the run log's header (`producer: <path> sha256 ...`), with
+/// `%USERPROFILE%` put back.
+fn producer_folder(run_log: &str) -> Option<std::path::PathBuf> {
+    let line = run_log.lines().take(20).find_map(|l| l.split_once(" producer: ").map(|(_, rest)| rest))?;
+    let path = line.rsplit_once(" sha256 ").map_or(line, |(path, _)| path).trim();
+    let path = match (path.strip_prefix("%USERPROFILE%"), std::env::var("USERPROFILE")) {
+        (Some(rest), Ok(profile)) => format!("{profile}{rest}"),
+        _ => path.to_owned(),
+    };
+    std::path::Path::new(&path).parent().map(std::path::Path::to_path_buf)
+}
+
+#[cfg(test)]
+#[test]
+fn the_producer_folder_comes_from_the_run_log_header() {
+    let log = "    0.005 game: x\n    0.005 producer: C:\\Packs\\wolf pack\\monaka_wolf_tno.dll sha256 F247\n";
+    assert_eq!(producer_folder(log), Some(std::path::PathBuf::from(r"C:\Packs\wolf pack")));
+    assert_eq!(producer_folder("    0.005 game: x\n"), None);
 }
 
 /// The rate line's addition: the view builds and how they were drawn.

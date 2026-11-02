@@ -61,7 +61,7 @@ use monaka_core::sync::Locked;
 pub const EYES: Component<Wolf> = Component {
     name: "eyes",
     features: &[Feature::Stereo],
-    options: &[crate::eyes::STEREO, crate::eyes::FSR, crate::eyes::FSR_SCALE, crate::eyes::FSR_SHARPNESS, crate::eyes::FRAMEGEN, crate::eyes::DLSS, DOMINANT_EYE, HEAD_MOVEMENT, EYE_SEPARATION],
+    options: &[crate::eyes::STEREO, crate::eyes::FSR, crate::eyes::FSR_SCALE, crate::eyes::FSR_SHARPNESS, crate::eyes::FRAMEGEN, crate::eyes::DLSS, crate::eyes::DLSS_SHARPNESS, DOMINANT_EYE, HEAD_MOVEMENT, EYE_SEPARATION],
     needs: &[Need::On(&crate::PRESENT)],
     settings: |options, manifest| {
         EyeSettings::from_options(options, manifest);
