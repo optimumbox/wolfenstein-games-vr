@@ -111,3 +111,27 @@ pass is worth building. Doing it means drawing both eyes from the first pass int
 of the eye targets (gl_Layer from the vertex shader) and skipping the second pass's scene draws;
 the engine draws with NV bindless calls, so it may sample the eye targets through handles the copies
 would have to stand in for (not yet checked).
+
+## Layered build (2026-11-02)
+
+Built as above: every texture is bound by name (`glBindMultiTextureEXT`), no bindless handles. The
+eye textures are stood in for by two-layer arrays (`layers.rs`) with a 2D view per layer; the
+engine's framebuffers get a layered stand-in and one per layer. The converted vertex shader writes
+`gl_Layer = 0` with `secondary_view_offset = 1`, so the second view lands in layer 1. Each pass
+begins with a colour+depth clear of fb 5; the left eye's pass draws its scene stretch layered with
+the eye matrix on, the right eye's pass skips the same stretch's draws and clears, and both passes
+draw as the engine does from the stretch's end (the first other draw into an eye texture). At
+`SwapBuffers` the last layer is copied back into the engine's textures (the depth Monaka reads).
+
+Result: 90.0 pairs/s, render-thread CPU 5-6.5 ms (was 11.5).
+
+The right eye's pass then issued a quarter of the left's draws, even before the stretch's end. It
+was not occlusion queries (none issued, `ARB` or `NV`), nor the 160x60 image read back each pass
+(fb 28): with nothing skipped the counts were whole, and with the `r_skip*GPUCulling` cvars set
+they were whole too (at 64 pairs/s: everything drawn). The engine's GPU culling tests are draws
+of the stretch, bounding boxes with colour and depth writes off (programs 4 and 122, about 480 a
+frame); skipped, the right eye's culling found nothing visible. Draws writing neither colour nor
+depth are now drawn in the right eye's pass: its counts match the left's, still 90.0 pairs/s.
+
+Still to check in the headset: the right eye's image (its culling tests run against its layer as
+the left pass left it, the whole scene rather than the part drawn so far).
