@@ -112,6 +112,13 @@ impl Steps {
     /// The rate after a measure at `now`: the game thread's promise (`holds` frames a second), the
     /// frames `achieved` a second, up to `ceiling`.
     pub fn next(&mut self, holds: f64, achieved: f64, ceiling: i32, now: Instant) -> i32 {
+        // A rate off the headset's refresh (taken before the headset's timing came) is behind by
+        // its nature: straight to the best rate on it, nothing learnt.
+        if self.current != OWN && !paced(self.current) {
+            (self.rises, self.behind) = (0, 0);
+            self.current = fitting(holds, ceiling);
+            return self.current;
+        }
         // Behind at the game's own rate there is nowhere lower to go: nothing is learnt.
         let behind = achieved < f64::from(self.current) * BEHIND && self.current > OWN;
         self.behind = if behind { self.behind + 1 } else { 0 };

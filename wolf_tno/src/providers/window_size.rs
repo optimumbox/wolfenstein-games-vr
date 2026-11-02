@@ -22,6 +22,7 @@ use monaka_producer::log;
 use monaka_stereo::eye_size::{self, Ask, Resizes};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::*};
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{HDC, WindowFromDC};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -74,7 +75,41 @@ pub fn ready(width: u32, height: u32) -> bool {
         Some((quality, display)) if eye == monaka_dlss11::render_size(display, quality) => display,
         _ => eye,
     };
-    eye_size::ready::<Wolf>(presented)
+    let open = eye_size::ready::<Wolf>(presented);
+    if open {
+        keep_size(eye);
+    }
+    open
+}
+
+/// The eye size asked for ([`Resizes::ask`]), once asked.
+static ASKED: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+/// When the window was last asked for its size again, and how often.
+static REASKED: Mutex<(Option<Instant>, u64)> = Mutex::new((None, 0));
+/// The window is asked for its size again at most this often.
+const REASK_EVERY: Duration = Duration::from_secs(3);
+/// Times logged at most.
+const REASKS_LOGGED: u64 = 10;
+
+/// After the switch: the game going back to a size of its own (its video settings applied again as
+/// a level loads), the window asked for the eye size again.
+fn keep_size(eye: (u32, u32)) {
+    let Some(asked) = *ASKED.locked() else { return };
+    if eye == drawn_eye(asked) {
+        return;
+    }
+    let mut reasked = REASKED.locked();
+    if reasked.0.is_some_and(|at| at.elapsed() < REASK_EVERY) {
+        return;
+    }
+    reasked.0 = Some(Instant::now());
+    if matches!(<Wolf as Resizes>::ask(asked, eye), Ask::Asked) {
+        reasked.1 += 1;
+        if reasked.1 <= REASKS_LOGGED {
+            let want = drawn_eye(asked);
+            log!("eye size: the game drew {}x{} eyes again; asked for {}x{} once more", eye.0, eye.1, want.0, want.1);
+        }
+    }
 }
 
 /// DLSS at `quality` for eyes of `display`: the window is made the render size.
@@ -112,6 +147,7 @@ impl Resizes for Wolf {
         if window == 0 {
             return Ask::NotYet;
         }
+        *ASKED.locked() = Some(eye);
         let (width, height) = window_for(drawn_eye(eye), SIDE_BY_SIDE.load(Acquire));
         std::thread::spawn(move || resize(window, width, height));
         Ask::Asked

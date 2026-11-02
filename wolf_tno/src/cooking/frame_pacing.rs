@@ -83,15 +83,18 @@ fn quiet() {
     set_pacing(false);
 }
 
-/// The headset's refresh period (nanoseconds) while frames are paced to it.
-pub fn pacing_period() -> Option<u64> {
-    PACING.load(Acquire).then(|| STATE.locked().period).filter(|&p| p > 0)
+/// The headset's refresh period (nanoseconds) as the viewer last said it, while frames may be paced
+/// to it (whether or not the game's rate lets them be yet).
+pub fn headset_period() -> Option<u64> {
+    let timing = crate::on(FRAME_PACING_AT).then(|| PAIRS.head().display()).flatten()?;
+    (now_ns().saturating_sub(timing.woke_ns) < STALE_NS && timing.period_ns > 0).then_some(timing.period_ns)
 }
 
-/// Whether the game's rate `hz` keeps frames on the refresh while they are paced (any rate when
-/// they are not): the frame rate takes only such rates.
+/// Whether the game's rate `hz` keeps frames on the headset's refresh (any rate when they cannot be
+/// paced): the frame rate takes only such rates. Pacing starts only at such a rate, so this asks the
+/// headset, not the pacing (96 on a 90 Hz headset is never paced, and shows 90 of its frames).
 pub fn allows(hz: i32) -> bool {
-    pacing_period().is_none_or(|period| refreshes_per_frame(period, hz).is_some())
+    headset_period().is_none_or(|period| refreshes_per_frame(period, hz).is_some())
 }
 
 /// How long the last frame waited for its slot (microseconds), taken once.
