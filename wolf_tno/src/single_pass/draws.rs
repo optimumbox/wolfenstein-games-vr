@@ -62,7 +62,18 @@ struct Counts {
     clears_skipped: u64,
     frames_on: u64,
     frames_off: u64,
+    /// The draws seen, then those passing each test in turn: a converted program, perspective
+    /// rows, a viewport in one half, an eye target.
+    draws: u64,
+    converted: u64,
+    perspective: u64,
+    in_a_half: u64,
+    on_eye_target: u64,
 }
+
+/// The live frame whose viewports and draws are written to the log, one line each.
+const TRACED_FRAME: u64 = 600;
+const TRACED_LINES: usize = 400;
 
 struct State {
     gl: Option<Gl>,
@@ -90,6 +101,8 @@ struct State {
     counts: Counts,
     agreeing: (usize, usize),
     logged: Option<Instant>,
+    live_frames: u64,
+    trace: Option<Vec<String>>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -119,6 +132,8 @@ fn state() -> State {
         counts: Counts::default(),
         agreeing: (0, 0),
         logged: None,
+        live_frames: 0,
+        trace: None,
     }
 }
 
@@ -171,6 +186,15 @@ pub fn frame(on: bool) {
             return;
         }
     }
+    state.live_frames += 1;
+    if let Some(lines) = state.trace.take() {
+        log!("single pass: frame {} traced (eye targets {}x{}):
+  {}", state.live_frames - 1, state.size.0, state.size.1, lines.join("
+  "));
+    }
+    if state.live_frames == TRACED_FRAME {
+        state.trace = Some(Vec::new());
+    }
     let size = monaka_stereo::same_frame::gl::frame_size().unwrap_or((0, 0));
     state.size = (size.0 as i32, size.1 as i32);
     let pairs: Vec<(Rows, Rows)> = state.left.iter().zip(&state.right).filter(|(l, r)| l.0 == r.0).map(|(l, r)| (l.1, r.1)).collect();
@@ -201,6 +225,16 @@ pub fn frame(on: bool) {
             c.clears_skipped,
             state.agreeing.0,
             state.agreeing.1
+        );
+        log!(
+            "single pass: {} draws, {} with a converted program, {} perspective, {} in a half, {} on an eye target ({}x{})",
+            c.draws,
+            c.converted,
+            c.perspective,
+            c.in_a_half,
+            c.on_eye_target,
+            state.size.0,
+            state.size.1
         );
     }
 }
@@ -269,6 +303,16 @@ type DrawRangeElementsBaseVertexFn = unsafe extern "system" fn(u32, u32, u32, i3
 type DrawElementsInstancedFn = unsafe extern "system" fn(u32, i32, u32, *const c_void, i32);
 type DrawElementsInstancedBaseVertexFn = unsafe extern "system" fn(u32, i32, u32, *const c_void, i32, i32);
 type DrawArraysInstancedFn = unsafe extern "system" fn(u32, i32, i32, i32);
+type DrawElementsIndirectFn = unsafe extern "system" fn(u32, u32, *const c_void);
+type MultiDrawElementsIndirectFn = unsafe extern "system" fn(u32, u32, *const c_void, i32, i32);
+type DrawArraysIndirectFn = unsafe extern "system" fn(u32, *const c_void);
+type MultiDrawArraysIndirectFn = unsafe extern "system" fn(u32, *const c_void, i32, i32);
+type MultiDrawElementsFn = unsafe extern "system" fn(u32, *const i32, u32, *const *const c_void, i32);
+type MultiDrawElementsBaseVertexFn = unsafe extern "system" fn(u32, *const i32, u32, *const *const c_void, i32, *const i32);
+type DrawElementsInstancedBaseInstanceFn = unsafe extern "system" fn(u32, i32, u32, *const c_void, i32, u32);
+type DrawElementsInstancedBaseVertexBaseInstanceFn = unsafe extern "system" fn(u32, i32, u32, *const c_void, i32, i32, u32);
+type DrawArraysInstancedBaseInstanceFn = unsafe extern "system" fn(u32, i32, i32, i32, u32);
+type MultiDrawElementsIndirectBindlessFn = unsafe extern "system" fn(u32, u32, *const c_void, i32, i32, i32);
 
 static USE_PROGRAM: Original<UseProgramFn> = Original::new();
 static UNIFORM_4FV: Original<Uniform4fvFn> = Original::new();
@@ -284,6 +328,16 @@ static DRAW_RANGE_ELEMENTS_BASE_VERTEX: Original<DrawRangeElementsBaseVertexFn> 
 static DRAW_ELEMENTS_INSTANCED: Original<DrawElementsInstancedFn> = Original::new();
 static DRAW_ELEMENTS_INSTANCED_BASE_VERTEX: Original<DrawElementsInstancedBaseVertexFn> = Original::new();
 static DRAW_ARRAYS_INSTANCED: Original<DrawArraysInstancedFn> = Original::new();
+static DRAW_ELEMENTS_INDIRECT: Original<DrawElementsIndirectFn> = Original::new();
+static MULTI_DRAW_ELEMENTS_INDIRECT: Original<MultiDrawElementsIndirectFn> = Original::new();
+static DRAW_ARRAYS_INDIRECT: Original<DrawArraysIndirectFn> = Original::new();
+static MULTI_DRAW_ARRAYS_INDIRECT: Original<MultiDrawArraysIndirectFn> = Original::new();
+static MULTI_DRAW_ELEMENTS: Original<MultiDrawElementsFn> = Original::new();
+static MULTI_DRAW_ELEMENTS_BASE_VERTEX: Original<MultiDrawElementsBaseVertexFn> = Original::new();
+static DRAW_ELEMENTS_INSTANCED_BASE_INSTANCE: Original<DrawElementsInstancedBaseInstanceFn> = Original::new();
+static DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE: Original<DrawElementsInstancedBaseVertexBaseInstanceFn> = Original::new();
+static DRAW_ARRAYS_INSTANCED_BASE_INSTANCE: Original<DrawArraysInstancedBaseInstanceFn> = Original::new();
+static MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS: Original<MultiDrawElementsIndirectBindlessFn> = Original::new();
 
 /// The slots in the executable's data holding the driver's `address`.
 fn slots(exe: &Module, address: usize) -> Vec<usize> {
@@ -349,6 +403,16 @@ fn install() -> bool {
     draws += hook!(DRAW_ELEMENTS_INSTANCED, "glDrawElementsInstanced", draw_elements_instanced as DrawElementsInstancedFn, false);
     draws += hook!(DRAW_ELEMENTS_INSTANCED_BASE_VERTEX, "glDrawElementsInstancedBaseVertex", draw_elements_instanced_base_vertex as DrawElementsInstancedBaseVertexFn, false);
     draws += hook!(DRAW_ARRAYS_INSTANCED, "glDrawArraysInstanced", draw_arrays_instanced as DrawArraysInstancedFn, false);
+    draws += hook!(DRAW_ELEMENTS_INDIRECT, "glDrawElementsIndirect", draw_elements_indirect as DrawElementsIndirectFn, false);
+    draws += hook!(MULTI_DRAW_ELEMENTS_INDIRECT, "glMultiDrawElementsIndirect", multi_draw_elements_indirect as MultiDrawElementsIndirectFn, false);
+    draws += hook!(DRAW_ARRAYS_INDIRECT, "glDrawArraysIndirect", draw_arrays_indirect as DrawArraysIndirectFn, false);
+    draws += hook!(MULTI_DRAW_ARRAYS_INDIRECT, "glMultiDrawArraysIndirect", multi_draw_arrays_indirect as MultiDrawArraysIndirectFn, false);
+    draws += hook!(MULTI_DRAW_ELEMENTS, "glMultiDrawElements", multi_draw_elements as MultiDrawElementsFn, false);
+    draws += hook!(MULTI_DRAW_ELEMENTS_BASE_VERTEX, "glMultiDrawElementsBaseVertex", multi_draw_elements_base_vertex as MultiDrawElementsBaseVertexFn, false);
+    draws += hook!(DRAW_ELEMENTS_INSTANCED_BASE_INSTANCE, "glDrawElementsInstancedBaseInstance", draw_elements_instanced_base_instance as DrawElementsInstancedBaseInstanceFn, false);
+    draws += hook!(DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE, "glDrawElementsInstancedBaseVertexBaseInstance", draw_elements_instanced_base_vertex_base_instance as DrawElementsInstancedBaseVertexBaseInstanceFn, false);
+    draws += hook!(DRAW_ARRAYS_INSTANCED_BASE_INSTANCE, "glDrawArraysInstancedBaseInstance", draw_arrays_instanced_base_instance as DrawArraysInstancedBaseInstanceFn, false);
+    draws += hook!(MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS, "glMultiDrawElementsIndirectBindlessNV", multi_draw_elements_indirect_bindless as MultiDrawElementsIndirectBindlessFn, false);
     log!("single pass: the engine's GL functions found: {}", found.join(", "));
     if draws == 0 {
         log!("single pass: off: none of the engine's draw functions found");
@@ -432,14 +496,31 @@ fn half(state: &State, x: i32, w: i32) -> Half {
 fn draw() -> bool {
     let mut guard = STATE.locked();
     let Some(state) = guard.as_mut() else { return true };
-    if !state.live || !state.programs.contains_key(&state.current) {
+    if !state.live {
         return true;
     }
+    state.counts.draws += 1;
+    if !state.programs.contains_key(&state.current) {
+        if let Some(trace) = state.trace.as_mut().filter(|t| t.len() < TRACED_LINES) {
+            trace.push(format!("draw program {} (not converted) fb {}", state.current, draw_framebuffer()));
+        }
+        return true;
+    }
+    state.counts.converted += 1;
     let current = state.current;
     let rows = state.programs[&current].rows;
     let perspective = rows[3][..3].iter().any(|v| v.abs() > 1e-6);
     let side = half(state, state.viewport[0], state.viewport[2]);
     let target = if perspective && side != Half::Neither { eye_target(state) } else { None };
+    state.counts.perspective += u64::from(perspective);
+    state.counts.in_a_half += u64::from(perspective && side != Half::Neither);
+    state.counts.on_eye_target += u64::from(target.is_some());
+    if state.trace.as_ref().is_some_and(|t| t.len() < TRACED_LINES) {
+        let framebuffer = draw_framebuffer();
+        let width = eye_target(state).map_or_else(|| format!("{:?}", state.widths.get(&framebuffer)), |_| "eye".to_owned());
+        let line = format!("draw program {current} w row {:?} viewport {:?} fb {framebuffer} width {width} phase {:?}", rows[3], state.viewport, state.phase);
+        state.trace.as_mut().expect("checked").push(line);
+    }
     let Some(gl) = state.gl.as_ref() else { return true };
     let program = state.programs.get_mut(&current).expect("looked up above");
     match (target, side, state.phase) {
@@ -563,6 +644,9 @@ unsafe extern "system" fn viewport(x: i32, y: i32, w: i32, h: i32) {
     let flight = InFlight::enter();
     if let Some(state) = STATE.locked().as_mut() {
         state.viewport = [x, y, w, h];
+        if let Some(trace) = state.trace.as_mut().filter(|t| t.len() < TRACED_LINES) {
+            trace.push(format!("viewport {x} {y} {w} {h}"));
+        }
         // glViewport sets every viewport: viewport 1 follows before the next stereo draw.
         state.index_one = true;
         match half(state, x, w) {
@@ -638,3 +722,13 @@ draw_detour!(
     (mode: u32, count: i32, kind: u32, indices: *const c_void, instances: i32, base: i32)
 );
 draw_detour!(draw_arrays_instanced, DRAW_ARRAYS_INSTANCED, DrawArraysInstancedFn, (mode: u32, first: i32, count: i32, instances: i32));
+draw_detour!(draw_elements_indirect, DRAW_ELEMENTS_INDIRECT, DrawElementsIndirectFn, (mode: u32, kind: u32, indirect: *const c_void));
+draw_detour!(multi_draw_elements_indirect, MULTI_DRAW_ELEMENTS_INDIRECT, MultiDrawElementsIndirectFn, (mode: u32, kind: u32, indirect: *const c_void, draws: i32, stride: i32));
+draw_detour!(draw_arrays_indirect, DRAW_ARRAYS_INDIRECT, DrawArraysIndirectFn, (mode: u32, indirect: *const c_void));
+draw_detour!(multi_draw_arrays_indirect, MULTI_DRAW_ARRAYS_INDIRECT, MultiDrawArraysIndirectFn, (mode: u32, indirect: *const c_void, draws: i32, stride: i32));
+draw_detour!(multi_draw_elements, MULTI_DRAW_ELEMENTS, MultiDrawElementsFn, (mode: u32, counts: *const i32, kind: u32, indices: *const *const c_void, draws: i32));
+draw_detour!(multi_draw_elements_base_vertex, MULTI_DRAW_ELEMENTS_BASE_VERTEX, MultiDrawElementsBaseVertexFn, (mode: u32, counts: *const i32, kind: u32, indices: *const *const c_void, draws: i32, bases: *const i32));
+draw_detour!(draw_elements_instanced_base_instance, DRAW_ELEMENTS_INSTANCED_BASE_INSTANCE, DrawElementsInstancedBaseInstanceFn, (mode: u32, count: i32, kind: u32, indices: *const c_void, instances: i32, first: u32));
+draw_detour!(draw_elements_instanced_base_vertex_base_instance, DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE, DrawElementsInstancedBaseVertexBaseInstanceFn, (mode: u32, count: i32, kind: u32, indices: *const c_void, instances: i32, base: i32, first: u32));
+draw_detour!(draw_arrays_instanced_base_instance, DRAW_ARRAYS_INSTANCED_BASE_INSTANCE, DrawArraysInstancedBaseInstanceFn, (mode: u32, first: i32, count: i32, instances: i32, base: u32));
+draw_detour!(multi_draw_elements_indirect_bindless, MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS, MultiDrawElementsIndirectBindlessFn, (mode: u32, kind: u32, indirect: *const c_void, draws: i32, stride: i32, buffers: i32));
