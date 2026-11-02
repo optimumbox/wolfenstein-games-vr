@@ -64,6 +64,12 @@ pub const CAP_MARGIN: f64 = 0.97;
 /// in a row (one slow measure is a hitch: a load, a new upscaler, a shader).
 pub const BEHIND: f64 = 0.97;
 pub const BEHIND_WINDOWS: u32 = 2;
+/// Paced to the headset's refresh, a frame late misses a whole refresh: a hitch of two in a measure
+/// is already 4% behind, while a PC that cannot hold the rate misses most refreshes. So there the
+/// frames are behind only under this share, this many measures in a row (a 60 on a 90 Hz headset
+/// shows its frames for one refresh, then two: a judder worse than the hitches).
+pub const BEHIND_PACED: f64 = 0.85;
+pub const BEHIND_PACED_WINDOWS: u32 = 4;
 /// How long a measure runs, and how many in a row with room to spare before the rate rises.
 pub const WINDOW: Duration = Duration::from_millis(500);
 pub const RISE_WINDOWS: u32 = 4;
@@ -112,6 +118,11 @@ impl Steps {
     /// The rate after a measure at `now`: the game thread's promise (`holds` frames a second), the
     /// frames `achieved` a second, up to `ceiling`.
     pub fn next(&mut self, holds: f64, achieved: f64, ceiling: i32, now: Instant) -> i32 {
+        self.step(holds, achieved, ceiling, now, crate::cooking::frame_pacing::headset_period().is_some())
+    }
+
+    /// [`Steps::next`], the frames paced to the headset's refresh or not (`on_grid`).
+    fn step(&mut self, holds: f64, achieved: f64, ceiling: i32, now: Instant, on_grid: bool) -> i32 {
         // A rate off the headset's refresh (taken before the headset's timing came) is behind by
         // its nature: straight to the best rate on it, nothing learnt.
         if self.current != OWN && !paced(self.current) {
@@ -120,9 +131,10 @@ impl Steps {
             return self.current;
         }
         // Behind at the game's own rate there is nowhere lower to go: nothing is learnt.
-        let behind = achieved < f64::from(self.current) * BEHIND && self.current > OWN;
+        let (share, windows) = if on_grid { (BEHIND_PACED, BEHIND_PACED_WINDOWS) } else { (BEHIND, BEHIND_WINDOWS) };
+        let behind = achieved < f64::from(self.current) * share && self.current > OWN;
         self.behind = if behind { self.behind + 1 } else { 0 };
-        if behind && self.behind < BEHIND_WINDOWS {
+        if behind && self.behind < windows {
             self.rises = 0;
             return self.current;
         }

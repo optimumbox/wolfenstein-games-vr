@@ -106,3 +106,18 @@ fn a_hitch_at_the_games_own_rate_blocks_nothing() {
     }
     assert_eq!(steps.current, 240, "risen as promised: nothing was learnt at 60");
 }
+
+#[test]
+fn paced_to_the_headset_a_hitch_keeps_the_rate() {
+    let start = Instant::now();
+    let mut steps = Steps::new(90);
+    // Two refreshes missed in each half second (87 a second): a hitch, not the PC's limit.
+    for _ in 0..BEHIND_PACED_WINDOWS * 3 {
+        assert_eq!(steps.step(900.0, 86.0, 90, start, true), 90);
+    }
+    // Most refreshes missed for two seconds: the PC cannot hold 90.
+    for _ in 1..BEHIND_PACED_WINDOWS {
+        assert_eq!(steps.step(900.0, 62.0, 90, start, true), 90);
+    }
+    assert_eq!(steps.step(900.0, 62.0, 90, start, true), OWN);
+}
