@@ -15,6 +15,10 @@
 //! other rate (or with no refresh sent: an older viewer, the headset idle) the engine paces as
 //! before. Where in a refresh the finished pairs land is kept halfway between the viewer's wakes
 //! ([`Phase`]), so none lands on the edge of one and is taken a refresh early or late.
+//!
+//! SteamVR halves the refresh it reports while it reprojects (a 90 Hz headset said to be 45 Hz for a
+//! moment): the grid is the shortest refresh the headset has reported ([`steady`]), which those
+//! moments are whole multiples of, so neither the pacing nor the game's rate follow them.
 
 use crate::Wolf;
 use crate::providers::engine::FrameFn;
@@ -53,6 +57,10 @@ const FITS: f64 = 0.005;
 const PHASE_GAIN: f64 = 0.05;
 /// The most refreshes a frame is held for.
 const MOST_REFRESHES: u64 = 4;
+/// The shortest refresh the headset has reported (nanoseconds; `u64::MAX`: none yet), and the
+/// shortest taken as one (a shorter report is not a headset's).
+static SHORTEST_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+const SHORTEST_TAKEN_NS: u64 = 2_000_000;
 
 /// The executable, `com_syncToTime` and the game's rate, from the install.
 static FACTS: OnceLock<(Module, &'static Cvar, GameRate)> = OnceLock::new();
@@ -87,7 +95,18 @@ fn quiet() {
 /// to it (whether or not the game's rate lets them be yet).
 pub fn headset_period() -> Option<u64> {
     let timing = crate::on(FRAME_PACING_AT).then(|| PAIRS.head().display()).flatten()?;
-    (now_ns().saturating_sub(timing.woke_ns) < STALE_NS && timing.period_ns > 0).then_some(timing.period_ns)
+    (now_ns().saturating_sub(timing.woke_ns) < STALE_NS && timing.period_ns > 0).then(|| steady(timing).period_ns)
+}
+
+/// `timing` on the headset's own refresh: the shortest it has reported, not a reprojecting
+/// SteamVR's multiple of it.
+fn steady(timing: DisplayTiming) -> DisplayTiming {
+    let period = timing.period_ns;
+    if period < SHORTEST_TAKEN_NS {
+        return timing;
+    }
+    let shortest = SHORTEST_NS.fetch_min(period, Relaxed).min(period);
+    DisplayTiming { period_ns: shortest, ..timing }
 }
 
 /// Whether the game's rate `hz` keeps frames on the headset's refresh (any rate when they cannot be
@@ -232,7 +251,7 @@ fn pace() {
     let Some((_, _, rate)) = FACTS.get() else { return };
     let timing = crate::on(FRAME_PACING_AT).then(|| PAIRS.head().display()).flatten();
     let now = now_ns();
-    let fresh = timing.filter(|t| now.saturating_sub(t.woke_ns) < STALE_NS);
+    let fresh = timing.filter(|t| now.saturating_sub(t.woke_ns) < STALE_NS && t.period_ns > 0).map(steady);
     let refreshes = fresh.zip(rate.read()).and_then(|(t, hz)| refreshes_per_frame(t.period_ns, hz));
     let (Some(timing), Some(refreshes)) = (fresh, refreshes) else {
         set_pacing(false);

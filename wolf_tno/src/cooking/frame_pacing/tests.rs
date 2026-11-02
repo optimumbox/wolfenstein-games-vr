@@ -59,3 +59,11 @@ fn pairs_are_moved_toward_halfway_between_wakes() {
     // Halfway: nothing moves.
     assert_eq!(Phase::after(&timing, 500, 1_000_000_000 + P / 2), 500);
 }
+
+#[test]
+fn a_reprojecting_steamvrs_half_rate_keeps_the_headsets_grid() {
+    let at = |period_ns| DisplayTiming { period_ns, woke_ns: 5 };
+    assert_eq!(steady(at(11_111_111)).period_ns, 11_111_111);
+    assert_eq!(steady(at(22_222_222)), at(11_111_111), "45 Hz reported: still 90's grid");
+    assert_eq!(steady(at(11_111_111)).period_ns, 11_111_111);
+}
