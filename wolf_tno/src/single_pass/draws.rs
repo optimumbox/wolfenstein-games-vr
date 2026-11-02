@@ -14,7 +14,7 @@
 //! in view 2 a clear of the right half of a target view 1 drew both eyes into is skipped.
 //!
 //! The engine's extension functions are called through its own function table, whose slots are
-//! found by the driver's addresses in the executable's data; the GL 1.1 ones through its imports.
+//! found in the executable's data by the driver's and OpenGL32's addresses ([`install`]).
 
 use super::eye_matrix::{self, Rows};
 use super::gl_api::{self, Gl};
@@ -68,6 +68,8 @@ struct State {
     gl: Option<Gl>,
     conversion: Conversion,
     started: bool,
+    /// The hooks were tried this run (not again after they could not go in).
+    tried: bool,
     /// Detours act (the hooks in, the stop not begun).
     live: bool,
     programs: HashMap<u32, Program>,
@@ -100,6 +102,7 @@ fn state() -> State {
         gl: None,
         conversion: Conversion::new(),
         started: false,
+        tried: false,
         live: false,
         programs: HashMap::new(),
         current: 0,
@@ -154,15 +157,15 @@ pub fn frame(on: bool) {
     if !state.conversion.finished() {
         if let Some(converted) = state.conversion.step(gl) {
             state.programs = converted.into_iter().map(|c| (c.program, Program { converted: c, rows: [[0.0; 4]; 4], switch: false, matrix: 0 })).collect();
-            state.live = install();
         }
         return;
     }
     if !state.live {
-        // A run after an earlier one's stop: the programs are converted already.
-        if state.programs.is_empty() || HOOKS.locked().is_some() {
+        // Once per run (a run after an earlier one's stop finds the programs converted already).
+        if state.tried || state.programs.is_empty() || HOOKS.locked().is_some() {
             return;
         }
+        state.tried = true;
         state.live = install();
         if !state.live {
             return;
@@ -210,6 +213,7 @@ fn stop(state: &mut State) {
         }
     }
     state.live = false;
+    state.tried = false;
     LET_GO.store(true, Release);
 }
 
@@ -295,55 +299,61 @@ fn slots(exe: &Module, address: usize) -> Vec<usize> {
     out
 }
 
-/// Every hook in (render thread, the context current); whether they went in.
+/// Every hook in (render thread, the context current); whether they went in. Each function is
+/// hooked wherever the executable's data holds it: the driver's address (from its own loader's
+/// table) or OpenGL32's export (an import slot, or a table filled by `GetProcAddress`).
 fn install() -> bool {
     let Some(exe) = Module::find(&monaka_hook::module::host_name()) else {
         log!("single pass: off: the executable is not found");
         return false;
     };
+    let opengl = Module::find("opengl32.dll");
     let mut hooks = Hooks::default();
     let mut found = Vec::new();
-    macro_rules! table {
+    let mut draws = 0;
+    macro_rules! hook {
         ($original:expr, $name:literal, $detour:expr, $required:expr) => {{
-            let slots = gl_api::address($name).map(|a| slots(&exe, a)).unwrap_or_default();
-            found.push(format!("{} {}", $name, slots.len()));
-            if slots.is_empty() && $required {
+            let mut at: Vec<usize> = [gl_api::address($name), opengl.as_ref().and_then(|m| m.export($name))]
+                .into_iter()
+                .flatten()
+                .flat_map(|address| slots(&exe, address))
+                .collect();
+            at.sort_unstable();
+            at.dedup();
+            found.push(format!("{} {}", $name, at.len()));
+            if at.is_empty() && $required {
                 log!("single pass: off: the engine's {} is not in its data ({})", $name, found.join(", "));
                 return false;
             }
-            for slot in slots {
-                // SAFETY: the slot holds the driver's function of that name, called through it.
-                if let Err(e) = unsafe { hooks.pointer(&$original, $name, slot, $detour) } {
+            for slot in &at {
+                // SAFETY: the slot holds the GL function of that name, called through it.
+                if let Err(e) = unsafe { hooks.pointer(&$original, $name, *slot, $detour) } {
                     log!("single pass: off: {e}");
                     return false;
                 }
             }
+            at.len()
         }};
     }
-    macro_rules! import {
-        ($original:expr, $name:literal, $detour:expr) => {{
-            // SAFETY: the import slot holds OpenGL's function of that name, of the detour's type.
-            if let Err(e) = unsafe { hooks.import(&$original, $name, &exe, "OPENGL32.dll", $name, $detour) } {
-                log!("single pass: off: {e}");
-                return false;
-            }
-        }};
+    hook!(USE_PROGRAM, "glUseProgram", use_program as UseProgramFn, true);
+    hook!(UNIFORM_4FV, "glUniform4fv", uniform_4fv as Uniform4fvFn, true);
+    hook!(PROGRAM_UNIFORM_4FV, "glProgramUniform4fv", program_uniform_4fv as ProgramUniform4fvFn, false);
+    hook!(VIEWPORT, "glViewport", viewport as RectFn, true);
+    hook!(SCISSOR, "glScissor", scissor as RectFn, false);
+    hook!(CLEAR, "glClear", clear as ClearFn, false);
+    draws += hook!(DRAW_ELEMENTS, "glDrawElements", draw_elements as DrawElementsFn, false);
+    draws += hook!(DRAW_ARRAYS, "glDrawArrays", draw_arrays as DrawArraysFn, false);
+    draws += hook!(DRAW_ELEMENTS_BASE_VERTEX, "glDrawElementsBaseVertex", draw_elements_base_vertex as DrawElementsBaseVertexFn, false);
+    draws += hook!(DRAW_RANGE_ELEMENTS, "glDrawRangeElements", draw_range_elements as DrawRangeElementsFn, false);
+    draws += hook!(DRAW_RANGE_ELEMENTS_BASE_VERTEX, "glDrawRangeElementsBaseVertex", draw_range_elements_base_vertex as DrawRangeElementsBaseVertexFn, false);
+    draws += hook!(DRAW_ELEMENTS_INSTANCED, "glDrawElementsInstanced", draw_elements_instanced as DrawElementsInstancedFn, false);
+    draws += hook!(DRAW_ELEMENTS_INSTANCED_BASE_VERTEX, "glDrawElementsInstancedBaseVertex", draw_elements_instanced_base_vertex as DrawElementsInstancedBaseVertexFn, false);
+    draws += hook!(DRAW_ARRAYS_INSTANCED, "glDrawArraysInstanced", draw_arrays_instanced as DrawArraysInstancedFn, false);
+    log!("single pass: the engine's GL functions found: {}", found.join(", "));
+    if draws == 0 {
+        log!("single pass: off: none of the engine's draw functions found");
+        return false;
     }
-    table!(USE_PROGRAM, "glUseProgram", use_program as UseProgramFn, true);
-    table!(UNIFORM_4FV, "glUniform4fv", uniform_4fv as Uniform4fvFn, true);
-    table!(PROGRAM_UNIFORM_4FV, "glProgramUniform4fv", program_uniform_4fv as ProgramUniform4fvFn, false);
-    table!(DRAW_ELEMENTS_BASE_VERTEX, "glDrawElementsBaseVertex", draw_elements_base_vertex as DrawElementsBaseVertexFn, false);
-    table!(DRAW_RANGE_ELEMENTS, "glDrawRangeElements", draw_range_elements as DrawRangeElementsFn, false);
-    table!(DRAW_RANGE_ELEMENTS_BASE_VERTEX, "glDrawRangeElementsBaseVertex", draw_range_elements_base_vertex as DrawRangeElementsBaseVertexFn, false);
-    table!(DRAW_ELEMENTS_INSTANCED, "glDrawElementsInstanced", draw_elements_instanced as DrawElementsInstancedFn, false);
-    table!(DRAW_ELEMENTS_INSTANCED_BASE_VERTEX, "glDrawElementsInstancedBaseVertex", draw_elements_instanced_base_vertex as DrawElementsInstancedBaseVertexFn, false);
-    table!(DRAW_ARRAYS_INSTANCED, "glDrawArraysInstanced", draw_arrays_instanced as DrawArraysInstancedFn, false);
-    import!(VIEWPORT, "glViewport", viewport as RectFn);
-    import!(SCISSOR, "glScissor", scissor as RectFn);
-    import!(CLEAR, "glClear", clear as ClearFn);
-    import!(DRAW_ELEMENTS, "glDrawElements", draw_elements as DrawElementsFn);
-    import!(DRAW_ARRAYS, "glDrawArrays", draw_arrays as DrawArraysFn);
-    log!("single pass: the engine's function table: {}", found.join(", "));
     if let Err(e) = hooks.enable() {
         let _ = hooks.disable();
         log!("single pass: off: {e}");
