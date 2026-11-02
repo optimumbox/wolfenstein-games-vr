@@ -32,7 +32,7 @@ pub const FRAME_RATE: Opt = opt(
     "frame_rate",
     "Frame rate",
     "Frame rates above 60 may result in unstable or buggy gameplay.",
-    choice(&[("60", "60 (native)"), ("80", "80"), ("96", "96"), ("120", "120"), ("160", "160"), ("240", "240")], "60"),
+    choice(&[("60", "60 (native)"), ("80", "80"), ("90", "90"), ("96", "96"), ("120", "120"), ("160", "160"), ("240", "240")], "60"),
 )
 .on(Shown::Game);
 
@@ -51,8 +51,9 @@ pub const FRAME_RATE_COMPONENT: Component<Wolf> =
     };
 
 /// The rates the game may take: those whose whole-millisecond tick keeps the game's clock at its
-/// own 0.96 of real time (16 ms at 60, 4 ms at 240).
-pub const STEPS: [i32; 8] = [60, 64, 80, 96, 120, 160, 192, 240];
+/// own 0.96 of real time (16 ms at 60, 4 ms at 240), and 90 for 90 Hz headsets, whose 11 ms tick
+/// runs the clock at 0.99 (3% faster than the game's own; no rate near 90 keeps 0.96).
+pub const STEPS: [i32; 9] = [60, 64, 80, 90, 96, 120, 160, 192, 240];
 /// The game's own rate, and the lowest the rate goes.
 pub const OWN: i32 = 60;
 /// A rate is taken only with this much of a frame's time to spare.
@@ -181,7 +182,7 @@ const LOGGED: u64 = 200;
 /// The game's rate (ticks, and so frames, a second) at most while VR runs ([`FRAME_RATE`]; 60 is
 /// the game's own).
 pub(crate) fn ceiling(options: &monaka_core::options::Options) -> i32 {
-    options.choice("frame_rate", &[("80", 80), ("96", 96), ("120", 120), ("160", 160), ("240", 240)], 60)
+    options.choice("frame_rate", &[("80", 80), ("90", 90), ("96", 96), ("120", 120), ("160", 160), ("240", 240)], 60)
 }
 
 fn install(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {

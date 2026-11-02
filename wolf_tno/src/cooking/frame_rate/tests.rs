@@ -1,10 +1,20 @@
 use super::*;
 
+/// The step whose tick runs the game's clock at 0.99 of real time rather than 0.96.
+const HEADSET_90: i32 = 90;
+
 #[test]
 fn every_step_keeps_the_games_own_speed() {
-    for step in STEPS {
+    for step in STEPS.into_iter().filter(|&s| s != HEADSET_90) {
         assert_eq!(1000 / step * step, 960, "{step} a second: a whole-millisecond tick at 0.96 of real time");
     }
+    assert_eq!(1000 / HEADSET_90 * HEADSET_90, 990, "90 a second: an 11 ms tick, 0.99 of real time");
+}
+
+#[test]
+fn a_90_hz_headset_gets_90() {
+    assert_eq!(fitting(105.0, 96), 90, "94 to spare: 90 rather than 80");
+    assert_eq!(fitting(300.0, 90), 90);
 }
 
 #[test]
