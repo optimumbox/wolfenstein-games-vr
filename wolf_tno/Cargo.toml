@@ -21,6 +21,8 @@ monaka_hook.workspace = true
 monaka_pad.workspace = true
 monaka_producer.workspace = true
 monaka_stereo.workspace = true
+monaka_dlss11.workspace = true
+monaka_warp.workspace = true
 
 [dependencies.windows]
 workspace = true

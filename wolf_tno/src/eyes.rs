@@ -42,6 +42,25 @@ pub const FSR_SHARPNESS: Opt =
 /// pairs by AMD's FSR frame generation. Offered with FSR upscaling, whose option brings AMD's DLLs.
 pub const FRAMEGEN: Opt = frame_generation(&[FrameGenerator::Off.offer(), FrameGenerator::Fsr.experimental()], FrameGenerator::Off).only_when("fsr", "1");
 
+/// DLSS ([`EyeSettings::dlss`]): with both eyes drawn each frame, each drawn smaller and upscaled
+/// to the eye size by NVIDIA DLSS (`nvngx_dlss.dll` ships beside the pack's DLL).
+pub const DLSS: Opt = opt(
+    "dlss",
+    "DLSS",
+    "NVIDIA DLSS (RTX GPUs): each eye renders smaller, then DLSS upscales it to the headset's resolution. DLAA keeps the full resolution and only smooths edges.",
+    choice(&[("off", "Off"), ("dlaa", "DLAA"), ("quality", "Quality"), ("balanced", "Balanced"), ("performance", "Performance"), ("ultra_performance", "Ultra performance")], "quality"),
+)
+.on(Shown::Rendering)
+.only_when("stereo", "same");
+
+/// DLSS settings (`dlss`, and `dlss_jitter_sign` on the command line only).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Dlss {
+    pub quality: monaka_dlss11::Quality,
+    /// 1 or -1: whether DLSS is told the content shift or its opposite.
+    pub jitter_sign: f32,
+}
+
 /// FSR upscaling settings (`fsr_*` options).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Fsr {
@@ -72,6 +91,8 @@ pub struct EyeSettings {
     pub fsr: Option<Fsr>,
     /// Frame generation (`framegen=fsr`, with frame warping): in-between pairs of the warped pairs.
     pub framegen: bool,
+    /// DLSS (`dlss`, with both eyes drawn each frame): each eye drawn smaller and upscaled.
+    pub dlss: Option<Dlss>,
     /// Frame warping: the dominant eye drawn most frames, the other every refresh, instead of the
     /// eyes taking turns (`afw_dominant=1`, command line only: the gaps beside near things then fill
     /// from a frame up to a refresh old, which shows moving hands where they were).
@@ -112,6 +133,10 @@ impl EyeSettings {
                 jitter_sign: if options.number("fsr_jitter_sign", -1.0, 1.0, 1.0) < 0.0 { -1.0 } else { 1.0 },
             }),
             framegen: FrameGenerator::chosen(&FRAMEGEN, options) == FrameGenerator::Fsr,
+            dlss: options.text("dlss").and_then(monaka_dlss11::Quality::parse).map(|quality| Dlss {
+                quality,
+                jitter_sign: if options.number("dlss_jitter_sign", -1.0, 1.0, 1.0) < 0.0 { -1.0 } else { 1.0 },
+            }),
             units_per_metre: UNITS_PER_METRE,
             screen_separation: options.number("screen_separation", -1.0, 1.0, 0.0),
             dominant_eye: options.choice("dominant_eye", &eyes, dominant_default),

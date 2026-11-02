@@ -40,7 +40,7 @@ use monaka_core::rendering::StereoMethod;
 use monaka_core::ticket::{Tickets, View as Ticket};
 use monaka_stereo::afw::{Rendered, Shot};
 use monaka_stereo::driver::Pending;
-use monaka_stereo::same_frame::gl::{self as gl_frames, GlDepth, GlShot};
+use monaka_stereo::same_frame::gl::{self as gl_frames, GlDepth, GlDlssFrame, GlShot};
 use monaka_stereo::upscaler::fsr11::jittered_at;
 use monaka_hook::module::Module;
 use monaka_hook::{InFlight, Original, mem};
@@ -61,7 +61,7 @@ use monaka_core::sync::Locked;
 pub const EYES: Component<Wolf> = Component {
     name: "eyes",
     features: &[Feature::Stereo],
-    options: &[crate::eyes::STEREO, crate::eyes::FSR, crate::eyes::FSR_SCALE, crate::eyes::FSR_SHARPNESS, crate::eyes::FRAMEGEN, DOMINANT_EYE, HEAD_MOVEMENT, EYE_SEPARATION],
+    options: &[crate::eyes::STEREO, crate::eyes::FSR, crate::eyes::FSR_SCALE, crate::eyes::FSR_SHARPNESS, crate::eyes::FRAMEGEN, crate::eyes::DLSS, DOMINANT_EYE, HEAD_MOVEMENT, EYE_SEPARATION],
     needs: &[Need::On(&crate::PRESENT)],
     settings: |options, manifest| {
         EyeSettings::from_options(options, manifest);
@@ -428,6 +428,18 @@ static FRAME_PROJECTION: Mutex<Option<EyeProjection>> = Mutex::new(None);
 type EyeProjection = ([f32; 16], f32, Frustum, [f32; 2]);
 /// Each eye's next FSR jitter phase.
 static JITTER_PHASE: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+/// DLSS with both eyes drawn each frame ([`arm_dlss`]): its quality, once armed.
+static DLSS: OnceLock<monaka_dlss11::Quality> = OnceLock::new();
+/// The DLSS jitter phase of this view build (both eyes share it).
+static DLSS_PHASE: AtomicU32 = AtomicU32::new(0);
+/// The projections the engine made for this build's eyes with DLSS (as [`FRAME_PROJECTION`]).
+static DLSS_PROJECTIONS: Mutex<[Option<EyeProjection>; 2]> = Mutex::new([None; 2]);
+/// Each frame built with DLSS: its pose and how both eyes were drawn, in step with the loop's
+/// tickets (as [`WARP_TICKETS`]).
+static DLSS_TICKETS: Mutex<Tickets<Option<GlDlssFrame>>> = Mutex::new(Tickets::new(4));
+static DLSS_SHOWING: Mutex<Option<monaka_core::ticket::Ticket<Option<GlDlssFrame>>>> = Mutex::new(None);
+/// Frames built with DLSS without how both eyes were drawn (logged the first few).
+static DLSS_UNRENDERED: AtomicU64 = AtomicU64::new(0);
 /// Each frame built with frame warping: its eye, pose and how it was rendered, in step with the
 /// loop's tickets (one each per built frame, taken at the same `SwapBuffers`).
 static WARP_TICKETS: Mutex<Tickets<WarpFacts>> = Mutex::new(Tickets::new(4));
@@ -610,6 +622,11 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
     let warping = WARPING.load(Acquire);
     let eye = warp_eye(build, setup.filter(|s| s.config.afw_dominant).map(|s| s.config.dominant_eye));
     let mut eye_view = None;
+    let dlss = DLSS.get().copied().filter(|_| !warping);
+    let mut dlss_eyes = [None; 2];
+    if let Some(quality) = dlss {
+        DLSS_PHASE.store(DLSS_PHASE.load(Relaxed).wrapping_add(1) % monaka_dlss11::phases(quality), Relaxed);
+    }
     if let (Some(setup), Some(pose)) = (setup, pose.as_ref()) {
         let convention = eng_idt::camera_convention(setup.config.units_per_metre);
         let players = Players { first: views, stride: setup.build.player_view_stride, active: engine::PLAYER_ACTIVE, render_view: engine::PLAYER_RENDER_VIEW };
@@ -650,6 +667,9 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
                         // Where the engine puts the eye drawn: the view moved along its left axis.
                         let separation = setup.config.engine_separation(&setup.shared, pose);
                         eye_view = Some(at_eye(turned, eye, separation).origin_axis);
+                        if dlss.is_some() {
+                            dlss_eyes = [0, 1].map(|e| Some(at_eye(turned, e, separation).origin_axis));
+                        }
                         // Where a driven machine aims, for its crosshair (`hud_pieces`).
                         let aim = crate::providers::camera_taken::driving()
                             .then(|| aim_tangents(&own.origin_axis, &turned.origin_axis, separation, AIM_DISTANCE * setup.config.units_per_metre))
@@ -688,6 +708,7 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
         fresh_view_slots(this, slots);
     }
     *FRAME_PROJECTION.locked() = None;
+    *DLSS_PROJECTIONS.locked() = [None; 2];
     EYE_CALLS.store(0, Relaxed);
     BUILDING_THREAD.store(thread_id(), Release);
     // SAFETY: forwards the game's own call.
@@ -709,10 +730,56 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
                 WARP_TICKETS.locked().issue(Ticket::Eye(eye), pose, rendered);
                 PAIRS.built(Ticket::Eye(eye), pose);
             }
-            false => PAIRS.built(Ticket::Both, pose),
+            false => {
+                if dlss.is_some() {
+                    let units = setup.map_or(1.0, |s| s.config.units_per_metre);
+                    let projections = *DLSS_PROJECTIONS.locked();
+                    let frame = dlss_frame_of(dlss_eyes, projections, units);
+                    DLSS_TICKETS.locked().issue(Ticket::Both, pose, frame);
+                }
+                PAIRS.built(Ticket::Both, pose)
+            }
         }
     }
     result
+}
+
+/// Both eyes as drawn for DLSS: each eye's place (`origins`, the engine's origin and axis rows) and
+/// the projection the engine made for it; none unless both are there with the same jitter.
+fn dlss_frame_of(origins: [Option<[f32; 12]>; 2], projections: [Option<EyeProjection>; 2], units: f32) -> Option<GlDlssFrame> {
+    let convention = eng_idt::camera_convention(units);
+    let mut jitter = None;
+    let mut views = [None; 2];
+    for eye in 0..2 {
+        let (gl, near, frustum, eye_jitter) = projections[eye]?;
+        if jitter.is_some_and(|j| j != eye_jitter) {
+            return None;
+        }
+        jitter = Some(eye_jitter);
+        let mut rendered = warp_rendered(&camera_of(&origins[eye]?, &convention)?, &gl, near, units)?;
+        // The projection before the jitter: DLSS's output is unjittered.
+        frustum.apply_to_projection(&mut rendered.projection);
+        views[eye] = Some(monaka_warp::EyeView { camera: rendered.camera, projection: rendered.projection });
+    }
+    Some(GlDlssFrame { views: [views[0]?, views[1]?], jitter: jitter? })
+}
+
+/// DLSS for this run, with both eyes drawn each frame: each eye's projection jittered, and how both
+/// were drawn kept for each frame ([`dlss_frame`]).
+pub fn arm_dlss(quality: monaka_dlss11::Quality) {
+    let _ = DLSS.set(quality);
+}
+
+/// At the frame's `SwapBuffers`: how both eyes of the frame being presented were drawn (its ticket
+/// taken in step with the loop's, as [`warp_shot`]), or none for a frame without that.
+pub fn dlss_frame() -> Option<GlDlssFrame> {
+    let newest = DLSS_TICKETS.locked().show().ticket;
+    let ticket = std::mem::replace(&mut *DLSS_SHOWING.locked(), newest)?;
+    let frame = ticket.extra;
+    if frame.is_none() && DLSS_UNRENDERED.fetch_add(1, Relaxed) < 5 {
+        log!("DLSS: a frame without both eyes' cameras and projections; resampled");
+    }
+    frame
 }
 
 /// The eye frame warping draws at view build `n`: the eyes take turns, or (`dominant`, see
@@ -887,6 +954,9 @@ pub unsafe extern "system" fn projection(fov_x: f32, fov_y: f32, near: f32, far:
             && near > 0.0
         {
             // With FSR the eye's projection is shifted by its next jitter (render pixels).
+            // With DLSS both eyes are shifted by the build's jitter (render pixels, each eye half the
+            // frame).
+            let dlss = DLSS.get().filter(|_| !warping);
             let jitter = match (warping, SETUP_SCALE.get().copied().flatten(), gl_frames::frame_size()) {
                 (true, Some(scale), Some((width, height))) => {
                     let render = gl_frames::region_size(width, height, warp_region(scale));
@@ -894,6 +964,7 @@ pub unsafe extern "system" fn projection(fov_x: f32, fov_y: f32, near: f32, far:
                     let phase = JITTER_PHASE[eye].fetch_add(1, Relaxed) % phases;
                     Some((fsr_jitter(phase), render))
                 }
+                (false, _, Some((width, height))) if dlss.is_some() => Some((monaka_dlss11::jitter(DLSS_PHASE.load(Relaxed)), (width / 2, height))),
                 _ => None,
             };
             let drawn = jitter.map_or(frustum, |(jitter, render)| jittered_at(frustum, jitter, render));
@@ -902,10 +973,14 @@ pub unsafe extern "system" fn projection(fov_x: f32, fov_y: f32, near: f32, far:
             NEAR_UNITS.store(near.to_bits(), Relaxed);
             // SAFETY: the engine's own frustum maker, with the output the game passed.
             unsafe { (setup.make_frustum)(left, right, bottom, top, near, far, out) };
-            if warping {
+            if warping || dlss.is_some() {
                 // SAFETY: the 4x4 matrix the frustum maker just wrote.
                 let matrix = mem::read::<[f32; 16]>(out as usize);
-                *FRAME_PROJECTION.locked() = matrix.map(|m| (m, near, frustum, jitter.map_or([0.0; 2], |(j, _)| j)));
+                let projection = matrix.map(|m| (m, near, frustum, jitter.map_or([0.0; 2], |(j, _)| j)));
+                match warping {
+                    true => *FRAME_PROJECTION.locked() = projection,
+                    false => DLSS_PROJECTIONS.locked()[eye] = projection,
+                }
             }
             return;
         }

@@ -6,6 +6,9 @@
 //! mode's size: the eyes stay the game's own then. The window's style and place go back at the
 //! stop.
 //!
+//! With DLSS ([`arm_dlss`]) the window is made the render size instead: each eye drawn smaller,
+//! DLSS bringing it to the eye size asked for.
+//!
 //! The window is the one the render thread presents to (`SwapBuffers`' device context: [`seen`]).
 //! Its owner is the game's main thread, which may be waiting on the render thread: each change is
 //! made from a thread of its own, so a present never waits on the window's messages.
@@ -35,6 +38,8 @@ static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static SIDE_BY_SIDE: AtomicBool = AtomicBool::new(false);
 /// The build's `r_fullscreen`, with its executable; none where not mapped.
 static FULLSCREEN: Mutex<Option<(Module, &'static Cvar)>> = Mutex::new(None);
+/// DLSS: its quality and the eye size it upscales to ([`arm_dlss`]).
+static DLSS: Mutex<Option<(monaka_dlss11::Quality, (u32, u32))>> = Mutex::new(None);
 /// The window's style and place before it was resized, for the stop.
 static BEFORE: Mutex<Option<Before>> = Mutex::new(None);
 
@@ -62,9 +67,27 @@ pub fn seen(dc: HDC) {
 }
 
 /// Whether a frame of `width` x `height` may be published (the same-frame loop's `ready`): the
-/// eyes in it at the size asked for, or the switch given up.
+/// eyes in it at the size asked for (with DLSS, at its render size), or the switch given up.
 pub fn ready(width: u32, height: u32) -> bool {
-    eye_size::ready::<Wolf>(eye_of((width, height)))
+    let eye = eye_of((width, height));
+    let presented = match *DLSS.locked() {
+        Some((quality, display)) if eye == monaka_dlss11::render_size(display, quality) => display,
+        _ => eye,
+    };
+    eye_size::ready::<Wolf>(presented)
+}
+
+/// DLSS at `quality` for eyes of `display`: the window is made the render size.
+pub fn arm_dlss(quality: monaka_dlss11::Quality, display: (u32, u32)) {
+    *DLSS.locked() = Some((quality, display));
+}
+
+/// The size each eye is drawn at for eyes of `eye`: with DLSS, its render size.
+fn drawn_eye(eye: (u32, u32)) -> (u32, u32) {
+    match *DLSS.locked() {
+        Some((quality, display)) if display == eye => monaka_dlss11::render_size(display, quality),
+        _ => eye,
+    }
 }
 
 /// An eye's size in a frame of `frame`.
@@ -89,7 +112,7 @@ impl Resizes for Wolf {
         if window == 0 {
             return Ask::NotYet;
         }
-        let (width, height) = window_for(eye, SIDE_BY_SIDE.load(Acquire));
+        let (width, height) = window_for(drawn_eye(eye), SIDE_BY_SIDE.load(Acquire));
         std::thread::spawn(move || resize(window, width, height));
         Ask::Asked
     }

@@ -44,6 +44,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "monaka_dlss11"
+version = "0.3.0"
+dependencies = [
+ "monaka_channel",
+ "monaka_warp",
+ "windows",
+]
+
+[[package]]
 name = "monaka_ffx"
 version = "0.3.0"
 dependencies = [
@@ -133,6 +142,7 @@ dependencies = [
  "monaka_channel",
  "monaka_contract",
  "monaka_core",
+ "monaka_dlss11",
  "monaka_ffx",
  "monaka_framegen",
  "monaka_fsr11",
@@ -173,11 +183,13 @@ dependencies = [
  "monaka_channel",
  "monaka_contract",
  "monaka_core",
+ "monaka_dlss11",
  "monaka_hook",
  "monaka_launch",
  "monaka_pad",
  "monaka_producer",
  "monaka_stereo",
+ "monaka_warp",
  "windows",
 ]
 

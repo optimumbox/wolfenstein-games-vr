@@ -3,7 +3,8 @@
 //! thread with its GL context current ([`swap_buffers`]). Each frame goes to the same-frame loop's
 //! OpenGL path (`monaka_stereo::same_frame::gl`): with the engine's side-by-side layout each half
 //! is one eye, else the whole frame goes to both eyes; with frame warping ([`warp`]) one eye a frame,
-//! the other warped from it, with FSR upscaling and frame generation when chosen. A full-screen video
+//! the other warped from it, with FSR upscaling and frame generation when chosen; with DLSS
+//! ([`dlss`]) both eyes drawn smaller and each upscaled to the eye size. A full-screen video
 //! (`engine::Build::video`), drawn over the whole window rather than per eye, is reported as a
 //! situation (`Situation::Video`), so the loop sends those frames whole to the flat screen.
 
@@ -16,7 +17,7 @@ use monaka_producer::situation::{self, Situation};
 use crate::providers::eye_site;
 use monaka_stereo::afw::Rules;
 use monaka_stereo::afw::d3d11::FrameGeneration;
-use monaka_stereo::same_frame::gl::{GlFsr, GlWarp};
+use monaka_stereo::same_frame::gl::{GlDlss, GlFsr, GlWarp};
 use monaka_core::sync::Locked;
 use monaka_stereo::same_frame::timing::Stage;
 use monaka_stereo::same_frame::{Output, PAIRS, PairLoop, PresentsPairs, gl};
@@ -37,6 +38,7 @@ impl PresentsPairs for Wolf {
         warp,
         // Each eye's depth with its pair: a pair shown again moves for the eyes, not only turns.
         depth: |_| Some(gl::GlPairDepth { depth: eye_site::scene_depth, near: eye_site::near_metres }),
+        dlss,
         // The render thread presents each frame at the start of drawing the next.
         presents_behind_drawing: true,
         // Nothing goes out until the window is the eye size asked for (`render_size`).
@@ -90,6 +92,35 @@ fn warp(start: &Start<'_, Wolf>) -> Option<GlWarp> {
         rules: Rules::WHOLE.every(eye_site::REFRESH).fill_first(false),
         // Command line only: `afw_sources=1` shows where each warped pixel came from.
         sources: start.options.text("afw_sources").and_then(|t| t.trim().parse().ok()).unwrap_or(0),
+    })
+}
+
+/// With DLSS chosen, both eyes drawn each frame and an eye size asked for: the window made the
+/// render size, each eye's projection jittered, and DLSS bringing each eye to the eye size. NVIDIA's
+/// `nvngx_dlss.dll` is looked for beside the pack's DLL (or where `dlss_dll` says).
+fn dlss(start: &Start<'_, Wolf>) -> Option<GlDlss> {
+    let config = crate::eyes(start);
+    let settings = config.dlss?;
+    if !config.stereo || eye_site::warps(&config, start.shared, start.build.build) {
+        return None;
+    }
+    let Some(display) = start.options.size("eye_size") else {
+        log!("DLSS is off: no eye size asked for");
+        return None;
+    };
+    let pack = Module::containing(dlss as *const () as usize).and_then(|m| m.path()).and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    let dlls = start.options.text("dlss_dll").map(std::path::PathBuf::from).or(pack)?;
+    eye_site::arm_dlss(settings.quality);
+    crate::providers::window_size::arm_dlss(settings.quality, display);
+    let leak = |p: std::path::PathBuf| -> &'static std::path::Path { Box::leak(p.into_boxed_path()) };
+    Some(GlDlss {
+        quality: settings.quality,
+        display,
+        frame: eye_site::dlss_frame,
+        depth: eye_site::scene_depth,
+        dlls: leak(dlls),
+        data: leak(start.session.dir().join("ngx")),
+        jitter_sign: settings.jitter_sign,
     })
 }
 

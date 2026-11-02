@@ -17,11 +17,13 @@ monaka_body = { path = "../../monaka_sdk/crates/body" }
 monaka_channel = { path = "../../monaka_sdk/crates/channel" }
 monaka_contract = { path = "../../monaka_sdk/crates/contract" }
 monaka_core = { path = "../../monaka_sdk/crates/core" }
+monaka_dlss11 = { path = "../../monaka_sdk/crates/dlss11" }
 monaka_hook = { path = "../../monaka_sdk/crates/hook" }
 monaka_launch = { path = "../../monaka_vr/crates/launch" }
 monaka_pad = { path = "../../monaka_sdk/crates/pad" }
 monaka_producer = { path = "../../monaka_sdk/crates/producer" }
 monaka_stereo = { path = "../../monaka_sdk/crates/stereo" }
+monaka_warp = { path = "../../monaka_sdk/crates/warp" }
 windows = "0.62"
 
 [workspace.lints.rust]

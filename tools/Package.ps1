@@ -22,10 +22,15 @@ New-Item -ItemType Directory $folder -Force | Out-Null
 $dlls = @('monaka_wolf_tno.dll')
 foreach ($dll in $dlls) { Copy-Item -LiteralPath (Join-Path $built $dll) -Destination $folder }
 Copy-Item -LiteralPath (Join-Path $repo 'README.md'), (Join-Path $repo 'LICENSE') -Destination $folder
+# NVIDIA's DLSS model, looked for beside the producer DLL (`dlss`), and its licence.
+$ngx = Join-Path (Split-Path -Parent $MonakaRoot) 'monaka_sdk\crates\dlss11\ngx'
+Copy-Item -LiteralPath (Join-Path $ngx 'nvngx_dlss.dll'), (Join-Path $ngx 'NVIDIA-DLSS-LICENSE.txt') -Destination $folder
 Assert-NoPersonalPaths ($dlls | ForEach-Object { Join-Path $folder $_ })
 
 # Read the DLL back as a pack, as the launcher will.
 $play = Join-Path $MonakaRoot 'target\release\monaka_play.exe'
+# Else the installed Monaka's.
+if (-not (Test-Path -LiteralPath $play)) { $play = 'C:\Games\Monaka VR\monaka_play.exe' }
 if (-not (Test-Path -LiteralPath $play)) { throw "Build Monaka first (missing $play)." }
 foreach ($dll in $dlls) {
     $said = & $play pack (Join-Path $folder $dll) 2>&1 | Out-String
