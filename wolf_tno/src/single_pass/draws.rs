@@ -78,6 +78,11 @@ struct Counts {
     perspective: u64,
     stood_in: u64,
     in_stretch: u64,
+    /// Occlusion queries begun in each pass, their results read back as visible (their draws
+    /// skipped), and conditional renders on them made unconditional.
+    queries: [u64; 3],
+    blind_results: u64,
+    blind_conditions: u64,
 }
 
 /// The live frames whose passes are written to the log: each run of draws into one framebuffer
@@ -132,6 +137,11 @@ struct State {
     logged: Option<Instant>,
     live_frames: u64,
     trace: Option<Trace>,
+    /// The occlusion query being counted, the queries some of whose draws were skipped, and
+    /// whether the current conditional render was left out.
+    query: Option<u32>,
+    blind: HashSet<u32>,
+    unconditional: bool,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -168,6 +178,9 @@ fn state() -> State {
         logged: None,
         live_frames: 0,
         trace: None,
+        query: None,
+        blind: HashSet::new(),
+        unconditional: false,
     }
 }
 
@@ -336,12 +349,15 @@ pub fn frame(on: bool) {
             state.agreeing.1
         );
         log!(
-            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch",
+            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch; occlusion queries {:?} by pass, {} read as visible, {} conditional renders made unconditional",
             c.draws,
             c.converted,
             c.perspective,
             c.stood_in,
-            c.in_stretch
+            c.in_stretch,
+            c.queries,
+            c.blind_results,
+            c.blind_conditions
         );
     }
 }
@@ -417,6 +433,14 @@ type BindFramebufferFn = unsafe extern "system" fn(u32, u32);
 type BindTextureFn = unsafe extern "system" fn(u32, u32);
 type BindTexturesFn = unsafe extern "system" fn(u32, i32, *const u32);
 type BindMultiTextureFn = unsafe extern "system" fn(u32, u32, u32);
+type BeginQueryFn = unsafe extern "system" fn(u32, u32);
+type EndQueryFn = unsafe extern "system" fn(u32);
+type GetQueryObjectIvFn = unsafe extern "system" fn(u32, u32, *mut i32);
+type GetQueryObjectUivFn = unsafe extern "system" fn(u32, u32, *mut u32);
+type GetQueryObjectI64vFn = unsafe extern "system" fn(u32, u32, *mut i64);
+type GetQueryObjectUi64vFn = unsafe extern "system" fn(u32, u32, *mut u64);
+type BeginConditionalRenderFn = unsafe extern "system" fn(u32, u32);
+type EndConditionalRenderFn = unsafe extern "system" fn();
 type DrawArraysFn = unsafe extern "system" fn(u32, i32, i32);
 type DrawElementsFn = unsafe extern "system" fn(u32, i32, u32, *const c_void);
 type DrawElementsBaseVertexFn = unsafe extern "system" fn(u32, i32, u32, *const c_void, i32);
@@ -446,6 +470,14 @@ static BIND_FRAMEBUFFER_EXT: Original<BindFramebufferFn> = Original::new();
 static BIND_TEXTURE: Original<BindTextureFn> = Original::new();
 static BIND_TEXTURES: Original<BindTexturesFn> = Original::new();
 static BIND_MULTI_TEXTURE: Original<BindMultiTextureFn> = Original::new();
+static BEGIN_QUERY: Original<BeginQueryFn> = Original::new();
+static END_QUERY: Original<EndQueryFn> = Original::new();
+static GET_QUERY_OBJECT_IV: Original<GetQueryObjectIvFn> = Original::new();
+static GET_QUERY_OBJECT_UIV: Original<GetQueryObjectUivFn> = Original::new();
+static GET_QUERY_OBJECT_I64V: Original<GetQueryObjectI64vFn> = Original::new();
+static GET_QUERY_OBJECT_UI64V: Original<GetQueryObjectUi64vFn> = Original::new();
+static BEGIN_CONDITIONAL_RENDER: Original<BeginConditionalRenderFn> = Original::new();
+static END_CONDITIONAL_RENDER: Original<EndConditionalRenderFn> = Original::new();
 static DRAW_ARRAYS: Original<DrawArraysFn> = Original::new();
 static DRAW_ELEMENTS: Original<DrawElementsFn> = Original::new();
 static DRAW_ELEMENTS_BASE_VERTEX: Original<DrawElementsBaseVertexFn> = Original::new();
@@ -529,6 +561,14 @@ fn install() -> bool {
     hook!(BIND_TEXTURE, "glBindTexture", bind_texture as BindTextureFn, false);
     hook!(BIND_TEXTURES, "glBindTextures", bind_textures as BindTexturesFn, false);
     hook!(BIND_MULTI_TEXTURE, "glBindMultiTextureEXT", bind_multi_texture as BindMultiTextureFn, false);
+    hook!(BEGIN_QUERY, "glBeginQuery", begin_query as BeginQueryFn, false);
+    hook!(END_QUERY, "glEndQuery", end_query as EndQueryFn, false);
+    hook!(GET_QUERY_OBJECT_IV, "glGetQueryObjectiv", get_query_object_iv as GetQueryObjectIvFn, false);
+    hook!(GET_QUERY_OBJECT_UIV, "glGetQueryObjectuiv", get_query_object_uiv as GetQueryObjectUivFn, false);
+    hook!(GET_QUERY_OBJECT_I64V, "glGetQueryObjecti64v", get_query_object_i64v as GetQueryObjectI64vFn, false);
+    hook!(GET_QUERY_OBJECT_UI64V, "glGetQueryObjectui64v", get_query_object_ui64v as GetQueryObjectUi64vFn, false);
+    hook!(BEGIN_CONDITIONAL_RENDER, "glBeginConditionalRender", begin_conditional_render as BeginConditionalRenderFn, false);
+    hook!(END_CONDITIONAL_RENDER, "glEndConditionalRender", end_conditional_render as EndConditionalRenderFn, false);
     draws += hook!(DRAW_ELEMENTS, "glDrawElements", draw_elements as DrawElementsFn, false);
     draws += hook!(DRAW_ARRAYS, "glDrawArrays", draw_arrays as DrawArraysFn, false);
     draws += hook!(DRAW_ELEMENTS_BASE_VERTEX, "glDrawElementsBaseVertex", draw_elements_base_vertex as DrawElementsBaseVertexFn, false);
@@ -648,6 +688,11 @@ fn draw() -> bool {
             set_switch(gl, program, false);
             if state.matrix.is_some() {
                 state.counts.skipped += 1;
+                // Its occlusion query would count none of its samples: the engine would hide
+                // the object from the right eye next frame.
+                if let Some(query) = state.query {
+                    state.blind.insert(query);
+                }
                 return false;
             }
             true
@@ -881,6 +926,95 @@ unsafe extern "system" fn bind_textures(first: u32, count: i32, textures: *const
     let pointer = given.as_ref().map_or(textures, |g| g.as_ptr());
     // SAFETY: forwards the game's own call (with our stand-ins).
     unsafe { BIND_TEXTURES.get(&flight)(first, count, pointer) }
+}
+
+/// The occlusion queries' targets: samples passed, any passed, any passed (conservative).
+fn occlusion(target: u32) -> bool {
+    matches!(target, 0x8914 | 0x8C2F | 0x8D6A)
+}
+
+unsafe extern "system" fn begin_query(target: u32, id: u32) {
+    let flight = InFlight::enter();
+    if occlusion(target)
+        && let Some(state) = STATE.locked().as_mut().filter(|s| s.live)
+    {
+        state.query = Some(id);
+        state.blind.remove(&id);
+        state.counts.queries[state.pass.min(2) as usize] += 1;
+    }
+    // SAFETY: forwards the game's own call.
+    unsafe { BEGIN_QUERY.get(&flight)(target, id) }
+}
+
+unsafe extern "system" fn end_query(target: u32) {
+    let flight = InFlight::enter();
+    if occlusion(target)
+        && let Some(state) = STATE.locked().as_mut()
+    {
+        state.query = None;
+    }
+    // SAFETY: forwards the game's own call.
+    unsafe { END_QUERY.get(&flight)(target) }
+}
+
+/// Whether a query's result read back is to be made visible (some of its draws skipped).
+fn blind_result(id: u32, pname: u32) -> bool {
+    // GL_QUERY_RESULT, GL_QUERY_RESULT_NO_WAIT.
+    if pname != 0x8866 && pname != 0x9194 {
+        return false;
+    }
+    let mut guard = STATE.locked();
+    let Some(state) = guard.as_mut().filter(|s| s.live && s.blind.contains(&id)) else { return false };
+    state.counts.blind_results += 1;
+    true
+}
+
+macro_rules! query_detour {
+    ($name:ident, $original:ident, $type:ty) => {
+        unsafe extern "system" fn $name(id: u32, pname: u32, params: *mut $type) {
+            let flight = InFlight::enter();
+            // SAFETY: forwards the game's own call.
+            unsafe { $original.get(&flight)(id, pname, params) };
+            if !params.is_null() && blind_result(id, pname) {
+                // SAFETY: the game's own result, written into its pointer above.
+                unsafe {
+                    if *params == 0 {
+                        *params = 1;
+                    }
+                }
+            }
+        }
+    };
+}
+
+query_detour!(get_query_object_iv, GET_QUERY_OBJECT_IV, i32);
+query_detour!(get_query_object_uiv, GET_QUERY_OBJECT_UIV, u32);
+query_detour!(get_query_object_i64v, GET_QUERY_OBJECT_I64V, i64);
+query_detour!(get_query_object_ui64v, GET_QUERY_OBJECT_UI64V, u64);
+
+unsafe extern "system" fn begin_conditional_render(id: u32, mode: u32) {
+    let flight = InFlight::enter();
+    let leave_out = match STATE.locked().as_mut() {
+        Some(state) => {
+            state.unconditional = state.live && state.blind.contains(&id);
+            state.counts.blind_conditions += u64::from(state.unconditional);
+            state.unconditional
+        }
+        None => false,
+    };
+    if !leave_out {
+        // SAFETY: forwards the game's own call.
+        unsafe { BEGIN_CONDITIONAL_RENDER.get(&flight)(id, mode) }
+    }
+}
+
+unsafe extern "system" fn end_conditional_render() {
+    let flight = InFlight::enter();
+    let left_out = STATE.locked().as_mut().is_some_and(|s| std::mem::take(&mut s.unconditional));
+    if !left_out {
+        // SAFETY: forwards the game's own call.
+        unsafe { END_CONDITIONAL_RENDER.get(&flight)() }
+    }
 }
 
 macro_rules! draw_detour {
