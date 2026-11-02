@@ -71,3 +71,26 @@ The driver (RTX 4090, 616.64) offers `GL_NV_stereo_view_rendering` with `GL_NV_v
 4. **S3 the one-view state**: occlusion queries, full-screen passes, clears per half, and screen-space
    passes per eye (KF2's list).
 5. **S4 headset**: frame time against same-frame stereo.
+
+## Built (on trial, `single_pass=1`)
+
+- **Sources**: the game's own render programs, read at run time from `base\chunk0.index` /
+  `chunk0.resources` (`single_pass/archive.rs`; raw deflate flushed without a final block). Each
+  `generated/renderprogs/<name>_pc.bin` holds a GLSL 150 vertex and fragment shader. Nothing of the
+  game's is shipped; `tools/sp/resources.py` extracts them for study (into `research/`, ignored).
+- **Matching**: each source compiled once; an engine program's binary carries NVIDIA assembly whose
+  normalised text (`assembly_key`) names its source (548 of 550 offline), ties by uniform names.
+- **Conversion** (`convert.rs`): `main` renamed, a new `main` writes `gl_ViewportMask[0]=1` and,
+  while `monaka_sp[4].x` is set, `gl_SecondaryPositionNV = E·gl_Position` to viewport 1
+  (`NV_stereo_view_rendering`). Linked with the engine program's own uniform, attribute and output
+  locations, then `glProgramBinary`'d into the engine's program, uniform values put back.
+- **Eye matrix** (`eye_matrix.rs`): `E = MVP_R·MVP_L⁻¹`, the same for every draw, measured each frame
+  from view 1's and view 2's position rows of the same draws; used the next frame.
+- **Draws** (`draws.rs`): view 1 draws (left-half viewport of a window-wide target, converted
+  program, perspective rows) draw both eyes; view 2's same draws are skipped. Left-half scissored
+  clears are mirrored in view 1; right-half clears of targets drawn for both eyes skipped in view 2.
+  Hooks: the engine's GL function table (slots found by the driver's addresses in the exe's data)
+  and its OpenGL32 imports.
+- **Known gaps**: culling is the left eye's (objects at the right eye's outer edge may pop);
+  `glClearBuffer*` not handled; programs made after the sweep stay single-eye; DLSS motion vectors
+  of the right eye come from the left eye's varyings.

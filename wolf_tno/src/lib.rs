@@ -18,6 +18,8 @@
 //!   site installed with it ([`providers::eye_site`]);
 //! - [`EYES`](providers::eye_site::EYES): stereo by the engine's side-by-side layout, the player's
 //!   render view turned by the head at the view builder, each eye given the headset's frustum;
+//! - [`SINGLE_PASS`]: both eyes drawn by the left eye's view, the right eye's view skipping what
+//!   is drawn (on trial, `single_pass=1`; [`single_pass`]);
 //! - [`LOOK`]: the player looks and shoots where the head points (Monaka's look, through the
 //!   command's angles, [`providers::look`]);
 //! - [`GUNS`]: each gun on its controller ([`providers::held_item`]); [`GUN`]: each shot from the
@@ -41,8 +43,9 @@
 //! The code is sorted by who should own it: [`providers`] (what only these games know: their
 //! facts, their hooks, reading and writing the game), [`extras`] (what only these games have: the
 //! cutting laser aimed by its gun), [`cooking`] (their own versions of features a Monaka ready-made
-//! should own, each waiting for a provider: the HUD layer and the sights) and `research` (the
-//! probes). The components are listed here, except those still cooking.
+//! should own, each waiting for a provider: the HUD layer and the sights), `research` (the
+//! probes) and [`single_pass`] (both eyes drawn by the left eye's pass, on trial). The components
+//! are listed here, except those still cooking.
 
 mod eyes;
 mod cooking;
@@ -52,6 +55,7 @@ mod manifest;
 mod launch_tests;
 mod providers;
 mod research;
+pub mod single_pass;
 
 use eyes::EyeSettings;
 use cooking::hud;
@@ -90,6 +94,7 @@ impl Game for Wolf {
             &providers::window_size::EYE_SIZE,
             &PRESENT,
             &eye_site::EYES,
+            &SINGLE_PASS,
             &LOOK,
             &cooking::body_forward::MOVE_HEADING_COMPONENT,
             &GUNS,
@@ -128,6 +133,7 @@ fn eyes(start: &Start<'_, Wolf>) -> EyeSettings {
 
 /// The components' places, for the detours to ask whether each is on.
 pub(crate) const EYES_AT: usize = place::<Wolf>(&eye_site::EYES);
+pub(crate) const SINGLE_PASS_AT: usize = place::<Wolf>(&SINGLE_PASS);
 pub(crate) const GUNS_AT: usize = place::<Wolf>(&GUNS);
 pub(crate) const GUN_AT: usize = place::<Wolf>(&GUN);
 pub(crate) const HUD_AT: usize = place::<Wolf>(&hud::HUD);
@@ -146,6 +152,23 @@ pub(crate) fn on(place: usize) -> bool {
 /// installed ([`providers::eye_site`]). Always on: with stereo off the whole frame goes to both
 /// eyes. It reports a full-screen video, which goes to the flat screen.
 pub const PRESENT: Component<Wolf> = Component { reports: &[Situation::Video], ..monaka_stereo::same_frame::same_frame() };
+
+/// Single pass (on trial, `single_pass=1`): the engine's scene programs converted to draw both
+/// eyes at once, the left eye's view drawing the right eye's too and the right eye's view skipping
+/// those draws ([`single_pass`]). Its work is at each `SwapBuffers`; at the stop the render thread
+/// turns the converted programs back to one eye before the hooks come out.
+pub const SINGLE_PASS: Component<Wolf> = Component {
+    name: "single_pass",
+    needs: &[Need::On(&eye_site::EYES)],
+    settings: |options, _| {
+        options.switch("single_pass", false);
+    },
+    on: |run| On::when(run.options.switch("single_pass", false), "single_pass is off"),
+    give_back: single_pass::draws::give_back,
+    let_go: Some(single_pass::draws::let_go),
+    summary: Some(single_pass::draws::summary),
+    ..Component::NONE
+};
 
 /// The player looks and shoots where the head points (`monaka_body::look`, through the input
 /// command's angles: [`providers::look`]): the head's turn shared into them after the game added

@@ -23,6 +23,7 @@ monaka_producer.workspace = true
 monaka_stereo.workspace = true
 monaka_dlss11.workspace = true
 monaka_warp.workspace = true
+miniz_oxide = "0.8"
 
 [dependencies.windows]
 workspace = true

@@ -224,6 +224,7 @@ pub unsafe extern "system" fn swap_buffers(dc: HDC) -> BOOL {
         }
     }
     crate::providers::window_size::seen(dc);
+    crate::single_pass::draws::frame(crate::on(crate::SINGLE_PASS_AT));
     vsync::follow(PAIRS.publishing());
     gl::present(dc);
     crate::cooking::frame_pacing::published();
