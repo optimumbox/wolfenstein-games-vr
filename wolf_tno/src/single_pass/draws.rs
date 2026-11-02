@@ -71,9 +71,18 @@ struct Counts {
     on_eye_target: u64,
 }
 
-/// The live frame whose viewports and draws are written to the log, one line each.
-const TRACED_FRAME: u64 = 600;
+/// The live frames whose passes are written to the log: each run of draws into one framebuffer
+/// and viewport as a line, with the clears and copies between them.
+const TRACED_FRAMES: std::ops::Range<u64> = 600..602;
 const TRACED_LINES: usize = 400;
+
+/// A traced frame: its lines and the run of draws being counted.
+struct Trace {
+    lines: Vec<String>,
+    run: Option<(u32, [i32; 4])>,
+    draws: u32,
+    scene: u32,
+}
 
 struct State {
     gl: Option<Gl>,
@@ -102,7 +111,7 @@ struct State {
     agreeing: (usize, usize),
     logged: Option<Instant>,
     live_frames: u64,
-    trace: Option<Vec<String>>,
+    trace: Option<Trace>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -187,13 +196,15 @@ pub fn frame(on: bool) {
         }
     }
     state.live_frames += 1;
-    if let Some(lines) = state.trace.take() {
+    if let Some(mut trace) = state.trace.take() {
+        end_run(state.gl.as_ref(), &mut trace);
+        let lines = trace.lines;
         log!("single pass: frame {} traced (eye targets {}x{}):
   {}", state.live_frames - 1, state.size.0, state.size.1, lines.join("
   "));
     }
-    if state.live_frames == TRACED_FRAME {
-        state.trace = Some(Vec::new());
+    if TRACED_FRAMES.contains(&state.live_frames) {
+        state.trace = Some(Trace { lines: Vec::new(), run: None, draws: 0, scene: 0 });
     }
     let size = monaka_stereo::same_frame::gl::frame_size().unwrap_or((0, 0));
     state.size = (size.0 as i32, size.1 as i32);
@@ -413,6 +424,10 @@ fn install() -> bool {
     draws += hook!(DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE, "glDrawElementsInstancedBaseVertexBaseInstance", draw_elements_instanced_base_vertex_base_instance as DrawElementsInstancedBaseVertexBaseInstanceFn, false);
     draws += hook!(DRAW_ARRAYS_INSTANCED_BASE_INSTANCE, "glDrawArraysInstancedBaseInstance", draw_arrays_instanced_base_instance as DrawArraysInstancedBaseInstanceFn, false);
     draws += hook!(MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS, "glMultiDrawElementsIndirectBindlessNV", multi_draw_elements_indirect_bindless as MultiDrawElementsIndirectBindlessFn, false);
+    hook!(BLIT, "glBlitFramebuffer", blit as BlitFn, false);
+    hook!(BLIT_NAMED, "glBlitNamedFramebuffer", blit_named as BlitNamedFn, false);
+    hook!(COPY_IMAGE, "glCopyImageSubData", copy_image as CopyImageFn, false);
+    hook!(COPY_TEX_SUB_IMAGE, "glCopyTexSubImage2D", copy_tex_sub_image as CopyTexSubImageFn, false);
     log!("single pass: the engine's GL functions found: {}", found.join(", "));
     if draws == 0 {
         log!("single pass: off: none of the engine's draw functions found");
@@ -501,9 +516,7 @@ fn draw() -> bool {
     }
     state.counts.draws += 1;
     if !state.programs.contains_key(&state.current) {
-        if let Some(trace) = state.trace.as_mut().filter(|t| t.len() < TRACED_LINES) {
-            trace.push(format!("draw program {} (not converted) fb {}", state.current, draw_framebuffer()));
-        }
+        traced_draw(state, false);
         return true;
     }
     state.counts.converted += 1;
@@ -515,12 +528,7 @@ fn draw() -> bool {
     state.counts.perspective += u64::from(perspective);
     state.counts.in_a_half += u64::from(perspective && side != Half::Neither);
     state.counts.on_eye_target += u64::from(target.is_some());
-    if state.trace.as_ref().is_some_and(|t| t.len() < TRACED_LINES) {
-        let framebuffer = draw_framebuffer();
-        let width = eye_target(state).map_or_else(|| format!("{:?}", state.widths.get(&framebuffer)), |_| "eye".to_owned());
-        let line = format!("draw program {current} w row {:?} viewport {:?} fb {framebuffer} width {width} phase {:?}", rows[3], state.viewport, state.phase);
-        state.trace.as_mut().expect("checked").push(line);
-    }
+    traced_draw(state, perspective);
     let Some(gl) = state.gl.as_ref() else { return true };
     let program = state.programs.get_mut(&current).expect("looked up above");
     match (target, side, state.phase) {
@@ -610,6 +618,126 @@ fn clear_plan() -> ClearPlan {
     }
 }
 
+// ---- The trace ----
+
+/// What framebuffer `framebuffer` draws into: its colour and depth attachments, with sizes.
+fn describe(gl: Option<&Gl>, framebuffer: u32) -> String {
+    let Some(gl) = gl else { return format!("fb {framebuffer}") };
+    if framebuffer == 0 {
+        return "the window".to_owned();
+    }
+    let mut parts = Vec::new();
+    for (label, attachment) in [("colour", gl_api::GL_COLOR_ATTACHMENT0), ("colour1", gl_api::GL_COLOR_ATTACHMENT0 + 1), ("depth", gl_api::GL_DEPTH_ATTACHMENT)] {
+        let (mut kind, mut name, mut width, mut height) = (0, 0, 0, 0);
+        // SAFETY: plain queries into locals.
+        unsafe {
+            (gl.get_named_framebuffer_attachment_parameter_iv)(framebuffer, attachment, gl_api::GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &mut kind);
+            (gl.get_named_framebuffer_attachment_parameter_iv)(framebuffer, attachment, gl_api::GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &mut name);
+            if kind as u32 == gl_api::GL_TEXTURE {
+                (gl.get_texture_level_parameter_iv)(name as u32, 0, gl_api::GL_TEXTURE_WIDTH, &mut width);
+                (gl.get_texture_level_parameter_iv)(name as u32, 0, 0x1001, &mut height);
+            }
+        }
+        if kind != 0 {
+            let what = if kind as u32 == gl_api::GL_TEXTURE { "tex" } else { "rb" };
+            parts.push(format!("{label} {what} {name} {width}x{height}"));
+        }
+    }
+    format!("fb {framebuffer} ({})", parts.join(", "))
+}
+
+fn end_run(gl: Option<&Gl>, trace: &mut Trace) {
+    if let Some((framebuffer, viewport)) = trace.run.take()
+        && trace.lines.len() < TRACED_LINES
+    {
+        trace.lines.push(format!("{} viewport {viewport:?}: {} draws, {} perspective", describe(gl, framebuffer), trace.draws, trace.scene));
+    }
+    trace.draws = 0;
+    trace.scene = 0;
+}
+
+fn traced_draw(state: &mut State, scene: bool) {
+    let Some(mut trace) = state.trace.take() else { return };
+    let run = (draw_framebuffer(), state.viewport);
+    if trace.run != Some(run) {
+        end_run(state.gl.as_ref(), &mut trace);
+        trace.run = Some(run);
+    }
+    trace.draws += 1;
+    trace.scene += u32::from(scene);
+    state.trace = Some(trace);
+}
+
+/// A clear or copy between the runs of draws.
+fn traced(text: impl FnOnce() -> String) {
+    let mut guard = STATE.locked();
+    let Some(state) = guard.as_mut() else { return };
+    let Some(mut trace) = state.trace.take() else { return };
+    end_run(state.gl.as_ref(), &mut trace);
+    if trace.lines.len() < TRACED_LINES {
+        trace.lines.push(text());
+    }
+    state.trace = Some(trace);
+}
+
+type BlitFn = unsafe extern "system" fn(i32, i32, i32, i32, i32, i32, i32, i32, u32, u32);
+type BlitNamedFn = unsafe extern "system" fn(u32, u32, i32, i32, i32, i32, i32, i32, i32, i32, u32, u32);
+type CopyImageFn = unsafe extern "system" fn(u32, u32, i32, i32, i32, i32, u32, u32, i32, i32, i32, i32, i32, i32, i32);
+type CopyTexSubImageFn = unsafe extern "system" fn(u32, i32, i32, i32, i32, i32, i32, i32);
+static BLIT: Original<BlitFn> = Original::new();
+static BLIT_NAMED: Original<BlitNamedFn> = Original::new();
+static COPY_IMAGE: Original<CopyImageFn> = Original::new();
+static COPY_TEX_SUB_IMAGE: Original<CopyTexSubImageFn> = Original::new();
+
+unsafe extern "system" fn blit(sx0: i32, sy0: i32, sx1: i32, sy1: i32, dx0: i32, dy0: i32, dx1: i32, dy1: i32, mask: u32, filter: u32) {
+    let flight = InFlight::enter();
+    traced(|| {
+        let mut read = 0;
+        // SAFETY: a state query into a local (GL_READ_FRAMEBUFFER_BINDING).
+        unsafe { glGetIntegerv(0x8CAA, &mut read) };
+        format!("blit fb {read} [{sx0} {sy0} {sx1} {sy1}] to fb {} [{dx0} {dy0} {dx1} {dy1}] mask {mask:#x}", draw_framebuffer())
+    });
+    // SAFETY: forwards the game's own call.
+    unsafe { BLIT.get(&flight)(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter) }
+}
+
+unsafe extern "system" fn blit_named(read: u32, draw: u32, sx0: i32, sy0: i32, sx1: i32, sy1: i32, dx0: i32, dy0: i32, dx1: i32, dy1: i32, mask: u32, filter: u32) {
+    let flight = InFlight::enter();
+    traced(|| format!("blit fb {read} [{sx0} {sy0} {sx1} {sy1}] to fb {draw} [{dx0} {dy0} {dx1} {dy1}] mask {mask:#x}"));
+    // SAFETY: forwards the game's own call.
+    unsafe { BLIT_NAMED.get(&flight)(read, draw, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter) }
+}
+
+unsafe extern "system" fn copy_image(
+    src: u32,
+    src_target: u32,
+    src_level: i32,
+    sx: i32,
+    sy: i32,
+    sz: i32,
+    dst: u32,
+    dst_target: u32,
+    dst_level: i32,
+    dx: i32,
+    dy: i32,
+    dz: i32,
+    w: i32,
+    h: i32,
+    d: i32,
+) {
+    let flight = InFlight::enter();
+    traced(|| format!("copy image {src} ({sx} {sy}) to {dst} ({dx} {dy}) {w}x{h}"));
+    // SAFETY: forwards the game's own call.
+    unsafe { COPY_IMAGE.get(&flight)(src, src_target, src_level, sx, sy, sz, dst, dst_target, dst_level, dx, dy, dz, w, h, d) }
+}
+
+unsafe extern "system" fn copy_tex_sub_image(target: u32, level: i32, xoffset: i32, yoffset: i32, x: i32, y: i32, w: i32, h: i32) {
+    let flight = InFlight::enter();
+    traced(|| format!("copy fb {} ({x} {y}) {w}x{h} to the bound texture ({xoffset} {yoffset}) target {target:#x}", draw_framebuffer()));
+    // SAFETY: forwards the game's own call.
+    unsafe { COPY_TEX_SUB_IMAGE.get(&flight)(target, level, xoffset, yoffset, x, y, w, h) }
+}
+
 // ---- The detours ----
 
 unsafe extern "system" fn use_program(program: u32) {
@@ -644,9 +772,6 @@ unsafe extern "system" fn viewport(x: i32, y: i32, w: i32, h: i32) {
     let flight = InFlight::enter();
     if let Some(state) = STATE.locked().as_mut() {
         state.viewport = [x, y, w, h];
-        if let Some(trace) = state.trace.as_mut().filter(|t| t.len() < TRACED_LINES) {
-            trace.push(format!("viewport {x} {y} {w} {h}"));
-        }
         // glViewport sets every viewport: viewport 1 follows before the next stereo draw.
         state.index_one = true;
         match half(state, x, w) {
@@ -670,6 +795,13 @@ unsafe extern "system" fn scissor(x: i32, y: i32, w: i32, h: i32) {
 
 unsafe extern "system" fn clear(mask: u32) {
     let flight = InFlight::enter();
+    traced(|| {
+        let mut scissor = [0i32; 4];
+        // SAFETY: state queries into locals.
+        let on = unsafe { glIsEnabled(gl_api::GL_SCISSOR_TEST) } != 0;
+        unsafe { glGetIntegerv(gl_api::GL_SCISSOR_BOX, scissor.as_mut_ptr()) };
+        format!("clear {mask:#x} fb {}{}", draw_framebuffer(), if on { format!(" scissor {scissor:?}") } else { String::new() })
+    });
     let original = CLEAR.get(&flight);
     match clear_plan() {
         ClearPlan::AsIs => unsafe { original(mask) },
