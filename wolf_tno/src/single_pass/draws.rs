@@ -21,6 +21,10 @@
 //! the right eye's pass: its culling is its own, and skipped it would cull nearly all of the next
 //! frame's right eye ([`Writes`]).
 //!
+//! A draw of the stretch with another depth projection than the world's (the hands and their
+//! weapon, their depth squeezed in front of the world) is not carried by the eye matrix, which
+//! fits the world's: each pass draws it into its own layer ([`depth_ratio`]).
+//!
 //! The stand-ins are made once the scene's framebuffers have been seen for a while
 //! ([`DISCOVERY_FRAMES`]); at each `SwapBuffers` the frame's last layer is copied back into the
 //! engine's textures, for what reads them at the present (the frame's depth).
@@ -85,6 +89,8 @@ struct Counts {
     in_stretch: u64,
     /// The right eye's stretch draws writing neither colour nor depth (its culling's), drawn.
     unwritten: u64,
+    /// The stretch's draws with another depth projection than the world's, drawn by each pass.
+    own_projection: u64,
 }
 
 /// The live frames whose passes are written to the log: each run of draws into one framebuffer
@@ -132,6 +138,10 @@ struct State {
     /// This frame's eye matrix (measured last frame) and its number.
     matrix: Option<Rows>,
     matrix_number: u64,
+    /// The world's depth projection (the stretch's usual [`depth_ratio`], measured last frame),
+    /// and this frame's left-eye stretch ratios.
+    world_depth: Option<f32>,
+    depth_ratios: Vec<f32>,
     left: Vec<(u32, Rows)>,
     right: Vec<(u32, Rows)>,
     counts: Counts,
@@ -168,6 +178,8 @@ fn state() -> State {
         widths: HashMap::new(),
         matrix: None,
         matrix_number: 0,
+        world_depth: None,
+        depth_ratios: Vec::new(),
         left: Vec::new(),
         right: Vec::new(),
         counts: Counts::default(),
@@ -309,6 +321,8 @@ pub fn frame(on: bool) {
     state.matrix_number += 1;
     state.agreeing = measured.map_or((0, pairs.len()), |m| (m.agreeing, m.looked_at));
     state.left.clear();
+    state.world_depth = median(&mut state.depth_ratios);
+    state.depth_ratios.clear();
     state.right.clear();
     state.pass = 0;
     state.cut = false;
@@ -343,13 +357,15 @@ pub fn frame(on: bool) {
             state.agreeing.1
         );
         log!(
-            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch; {} of the right eye's writing neither colour nor depth, drawn",
+            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch; {} of the right eye's writing neither colour nor depth, drawn; {} with their own depth projection, drawn by each eye (world's {:?})",
             c.draws,
             c.converted,
             c.perspective,
             c.stood_in,
             c.in_stretch,
-            c.unwritten
+            c.unwritten,
+            c.own_projection,
+            state.world_depth
         );
     }
 }
@@ -628,7 +644,19 @@ fn draw() -> bool {
     state.counts.in_stretch += u64::from(stretch);
     let Some(rows) = rows else { return true };
     let Some(gl) = state.gl.as_ref() else { return true };
+    let ratio = depth_ratio(&rows);
+    if stretch && state.pass == 1 && state.depth_ratios.len() < DEPTH_RATIOS {
+        state.depth_ratios.extend(ratio);
+    }
+    let own_projection = stretch && state.world_depth.zip(ratio).is_some_and(|(world, ratio)| (ratio - world).abs() > 1e-3 * world.abs().max(1e-6));
     let program = state.programs.get_mut(&current).expect("looked up above");
+    if own_projection {
+        // Drawn into the pass's own layer (the switch off: layer 0 of the layered framebuffer in
+        // the left eye's pass, the right eye's layer in its own).
+        set_switch(gl, program, false);
+        state.counts.own_projection += 1;
+        return true;
+    }
     match (stretch, state.pass) {
         (true, 1) => {
             if state.left.len() < RECORDED {
@@ -669,6 +697,23 @@ fn draw() -> bool {
             true
         }
     }
+}
+
+/// The left eye's stretch ratios kept a frame.
+const DEPTH_RATIOS: usize = 512;
+
+/// A draw's depth projection: its z row against its w row (x, y, z parts). A perspective
+/// projection's z row is its w row times a constant (the view's own z) plus a constant, so draws
+/// with the same projection share it whatever their model and view.
+fn depth_ratio(rows: &Rows) -> Option<f32> {
+    let (z, w) = (&rows[2][..3], &rows[3][..3]);
+    let ww: f32 = w.iter().map(|v| v * v).sum();
+    (ww > 1e-12).then(|| z.iter().zip(w).map(|(z, w)| z * w).sum::<f32>() / ww)
+}
+
+fn median(values: &mut [f32]) -> Option<f32> {
+    values.sort_unstable_by(f32::total_cmp);
+    values.get(values.len() / 2).copied()
 }
 
 /// What the draw about to be made writes into its framebuffer. One writing neither colour nor
