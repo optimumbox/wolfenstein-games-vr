@@ -97,7 +97,12 @@ impl Conversion {
                     Stage::Compiling { sources, scratch, since }
                 } else {
                     self.sources = sources;
-                    match_and_convert(gl, &self.sources, &scratch)
+                    let stage = match_and_convert(gl, &self.sources, &scratch, &mut self.converted);
+                    if matches!(stage, Stage::Failed) && !self.converted.is_empty() {
+                        self.stage = Stage::Done;
+                        return Some(self.converted.clone());
+                    }
+                    stage
                 }
             }
             Stage::Converting { jobs, since } => {
@@ -175,7 +180,7 @@ fn uniform_names(uniforms: &[ActiveUniform]) -> Vec<String> {
 
 /// The sources' assembly matched to the engine's programs, and a converted scratch program
 /// started for each engine program that can draw both eyes.
-fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32]) -> Stage {
+fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: &mut Vec<Converted>) -> Stage {
     let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
     let mut names = Vec::with_capacity(sources.len());
     for (index, &program) in scratch.iter().enumerate() {
@@ -196,6 +201,12 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32]) -> Stage 
             continue;
         }
         engine_programs += 1;
+        // Converted by an earlier run in this process: known by its stereo uniform, its source by
+        // its other uniforms' names.
+        if let Some(converted) = converted_before(gl, engine, sources, &names) {
+            already.push(converted);
+            continue;
+        }
         let Some(key) = gl.binary(engine).and_then(|(_, b)| gl_api::assembly_key(&b)) else { continue };
         let Some(candidates) = by_key.get(&key) else { continue };
         let uniforms = gl.uniforms(engine);
@@ -217,13 +228,35 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32]) -> Stage 
         jobs.push(Job { engine, source, rows, scratch });
     }
     log!(
-        "single pass: {engine_programs} engine programs, {matched} matched to their render program ({flat} full-screen or 2D, left as they are); converting {}",
+        "single pass: {engine_programs} engine programs, {} converted before, {matched} matched to their render program ({flat} full-screen or 2D, left as they are); converting {}",
+        already.len(),
         jobs.len()
     );
     if jobs.is_empty() {
         return Stage::Failed;
     }
     Stage::Converting { jobs, since: Instant::now() }
+}
+
+/// An engine program an earlier run converted: its locations, from the render program with the
+/// same uniforms (its own less the stereo uniform).
+fn converted_before(gl: &Gl, engine: u32, sources: &[Renderprog], names: &[Vec<String>]) -> Option<Converted> {
+    let stereo = locations(gl, engine, &[convert::STEREO_UNIFORM], convert::STEREO_ROWS)?;
+    let own: Vec<String> = uniform_names(&gl.uniforms(engine)).into_iter().filter(|n| n != convert::STEREO_UNIFORM).collect();
+    let rows = (0..sources.len()).filter(|&i| names[i] == own).find_map(|i| convert::position_rows(&sources[i].vertex))?;
+    let rows = locations(gl, engine, &rows.map(|r| format!("_va_[{r}]")).iter().map(String::as_str).collect::<Vec<_>>(), 0)?;
+    Some(Converted { program: engine, rows: rows.try_into().ok()?, stereo: stereo.try_into().ok()? })
+}
+
+/// The locations of `names` in `program` (with `rows` > 0: the rows of the one array named), none
+/// when one is missing.
+fn locations(gl: &Gl, program: u32, names: &[&str], rows: usize) -> Option<Vec<i32>> {
+    let names: Vec<String> = if rows > 0 { (0..rows).map(|r| format!("{}[{r}]", names[0])).collect() } else { names.iter().map(|n| (*n).to_owned()).collect() };
+    names
+        .iter()
+        // SAFETY: plain queries with NUL-terminated names.
+        .map(|name| Some(unsafe { (gl.get_uniform_location)(program, gl_api::c_name(name).as_ptr()) }).filter(|&l| l >= 0))
+        .collect()
 }
 
 /// The converted binary moved into the engine's program, its uniform values and block bindings
