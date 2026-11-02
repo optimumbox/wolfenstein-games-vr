@@ -94,3 +94,20 @@ The driver (RTX 4090, 616.64) offers `GL_NV_stereo_view_rendering` with `GL_NV_v
 - **Known gaps**: culling is the left eye's (objects at the right eye's outer edge may pop);
   `glClearBuffer*` not handled; programs made after the sweep stay single-eye; DLSS motion vectors
   of the right eye come from the left eye's varyings.
+
+## What the trace found (2026-11-02)
+
+The draws described above never fire: the engine draws no side-by-side target. A traced frame
+(600-601) shows the whole frame made twice per present, the left eye then the right, each into the
+same 1792x1792 framebuffers (1-5, sharing colour textures 1 and 3 and depth texture 4); the two only
+meet in the last two draws, into the window's halves. No blits or texture copies happen. Temporal
+targets alternate per eye (fb 34/35, 40/41).
+
+The render thread is CPU-bound: 11.5 ms of CPU in an 11.7 ms frame, 80-85 pairs/s.
+
+A probe that dropped every perspective draw of the second eye pass held 90.0 pairs/s with the
+render thread's CPU at 6.0-6.5 ms: the second eye's GL submission is most of the cost, so single
+pass is worth building. Doing it means drawing both eyes from the first pass into two-layer copies
+of the eye targets (gl_Layer from the vertex shader) and skipping the second pass's scene draws;
+the engine draws with NV bindless calls, so it may sample the eye targets through handles the copies
+would have to stand in for (not yet checked).
