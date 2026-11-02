@@ -61,6 +61,9 @@ const MOST_REFRESHES: u64 = 4;
 /// shortest taken as one (a shorter report is not a headset's).
 static SHORTEST_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 const SHORTEST_TAKEN_NS: u64 = 2_000_000;
+/// How often the pacing's tallies since the last are logged (nanoseconds), and how many times.
+const WINDOW_NS: u64 = 10_000_000_000;
+const WINDOWS_LOGGED: u64 = 60;
 
 /// The executable, `com_syncToTime` and the game's rate, from the install.
 static FACTS: OnceLock<(Module, &'static Cvar, GameRate)> = OnceLock::new();
@@ -201,11 +204,36 @@ struct State {
     off_sum_us: u64,
     off_worst_us: u64,
     began: u64,
+    /// The window logged every [`WINDOW_NS`]: since when, and its tallies.
+    window: Window,
+    windows_logged: u64,
+    /// When the last frame started after its wait (nanoseconds; 0: none).
+    last_started: u64,
+}
+
+/// The pacing's tallies over one logged window.
+#[derive(Clone, Copy)]
+struct Window {
+    since: u64,
+    frames: u64,
+    late: u64,
+    missed_slot: u64,
+    worst_us: u64,
+    /// The game thread's longest frame, its wait for the slot left out (microseconds).
+    work_worst_us: u64,
+    /// Frames whose own work took longer than a refresh.
+    work_over: u64,
+}
+
+impl Window {
+    const fn new(since: u64) -> Self {
+        Self { since, frames: 0, late: 0, missed_slot: 0, worst_us: 0, work_worst_us: 0, work_over: 0 }
+    }
 }
 
 impl State {
     const fn new() -> Self {
-        Self { period: 0, phase: 0, last: None, refreshes: 0, frames: 0, late: 0, missed_slot: 0, worst_us: 0, landed: 0, off_sum_us: 0, off_worst_us: 0, began: 0 }
+        Self { period: 0, phase: 0, last: None, refreshes: 0, frames: 0, late: 0, missed_slot: 0, worst_us: 0, landed: 0, off_sum_us: 0, off_worst_us: 0, began: 0, window: Window::new(0), windows_logged: 0, last_started: 0 }
     }
 }
 
@@ -219,6 +247,7 @@ fn set_pacing(pacing: bool) {
     }
     let mut state = STATE.locked();
     state.last = None;
+    state.last_started = 0;
     PUBLISHED.store(0, Relaxed);
     if state.began < 20 {
         state.began += 1;
@@ -275,9 +304,18 @@ fn pace() {
     let (slot, late) = next_slot(&timing, state.phase, state.last, refreshes, now);
     if late {
         state.late += 1;
+        state.window.late += 1;
+    }
+    // The frame before's own work: from its start to now.
+    if state.last_started != 0 && state.last.is_some() {
+        let work_us = now.saturating_sub(state.last_started) / 1000;
+        state.window.work_worst_us = state.window.work_worst_us.max(work_us);
+        state.window.work_over += u64::from(work_us * 1000 > timing.period_ns);
     }
     state.last = Some(slot);
     state.frames += 1;
+    state.window.frames += 1;
+    log_window(&mut state, now, timing.period_ns);
     drop(state);
     // A slot further off than a frame's refreshes is not this grid's: no wait.
     if slot > now && slot - now <= (refreshes + 1) * timing.period_ns {
@@ -289,8 +327,38 @@ fn pace() {
     let mut state = STATE.locked();
     if off_slot > 100 {
         state.missed_slot += 1;
+        state.window.missed_slot += 1;
     }
     state.worst_us = state.worst_us.max(off_slot);
+    state.window.worst_us = state.window.worst_us.max(off_slot);
+    state.last_started = started;
+}
+
+/// Every [`WINDOW_NS`], the window's tallies logged and started afresh.
+fn log_window(state: &mut State, now: u64, period: u64) {
+    if state.window.since == 0 {
+        state.window = Window::new(now);
+        return;
+    }
+    if now.saturating_sub(state.window.since) < WINDOW_NS {
+        return;
+    }
+    let w = state.window;
+    let seconds = now.saturating_sub(w.since) as f64 / 1e9;
+    if state.windows_logged < WINDOWS_LOGGED {
+        state.windows_logged += 1;
+        log!(
+            "frame pacing over {seconds:.0} s: {:.1} frames a second on a {:.1} Hz grid; {} late, {} over 0.1 ms off their slot (the most {} us); the game thread's own work over a refresh {} times, at most {:.2} ms",
+            w.frames as f64 / seconds,
+            1e9 / period.max(1) as f64,
+            w.late,
+            w.missed_slot,
+            w.worst_us,
+            w.work_over,
+            w.work_worst_us as f64 / 1000.0,
+        );
+    }
+    state.window = Window::new(now);
 }
 
 unsafe extern "system" fn frame(common: usize) -> usize {
