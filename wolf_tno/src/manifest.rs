@@ -26,9 +26,10 @@ pub const MANIFESTS: &[Manifest] = &[
         run_prefix: "wolf",
         before: BEFORE,
         options: &OPTIONS,
-        // A gun in each hand when dual wielding: a ring on each.
-        left_hand_aims: true,
-        weapon_ring: true,
+        // No aim ring on the guns: they aim with the hands, and the sights show where (as the HUD's
+        // crosshair, hidden by default).
+        left_hand_aims: false,
+        weapon_ring: false,
         ..Manifest::GAME
     },
     Manifest {
@@ -43,8 +44,8 @@ pub const MANIFESTS: &[Manifest] = &[
         run_prefix: "wolf",
         before: BEFORE,
         options: &TOB_OPTIONS,
-        left_hand_aims: true,
-        weapon_ring: true,
+        left_hand_aims: false,
+        weapon_ring: false,
         ..Manifest::GAME
     },
 ];
