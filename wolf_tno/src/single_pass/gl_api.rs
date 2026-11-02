@@ -109,6 +109,25 @@ entry_points! {
     get_named_framebuffer_attachment_parameter_iv: "glGetNamedFramebufferAttachmentParameteriv" fn(u32, u32, u32, *mut i32);
     get_texture_level_parameter_iv: "glGetTextureLevelParameteriv" fn(u32, i32, u32, *mut i32);
     get_named_renderbuffer_parameter_iv: "glGetNamedRenderbufferParameteriv" fn(u32, u32, *mut i32);
+    is_framebuffer: "glIsFramebuffer" fn(u32) -> u8;
+    bind_framebuffer: "glBindFramebuffer" fn(u32, u32);
+    create_framebuffers: "glCreateFramebuffers" fn(i32, *mut u32);
+    delete_framebuffers: "glDeleteFramebuffers" fn(i32, *const u32);
+    named_framebuffer_texture: "glNamedFramebufferTexture" fn(u32, u32, u32, i32);
+    named_framebuffer_texture_layer: "glNamedFramebufferTextureLayer" fn(u32, u32, u32, i32, i32);
+    named_framebuffer_renderbuffer: "glNamedFramebufferRenderbuffer" fn(u32, u32, u32, u32);
+    named_framebuffer_draw_buffers: "glNamedFramebufferDrawBuffers" fn(u32, i32, *const u32);
+    named_framebuffer_read_buffer: "glNamedFramebufferReadBuffer" fn(u32, u32);
+    check_named_framebuffer_status: "glCheckNamedFramebufferStatus" fn(u32, u32) -> u32;
+    create_textures: "glCreateTextures" fn(u32, i32, *mut u32);
+    gen_textures: "glGenTextures" fn(i32, *mut u32);
+    delete_textures: "glDeleteTextures" fn(i32, *const u32);
+    texture_storage_3d: "glTextureStorage3D" fn(u32, i32, u32, i32, i32, i32);
+    texture_view: "glTextureView" fn(u32, u32, u32, u32, u32, u32, u32, u32);
+    get_texture_parameter_iv: "glGetTextureParameteriv" fn(u32, u32, *mut i32);
+    texture_parameter_i: "glTextureParameteri" fn(u32, u32, i32);
+    copy_image_sub_data: "glCopyImageSubData" fn(u32, u32, i32, i32, i32, i32, u32, u32, i32, i32, i32, i32, i32, i32, i32);
+    bind_multi_texture: "glBindMultiTextureEXT" fn(u32, u32, u32);
 }
 
 fn load<F: Copy>(name: &str) -> Option<F> {

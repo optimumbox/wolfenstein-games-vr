@@ -4,5 +4,6 @@ pub mod archive;
 pub mod convert;
 pub mod draws;
 pub mod gl_api;
+pub mod layers;
 pub mod eye_matrix;
 pub mod programs;

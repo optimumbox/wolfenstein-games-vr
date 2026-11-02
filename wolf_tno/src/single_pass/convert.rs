@@ -2,9 +2,10 @@
 //! `GL_NV_stereo_view_rendering`.
 //!
 //! - The vertex shader's `main` is kept as `monaka_main`; a new `main` runs it, sends the vertex
-//!   to viewport 0 (the eye the engine is drawing, as `glViewport` set it) and, while the stereo
-//!   uniform's switch is on, writes the other eye's position into viewport 1: the left eye's clip
-//!   position times the eye matrix ([`STEREO_UNIFORM`], rows 0 to 3; row 4's x is the switch). The
+//!   to layer 0 (the eye the engine is drawing) and, while the stereo uniform's switch is on,
+//!   writes the other eye's position into layer 1 of the same viewport (`secondary_view_offset`):
+//!   the left eye's clip position times the eye matrix ([`STEREO_UNIFORM`], rows 0 to 3; row 4's
+//!   x is the switch). A framebuffer that is not layered ignores the layer. The
 //!   eye matrix is the right eye's view-projection over the left eye's, the same for every draw of
 //!   a frame, so no per-draw constant changes.
 //! - Every plain uniform gets the location the engine's program gave it ([`with_locations`]), so
@@ -14,7 +15,7 @@
 //! `return` in `main`, plain `uniform <type> <name> [<n>] ;` declarations, one uniform block.
 
 /// The converted vertex shader's uniform: rows 0-3 the eye matrix, row 4's x the switch.
-pub const STEREO_UNIFORM: &str = "monaka_sp";
+pub const STEREO_UNIFORM: &str = "monaka_sl";
 /// Its rows.
 pub const STEREO_ROWS: usize = 5;
 
@@ -47,13 +48,15 @@ pub fn stereo_vertex(vertex: &str) -> Option<String> {
     out.push_str("void monaka_main()");
     out.push_str(&vertex[at.1..]);
     out.push_str(&format!(
-        "\nuniform vec4 {u}[{n}];\n\
+        "\nlayout( secondary_view_offset = 1 ) out int gl_Layer;\n\
+         uniform vec4 {u}[{n}];\n\
          void main() {{\n\
          \tmonaka_main();\n\
+         \tgl_Layer = 0;\n\
          \tgl_ViewportMask[0] = 1;\n\
          \tif ( {u}[4].x != 0.0 ) {{\n\
          \t\tgl_SecondaryPositionNV = vec4( dot( {u}[0], gl_Position ), dot( {u}[1], gl_Position ), dot( {u}[2], gl_Position ), dot( {u}[3], gl_Position ) );\n\
-         \t\tgl_SecondaryViewportMaskNV[0] = 2;\n\
+         \t\tgl_SecondaryViewportMaskNV[0] = 1;\n\
          \t}} else {{\n\
          \t\tgl_SecondaryPositionNV = gl_Position;\n\
          \t\tgl_SecondaryViewportMaskNV[0] = 0;\n\

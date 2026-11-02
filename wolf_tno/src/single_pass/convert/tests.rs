@@ -42,8 +42,9 @@ fn the_stereo_vertex_shader_keeps_main_and_adds_the_other_eye() {
     assert!(out.starts_with("#version 150\n#extension GL_NV_viewport_array2 : require\n#extension GL_NV_stereo_view_rendering : require\n"));
     assert!(out.contains("void monaka_main() {\n\tvec4 position"));
     assert_eq!(out.matches("void main()").count(), 1);
-    assert!(out.contains("gl_SecondaryViewportMaskNV[0] = 2;"));
-    assert!(out.contains("uniform vec4 monaka_sp[5];"));
+    assert!(out.contains("layout( secondary_view_offset = 1 ) out int gl_Layer;"));
+    assert!(out.contains("gl_SecondaryViewportMaskNV[0] = 1;"));
+    assert!(out.contains("uniform vec4 monaka_sl[5];"));
     assert_eq!(stereo_vertex("#version 150\nvoid mainly() {}\n"), None);
 }
 

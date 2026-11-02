@@ -1,23 +1,31 @@
-//! The draws: each scene draw of the left eye's view also draws the right eye, and the right eye's
-//! view skips the draws already made.
+//! The draws: the scene draws of the left eye's pass also draw the right eye, and the right eye's
+//! pass skips them.
 //!
-//! The engine draws its two views one after the other into the halves of its eye targets (window
-//! wide: the left half is view 1, the right half view 2). A draw is a scene draw of view 1 when its
-//! viewport lies in the left half of an eye target, its program is converted ([`super::programs`])
-//! and its position rows are a perspective's; the converted program then sends a second copy of
-//! each vertex, carried by the eye matrix ([`super::eye_matrix`]), to viewport 1 (the same rect in
-//! the right half). The same draw in view 2 (right half) is skipped. Both views' rows are recorded
-//! as they go: the matrix for the next frame is measured from them at `SwapBuffers`, and without
-//! one each view draws for itself, as before.
+//! The engine draws a frame as two passes, the left eye's then the right's, each into the same
+//! eye-sized textures (a colour, depth and stencil clear begins each). Those textures are stood in
+//! for by two-layer arrays ([`super::layers`]): the engine's framebuffer and texture binds are
+//! redirected to ours, layer 0 in the left eye's pass and layer 1 in the right's.
 //!
-//! Clears follow: in view 1 a clear scissored to the left half is made again in the right half;
-//! in view 2 a clear of the right half of a target view 1 drew both eyes into is skipped.
+//! Each pass begins with its scene: draws with a converted program ([`super::programs`]) and
+//! perspective position rows into framebuffers whose attachments are all eye textures. While the
+//! left eye's pass is in that stretch its framebuffers are the layered ones and the converted
+//! programs send a second copy of each vertex, carried by the eye matrix ([`super::eye_matrix`]),
+//! into layer 1. The right eye's pass skips the same stretch, its draws and clears, finding its
+//! layer drawn. Each pass's stretch ends at its first other draw into an eye texture (lighting,
+//! post-processing, which take per-eye inputs): from there both passes draw as the engine does,
+//! in its order. Both passes' rows are recorded in the stretch: the matrix for the next frame is
+//! measured from them at `SwapBuffers`, and without one each pass draws for itself, as before.
+//!
+//! The stand-ins are made once the scene's framebuffers have been seen for a while
+//! ([`DISCOVERY_FRAMES`]); at each `SwapBuffers` the frame's last layer is copied back into the
+//! engine's textures, for what reads them at the present (the frame's depth).
 //!
 //! The engine's extension functions are called through its own function table, whose slots are
 //! found in the executable's data by the driver's and OpenGL32's addresses ([`install`]).
 
 use super::eye_matrix::{self, Rows};
 use super::gl_api::{self, Gl};
+use super::layers::Layers;
 use super::programs::{Conversion, Converted};
 use monaka_core::sync::Locked;
 use monaka_hook::module::Module;
@@ -28,22 +36,22 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering::*};
 use std::time::{Duration, Instant};
-use windows::Win32::Graphics::OpenGL::{glGetIntegerv, glIsEnabled};
+use windows::Win32::Graphics::OpenGL::glGetIntegerv;
 
-/// The draws recorded per view and frame, for the eye matrix.
+/// The draws recorded per pass and frame, for the eye matrix.
 const RECORDED: usize = 96;
 /// How often the counters are logged.
 const LOG_EVERY: Duration = Duration::from_secs(10);
+/// The live frames whose scene framebuffers are gathered before the stand-ins are made.
+const DISCOVERY_FRAMES: u64 = 60;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Phase {
-    /// No view drawn yet this frame.
-    Before,
-    /// View 1 (left half).
-    Left,
-    /// View 2 (right half), to the frame's end.
-    Right,
-}
+const GL_FRAMEBUFFER: u32 = 0x8D40;
+const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
+const GL_DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
+const GL_TEXTURE0: u32 = 0x84C0;
+const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
+const GL_DEPTH_BUFFER_BIT: u32 = 0x100;
 
 /// A converted program as drawn: its locations, its position rows as last uploaded, and its
 /// stereo uniform as last set.
@@ -58,23 +66,24 @@ struct Program {
 struct Counts {
     stereo: u64,
     skipped: u64,
-    mirrored: u64,
     clears_skipped: u64,
     frames_on: u64,
     frames_off: u64,
+    /// Frames with other than two passes.
+    odd_frames: u64,
     /// The draws seen, then those passing each test in turn: a converted program, perspective
-    /// rows, a viewport in one half, an eye target.
+    /// rows, a framebuffer stood in for, the scene's stretch.
     draws: u64,
     converted: u64,
     perspective: u64,
-    in_a_half: u64,
-    on_eye_target: u64,
+    stood_in: u64,
+    in_stretch: u64,
 }
 
 /// The live frames whose passes are written to the log: each run of draws into one framebuffer
-/// and viewport as a line, with the clears and copies between them.
+/// and viewport as a line, with the clears between them.
 const TRACED_FRAMES: std::ops::Range<u64> = 600..602;
-const TRACED_LINES: usize = 400;
+const TRACED_LINES: usize = 600;
 
 /// A traced frame: its lines and the run of draws being counted.
 struct Trace {
@@ -82,6 +91,8 @@ struct Trace {
     run: Option<(u32, [i32; 4])>,
     draws: u32,
     scene: u32,
+    /// The textures the run's draws were given ("t1@u3").
+    binds: Vec<String>,
 }
 
 struct State {
@@ -94,19 +105,28 @@ struct State {
     live: bool,
     programs: HashMap<u32, Program>,
     current: u32,
-    /// The eye targets' size (the window's).
+    /// The window's size (both eyes side by side): an eye is half its width.
     size: (i32, i32),
     viewport: [i32; 4],
-    phase: Phase,
-    /// Viewport and scissor 1 need setting before the next stereo draw.
-    index_one: bool,
+    /// The pass this frame is in: 0 before the first, 1 the left eye's, 2 the right's.
+    pass: u32,
+    /// The pass's scene stretch is over.
+    cut: bool,
+    /// The framebuffers and eye textures the engine has bound (its names).
+    draw_framebuffer: u32,
+    read_framebuffer: u32,
+    units: HashMap<u32, (u32, u32)>,
+    layers: Option<Layers>,
+    /// The stand-ins could not be made (not tried again this run).
+    layers_failed: bool,
+    /// The scene's framebuffers seen before the stand-ins are made, and framebuffers' widths.
+    seen: HashSet<u32>,
     widths: HashMap<u32, Option<i32>>,
     /// This frame's eye matrix (measured last frame) and its number.
     matrix: Option<Rows>,
     matrix_number: u64,
     left: Vec<(u32, Rows)>,
     right: Vec<(u32, Rows)>,
-    both_eyes: HashSet<u32>,
     counts: Counts,
     agreeing: (usize, usize),
     logged: Option<Instant>,
@@ -130,19 +150,71 @@ fn state() -> State {
         current: 0,
         size: (0, 0),
         viewport: [0; 4],
-        phase: Phase::Before,
-        index_one: true,
+        pass: 0,
+        cut: false,
+        draw_framebuffer: 0,
+        read_framebuffer: 0,
+        units: HashMap::new(),
+        layers: None,
+        layers_failed: false,
+        seen: HashSet::new(),
         widths: HashMap::new(),
         matrix: None,
         matrix_number: 0,
         left: Vec::new(),
         right: Vec::new(),
-        both_eyes: HashSet::new(),
         counts: Counts::default(),
         agreeing: (0, 0),
         logged: None,
         live_frames: 0,
         trace: None,
+    }
+}
+
+impl State {
+    /// The layer the pass draws into.
+    fn layer(&self) -> usize {
+        usize::from(self.pass >= 2)
+    }
+
+    /// The framebuffer drawn into for the engine's `framebuffer`.
+    fn mapped(&self, framebuffer: u32) -> u32 {
+        let Some(stand) = self.layers.as_ref().filter(|_| self.live).and_then(|l| l.stand(framebuffer)) else { return framebuffer };
+        match stand.layered {
+            Some(layered) if self.pass == 1 && !self.cut => layered,
+            _ => stand.layer[self.layer()],
+        }
+    }
+
+    /// The texture given for the engine's `texture`.
+    fn texture(&self, texture: u32) -> u32 {
+        self.layers.as_ref().filter(|_| self.live).and_then(|l| l.view(texture, self.layer())).unwrap_or(texture)
+    }
+
+    /// The engine's bound framebuffers and eye textures bound again as the pass has them.
+    fn rebind(&self) {
+        let Some(gl) = self.gl.as_ref() else { return };
+        // SAFETY: plain binds of the engine's objects or ours standing in for them.
+        unsafe {
+            (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, self.mapped(self.draw_framebuffer));
+            (gl.bind_framebuffer)(GL_READ_FRAMEBUFFER, self.mapped(self.read_framebuffer));
+            for (&unit, &(target, texture)) in &self.units {
+                (gl.bind_multi_texture)(GL_TEXTURE0 + unit, target, self.texture(texture));
+            }
+        }
+    }
+
+    /// Whether `framebuffer` draws into an eye texture (half the window wide).
+    fn eye_sized(&mut self, framebuffer: u32) -> bool {
+        let width = match self.widths.get(&framebuffer) {
+            Some(&width) => width,
+            None => {
+                let width = self.gl.as_ref().and_then(|gl| gl.framebuffer_width(framebuffer));
+                self.widths.insert(framebuffer, width);
+                width
+            }
+        };
+        width == Some(self.size.0 / 2) && self.size.0 > 0
     }
 }
 
@@ -190,6 +262,14 @@ pub fn frame(on: bool) {
             return;
         }
         state.tried = true;
+        let (mut draw, mut read) = (0, 0);
+        // SAFETY: state queries into locals (the engine's own bindings: nothing stands in yet).
+        unsafe {
+            glGetIntegerv(gl_api::GL_DRAW_FRAMEBUFFER_BINDING, &mut draw);
+            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &mut read);
+        }
+        state.draw_framebuffer = draw as u32;
+        state.read_framebuffer = read as u32;
         state.live = install();
         if !state.live {
             return;
@@ -199,65 +279,92 @@ pub fn frame(on: bool) {
     if let Some(mut trace) = state.trace.take() {
         end_run(state.gl.as_ref(), &mut trace);
         let lines = trace.lines;
-        log!("single pass: frame {} traced (eye targets {}x{}):
-  {}", state.live_frames - 1, state.size.0, state.size.1, lines.join("
-  "));
+        log!("single pass: frame {} traced:\n  {}", state.live_frames - 1, lines.join("\n  "));
     }
     if TRACED_FRAMES.contains(&state.live_frames) {
-        state.trace = Some(Trace { lines: Vec::new(), run: None, draws: 0, scene: 0 });
+        state.trace = Some(Trace { lines: Vec::new(), run: None, draws: 0, scene: 0, binds: Vec::new() });
+    }
+    let passes = state.pass;
+    if let (Some(layers), Some(gl)) = (state.layers.as_ref(), state.gl.as_ref()) {
+        layers.copy_back(gl, state.layer());
     }
     let size = monaka_stereo::same_frame::gl::frame_size().unwrap_or((0, 0));
     state.size = (size.0 as i32, size.1 as i32);
     let pairs: Vec<(Rows, Rows)> = state.left.iter().zip(&state.right).filter(|(l, r)| l.0 == r.0).map(|(l, r)| (l.1, r.1)).collect();
-    let measured = eye_matrix::measure(&pairs);
+    let measured = if passes == 2 { eye_matrix::measure(&pairs) } else { None };
     if state.matrix.is_some() {
         state.counts.frames_on += 1;
     } else {
         state.counts.frames_off += 1;
     }
+    state.counts.odd_frames += u64::from(passes != 2);
     state.matrix = measured.map(|m| m.matrix);
     state.matrix_number += 1;
     state.agreeing = measured.map_or((0, pairs.len()), |m| (m.agreeing, m.looked_at));
     state.left.clear();
     state.right.clear();
-    state.both_eyes.clear();
-    state.widths.clear();
-    state.phase = Phase::Before;
+    state.pass = 0;
+    state.cut = false;
+    if state.layers.is_none() && !state.layers_failed && passes == 2 && state.live_frames >= DISCOVERY_FRAMES && !state.seen.is_empty() {
+        let seen: Vec<u32> = state.seen.iter().copied().collect();
+        let eye = (state.size.0 / 2, state.size.1);
+        match Layers::build(state.gl.as_ref().expect("loaded above"), &seen, eye) {
+            Ok(layers) => {
+                let (textures, framebuffers, layered) = layers.counts();
+                log!("single pass: {textures} eye textures stood in for by layered arrays; {framebuffers} framebuffers drawing into them, {layered} with every attachment layered (scene framebuffers {seen:?})");
+                state.layers = Some(layers);
+            }
+            Err(e) => {
+                log!("single pass: off: {e}");
+                state.layers_failed = true;
+            }
+        }
+    }
+    state.rebind();
     if state.logged.is_none_or(|at| at.elapsed() >= LOG_EVERY) {
         state.logged = Some(Instant::now());
         let c = &state.counts;
         log!(
-            "single pass: {} frames both eyes in one pass, {} each eye its own; {} draws for both eyes, {} skipped; {} clears mirrored, {} skipped; eye matrix from {} of {} pairs",
+            "single pass: {} frames both eyes in one pass, {} each eye its own ({} without two passes); {} draws for both eyes, {} skipped, {} clears skipped; eye matrix from {} of {} pairs",
             c.frames_on,
             c.frames_off,
+            c.odd_frames,
             c.stereo,
             c.skipped,
-            c.mirrored,
             c.clears_skipped,
             state.agreeing.0,
             state.agreeing.1
         );
         log!(
-            "single pass: {} draws, {} with a converted program, {} perspective, {} in a half, {} on an eye target ({}x{})",
+            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch",
             c.draws,
             c.converted,
             c.perspective,
-            c.in_a_half,
-            c.on_eye_target,
-            state.size.0,
-            state.size.1
+            c.stood_in,
+            c.in_stretch
         );
     }
 }
 
-/// The stop on the render thread: every switch off, then the detours stand aside.
+/// The stop on the render thread: every switch off, the engine's own objects bound again, then the
+/// detours stand aside.
 fn stop(state: &mut State) {
     if let Some(gl) = state.gl.as_ref() {
         for program in state.programs.values_mut() {
             set_switch(gl, program, false);
         }
+        if let Some(layers) = state.layers.as_ref() {
+            layers.copy_back(gl, state.layer());
+        }
     }
     state.live = false;
+    state.rebind();
+    if let (Some(mut layers), Some(gl)) = (state.layers.take(), state.gl.as_ref()) {
+        layers.release(gl);
+    }
+    state.layers_failed = false;
+    state.seen.clear();
+    state.units.clear();
     state.tried = false;
     LET_GO.store(true, Release);
 }
@@ -306,6 +413,10 @@ type Uniform4fvFn = unsafe extern "system" fn(i32, i32, *const f32);
 type ProgramUniform4fvFn = unsafe extern "system" fn(u32, i32, i32, *const f32);
 type RectFn = unsafe extern "system" fn(i32, i32, i32, i32);
 type ClearFn = unsafe extern "system" fn(u32);
+type BindFramebufferFn = unsafe extern "system" fn(u32, u32);
+type BindTextureFn = unsafe extern "system" fn(u32, u32);
+type BindTexturesFn = unsafe extern "system" fn(u32, i32, *const u32);
+type BindMultiTextureFn = unsafe extern "system" fn(u32, u32, u32);
 type DrawArraysFn = unsafe extern "system" fn(u32, i32, i32);
 type DrawElementsFn = unsafe extern "system" fn(u32, i32, u32, *const c_void);
 type DrawElementsBaseVertexFn = unsafe extern "system" fn(u32, i32, u32, *const c_void, i32);
@@ -329,8 +440,12 @@ static USE_PROGRAM: Original<UseProgramFn> = Original::new();
 static UNIFORM_4FV: Original<Uniform4fvFn> = Original::new();
 static PROGRAM_UNIFORM_4FV: Original<ProgramUniform4fvFn> = Original::new();
 static VIEWPORT: Original<RectFn> = Original::new();
-static SCISSOR: Original<RectFn> = Original::new();
 static CLEAR: Original<ClearFn> = Original::new();
+static BIND_FRAMEBUFFER: Original<BindFramebufferFn> = Original::new();
+static BIND_FRAMEBUFFER_EXT: Original<BindFramebufferFn> = Original::new();
+static BIND_TEXTURE: Original<BindTextureFn> = Original::new();
+static BIND_TEXTURES: Original<BindTexturesFn> = Original::new();
+static BIND_MULTI_TEXTURE: Original<BindMultiTextureFn> = Original::new();
 static DRAW_ARRAYS: Original<DrawArraysFn> = Original::new();
 static DRAW_ELEMENTS: Original<DrawElementsFn> = Original::new();
 static DRAW_ELEMENTS_BASE_VERTEX: Original<DrawElementsBaseVertexFn> = Original::new();
@@ -350,7 +465,7 @@ static DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE: Original<DrawElementsI
 static DRAW_ARRAYS_INSTANCED_BASE_INSTANCE: Original<DrawArraysInstancedBaseInstanceFn> = Original::new();
 static MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS: Original<MultiDrawElementsIndirectBindlessFn> = Original::new();
 
-/// The slots in the executable's data holding the driver's `address`.
+/// Where the executable's data holds `address`.
 fn slots(exe: &Module, address: usize) -> Vec<usize> {
     let Some(code) = exe.kept_code() else { return Vec::new() };
     let mut out = Vec::new();
@@ -403,9 +518,17 @@ fn install() -> bool {
     hook!(USE_PROGRAM, "glUseProgram", use_program as UseProgramFn, true);
     hook!(UNIFORM_4FV, "glUniform4fv", uniform_4fv as Uniform4fvFn, true);
     hook!(PROGRAM_UNIFORM_4FV, "glProgramUniform4fv", program_uniform_4fv as ProgramUniform4fvFn, false);
-    hook!(VIEWPORT, "glViewport", viewport as RectFn, true);
-    hook!(SCISSOR, "glScissor", scissor as RectFn, false);
-    hook!(CLEAR, "glClear", clear as ClearFn, false);
+    hook!(VIEWPORT, "glViewport", viewport as RectFn, false);
+    hook!(CLEAR, "glClear", clear as ClearFn, true);
+    let binds = hook!(BIND_FRAMEBUFFER, "glBindFramebuffer", bind_framebuffer as BindFramebufferFn, false)
+        + hook!(BIND_FRAMEBUFFER_EXT, "glBindFramebufferEXT", bind_framebuffer_ext as BindFramebufferFn, false);
+    if binds == 0 {
+        log!("single pass: off: the engine's glBindFramebuffer is not in its data ({})", found.join(", "));
+        return false;
+    }
+    hook!(BIND_TEXTURE, "glBindTexture", bind_texture as BindTextureFn, false);
+    hook!(BIND_TEXTURES, "glBindTextures", bind_textures as BindTexturesFn, false);
+    hook!(BIND_MULTI_TEXTURE, "glBindMultiTextureEXT", bind_multi_texture as BindMultiTextureFn, false);
     draws += hook!(DRAW_ELEMENTS, "glDrawElements", draw_elements as DrawElementsFn, false);
     draws += hook!(DRAW_ARRAYS, "glDrawArrays", draw_arrays as DrawArraysFn, false);
     draws += hook!(DRAW_ELEMENTS_BASE_VERTEX, "glDrawElementsBaseVertex", draw_elements_base_vertex as DrawElementsBaseVertexFn, false);
@@ -424,10 +547,6 @@ fn install() -> bool {
     draws += hook!(DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE, "glDrawElementsInstancedBaseVertexBaseInstance", draw_elements_instanced_base_vertex_base_instance as DrawElementsInstancedBaseVertexBaseInstanceFn, false);
     draws += hook!(DRAW_ARRAYS_INSTANCED_BASE_INSTANCE, "glDrawArraysInstancedBaseInstance", draw_arrays_instanced_base_instance as DrawArraysInstancedBaseInstanceFn, false);
     draws += hook!(MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS, "glMultiDrawElementsIndirectBindlessNV", multi_draw_elements_indirect_bindless as MultiDrawElementsIndirectBindlessFn, false);
-    hook!(BLIT, "glBlitFramebuffer", blit as BlitFn, false);
-    hook!(BLIT_NAMED, "glBlitNamedFramebuffer", blit_named as BlitNamedFn, false);
-    hook!(COPY_IMAGE, "glCopyImageSubData", copy_image as CopyImageFn, false);
-    hook!(COPY_TEX_SUB_IMAGE, "glCopyTexSubImage2D", copy_tex_sub_image as CopyTexSubImageFn, false);
     log!("single pass: the engine's GL functions found: {}", found.join(", "));
     if draws == 0 {
         log!("single pass: off: none of the engine's draw functions found");
@@ -466,48 +585,8 @@ fn uploaded(state: &mut State, program: u32, location: i32, count: i32, values: 
     }
 }
 
-fn draw_framebuffer() -> u32 {
-    let mut framebuffer = 0;
-    // SAFETY: a state query into a local.
-    unsafe { glGetIntegerv(gl_api::GL_DRAW_FRAMEBUFFER_BINDING, &mut framebuffer) };
-    framebuffer as u32
-}
-
-/// Whether the bound draw framebuffer is an eye target (window wide), and its name.
-fn eye_target(state: &mut State) -> Option<u32> {
-    let framebuffer = draw_framebuffer();
-    let width = match state.widths.get(&framebuffer) {
-        Some(&width) => width,
-        None => {
-            let width = if framebuffer == 0 { Some(state.size.0) } else { state.gl.as_ref()?.framebuffer_width(framebuffer) };
-            state.widths.insert(framebuffer, width);
-            width
-        }
-    };
-    (width == Some(state.size.0) && state.size.0 > 0).then_some(framebuffer)
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Half {
-    Left,
-    Right,
-    Neither,
-}
-
-fn half(state: &State, x: i32, w: i32) -> Half {
-    let middle = state.size.0 / 2;
-    if w <= 0 || middle <= 0 {
-        Half::Neither
-    } else if x + w <= middle {
-        Half::Left
-    } else if x >= middle {
-        Half::Right
-    } else {
-        Half::Neither
-    }
-}
-
-/// Whether the draw about to be made goes ahead (one of view 2's already drawn is skipped).
+/// Whether the draw about to be made goes ahead (one of the right eye's pass already drawn is
+/// skipped).
 fn draw() -> bool {
     let mut guard = STATE.locked();
     let Some(state) = guard.as_mut() else { return true };
@@ -515,24 +594,35 @@ fn draw() -> bool {
         return true;
     }
     state.counts.draws += 1;
-    if !state.programs.contains_key(&state.current) {
-        traced_draw(state, false);
-        return true;
-    }
-    state.counts.converted += 1;
     let current = state.current;
-    let rows = state.programs[&current].rows;
-    let perspective = rows[3][..3].iter().any(|v| v.abs() > 1e-6);
-    let side = half(state, state.viewport[0], state.viewport[2]);
-    let target = if perspective && side != Half::Neither { eye_target(state) } else { None };
+    let rows = state.programs.get(&current).map(|p| p.rows);
+    let perspective = rows.is_some_and(|rows| rows[3][..3].iter().any(|v| v.abs() > 1e-6));
+    state.counts.converted += u64::from(rows.is_some());
     state.counts.perspective += u64::from(perspective);
-    state.counts.in_a_half += u64::from(perspective && side != Half::Neither);
-    state.counts.on_eye_target += u64::from(target.is_some());
     traced_draw(state, perspective);
+    let framebuffer = state.draw_framebuffer;
+    if state.layers.is_none() {
+        if perspective && state.pass >= 1 && state.eye_sized(framebuffer) {
+            state.seen.insert(framebuffer);
+        }
+    }
+    let stand = state.layers.as_ref().and_then(|l| l.stand(framebuffer));
+    state.counts.stood_in += u64::from(stand.is_some());
+    let mut stretch = stand.is_some() && !state.cut && (state.pass == 1 || state.pass == 2);
+    if stretch && !(perspective && stand.is_some_and(|s| s.layered.is_some())) {
+        // The scene's stretch ends: the left eye's pass draws into its own layer from here.
+        state.cut = true;
+        stretch = false;
+        if state.pass == 1 {
+            state.rebind();
+        }
+    }
+    state.counts.in_stretch += u64::from(stretch);
+    let Some(rows) = rows else { return true };
     let Some(gl) = state.gl.as_ref() else { return true };
     let program = state.programs.get_mut(&current).expect("looked up above");
-    match (target, side, state.phase) {
-        (Some(framebuffer), Half::Left, Phase::Before | Phase::Left) => {
+    match (stretch, state.pass) {
+        (true, 1) => {
             if state.left.len() < RECORDED {
                 state.left.push((current, rows));
             }
@@ -548,21 +638,10 @@ fn draw() -> bool {
                 program.matrix = state.matrix_number;
             }
             set_switch(gl, program, true);
-            if state.index_one {
-                let [x, y, w, h] = state.viewport;
-                let middle = state.size.0 / 2;
-                // SAFETY: plain GL calls; viewport and scissor 1 serve only the second copy.
-                unsafe {
-                    (gl.viewport_indexed_f)(1, (x + middle) as f32, y as f32, w as f32, h as f32);
-                    (gl.scissor_indexed)(1, middle, 0, middle, state.size.1);
-                }
-                state.index_one = false;
-            }
-            state.both_eyes.insert(framebuffer);
             state.counts.stereo += 1;
             true
         }
-        (Some(_), Half::Right, Phase::Right) => {
+        (true, _) => {
             if state.right.len() < RECORDED {
                 state.right.push((current, rows));
             }
@@ -580,42 +659,25 @@ fn draw() -> bool {
     }
 }
 
-/// What to do with a clear: make it as it is, make it again in the right half, or skip it.
-enum ClearPlan {
-    AsIs,
-    Mirror([i32; 4]),
-    Skip,
-}
-
-fn clear_plan() -> ClearPlan {
+/// Whether a clear goes ahead: a colour and depth clear begins a pass; in the right eye's pass a
+/// clear of the scene's stretch, already made in both layers, is skipped.
+fn clear_goes_ahead(mask: u32) -> bool {
     let mut guard = STATE.locked();
-    let Some(state) = guard.as_mut() else { return ClearPlan::AsIs };
-    if !state.live || state.matrix.is_none() {
-        return ClearPlan::AsIs;
+    let Some(state) = guard.as_mut() else { return true };
+    if !state.live {
+        return true;
     }
-    // SAFETY: a state query.
-    if unsafe { glIsEnabled(gl_api::GL_SCISSOR_TEST) } == 0 {
-        return ClearPlan::AsIs;
+    if mask & (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT) == GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT {
+        state.pass += 1;
+        state.cut = false;
+        state.rebind();
     }
-    let mut scissor = [0i32; 4];
-    // SAFETY: a state query into four ints.
-    unsafe { glGetIntegerv(gl_api::GL_SCISSOR_BOX, scissor.as_mut_ptr()) };
-    let side = half(state, scissor[0], scissor[2]);
-    if side == Half::Neither {
-        return ClearPlan::AsIs;
+    let layered = state.layers.as_ref().and_then(|l| l.stand(state.draw_framebuffer)).is_some_and(|s| s.layered.is_some());
+    if state.pass == 2 && !state.cut && layered && state.matrix.is_some() {
+        state.counts.clears_skipped += 1;
+        return false;
     }
-    let Some(framebuffer) = eye_target(state) else { return ClearPlan::AsIs };
-    match (side, state.phase) {
-        (Half::Left, Phase::Before | Phase::Left) => {
-            state.counts.mirrored += 1;
-            ClearPlan::Mirror(scissor)
-        }
-        (Half::Right, Phase::Right) if state.both_eyes.contains(&framebuffer) => {
-            state.counts.clears_skipped += 1;
-            ClearPlan::Skip
-        }
-        _ => ClearPlan::AsIs,
-    }
+    true
 }
 
 // ---- The trace ----
@@ -650,15 +712,17 @@ fn end_run(gl: Option<&Gl>, trace: &mut Trace) {
     if let Some((framebuffer, viewport)) = trace.run.take()
         && trace.lines.len() < TRACED_LINES
     {
-        trace.lines.push(format!("{} viewport {viewport:?}: {} draws, {} perspective", describe(gl, framebuffer), trace.draws, trace.scene));
+        let binds = if trace.binds.is_empty() { String::new() } else { format!(" given {}", trace.binds.join(" ")) };
+        trace.lines.push(format!("{} viewport {viewport:?}: {} draws, {} perspective{binds}", describe(gl, framebuffer), trace.draws, trace.scene));
     }
+    trace.binds.clear();
     trace.draws = 0;
     trace.scene = 0;
 }
 
 fn traced_draw(state: &mut State, scene: bool) {
     let Some(mut trace) = state.trace.take() else { return };
-    let run = (draw_framebuffer(), state.viewport);
+    let run = (state.draw_framebuffer, state.viewport);
     if trace.run != Some(run) {
         end_run(state.gl.as_ref(), &mut trace);
         trace.run = Some(run);
@@ -668,10 +732,8 @@ fn traced_draw(state: &mut State, scene: bool) {
     state.trace = Some(trace);
 }
 
-/// A clear or copy between the runs of draws.
-fn traced(text: impl FnOnce() -> String) {
-    let mut guard = STATE.locked();
-    let Some(state) = guard.as_mut() else { return };
+/// A clear between the runs of draws.
+fn traced(state: &mut State, text: impl FnOnce() -> String) {
     let Some(mut trace) = state.trace.take() else { return };
     end_run(state.gl.as_ref(), &mut trace);
     if trace.lines.len() < TRACED_LINES {
@@ -680,62 +742,34 @@ fn traced(text: impl FnOnce() -> String) {
     state.trace = Some(trace);
 }
 
-type BlitFn = unsafe extern "system" fn(i32, i32, i32, i32, i32, i32, i32, i32, u32, u32);
-type BlitNamedFn = unsafe extern "system" fn(u32, u32, i32, i32, i32, i32, i32, i32, i32, i32, u32, u32);
-type CopyImageFn = unsafe extern "system" fn(u32, u32, i32, i32, i32, i32, u32, u32, i32, i32, i32, i32, i32, i32, i32);
-type CopyTexSubImageFn = unsafe extern "system" fn(u32, i32, i32, i32, i32, i32, i32, i32);
-static BLIT: Original<BlitFn> = Original::new();
-static BLIT_NAMED: Original<BlitNamedFn> = Original::new();
-static COPY_IMAGE: Original<CopyImageFn> = Original::new();
-static COPY_TEX_SUB_IMAGE: Original<CopyTexSubImageFn> = Original::new();
-
-unsafe extern "system" fn blit(sx0: i32, sy0: i32, sx1: i32, sy1: i32, dx0: i32, dy0: i32, dx1: i32, dy1: i32, mask: u32, filter: u32) {
-    let flight = InFlight::enter();
-    traced(|| {
-        let mut read = 0;
-        // SAFETY: a state query into a local (GL_READ_FRAMEBUFFER_BINDING).
-        unsafe { glGetIntegerv(0x8CAA, &mut read) };
-        format!("blit fb {read} [{sx0} {sy0} {sx1} {sy1}] to fb {} [{dx0} {dy0} {dx1} {dy1}] mask {mask:#x}", draw_framebuffer())
-    });
-    // SAFETY: forwards the game's own call.
-    unsafe { BLIT.get(&flight)(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter) }
+/// A texture given to the coming draws, noted on the traced run (once each).
+fn given(state: &mut State, text: impl FnOnce() -> String) {
+    let Some(trace) = state.trace.as_mut() else { return };
+    let text = text();
+    if !trace.binds.contains(&text) && trace.binds.len() < 48 {
+        trace.binds.push(text);
+    }
 }
 
-unsafe extern "system" fn blit_named(read: u32, draw: u32, sx0: i32, sy0: i32, sx1: i32, sy1: i32, dx0: i32, dy0: i32, dx1: i32, dy1: i32, mask: u32, filter: u32) {
-    let flight = InFlight::enter();
-    traced(|| format!("blit fb {read} [{sx0} {sy0} {sx1} {sy1}] to fb {draw} [{dx0} {dy0} {dx1} {dy1}] mask {mask:#x}"));
-    // SAFETY: forwards the game's own call.
-    unsafe { BLIT_NAMED.get(&flight)(read, draw, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter) }
+fn active_unit() -> u32 {
+    let mut unit = 0;
+    // SAFETY: a state query into a local (GL_ACTIVE_TEXTURE).
+    unsafe { glGetIntegerv(0x84E0, &mut unit) };
+    (unit as u32).wrapping_sub(GL_TEXTURE0)
 }
 
-unsafe extern "system" fn copy_image(
-    src: u32,
-    src_target: u32,
-    src_level: i32,
-    sx: i32,
-    sy: i32,
-    sz: i32,
-    dst: u32,
-    dst_target: u32,
-    dst_level: i32,
-    dx: i32,
-    dy: i32,
-    dz: i32,
-    w: i32,
-    h: i32,
-    d: i32,
-) {
-    let flight = InFlight::enter();
-    traced(|| format!("copy image {src} ({sx} {sy}) to {dst} ({dx} {dy}) {w}x{h}"));
-    // SAFETY: forwards the game's own call.
-    unsafe { COPY_IMAGE.get(&flight)(src, src_target, src_level, sx, sy, sz, dst, dst_target, dst_level, dx, dy, dz, w, h, d) }
-}
-
-unsafe extern "system" fn copy_tex_sub_image(target: u32, level: i32, xoffset: i32, yoffset: i32, x: i32, y: i32, w: i32, h: i32) {
-    let flight = InFlight::enter();
-    traced(|| format!("copy fb {} ({x} {y}) {w}x{h} to the bound texture ({xoffset} {yoffset}) target {target:#x}", draw_framebuffer()));
-    // SAFETY: forwards the game's own call.
-    unsafe { COPY_TEX_SUB_IMAGE.get(&flight)(target, level, xoffset, yoffset, x, y, w, h) }
+/// The texture to bind to `unit` for the engine's `texture` (kept as an eye texture's binding).
+fn unit_texture(unit: u32, target: u32, texture: u32) -> u32 {
+    let mut guard = STATE.locked();
+    let Some(state) = guard.as_mut().filter(|s| s.live) else { return texture };
+    given(state, || format!("t{texture}@u{unit}"));
+    let given = state.texture(texture);
+    if given == texture {
+        state.units.remove(&unit);
+    } else {
+        state.units.insert(unit, (target, texture));
+    }
+    given
 }
 
 // ---- The detours ----
@@ -772,56 +806,81 @@ unsafe extern "system" fn viewport(x: i32, y: i32, w: i32, h: i32) {
     let flight = InFlight::enter();
     if let Some(state) = STATE.locked().as_mut() {
         state.viewport = [x, y, w, h];
-        // glViewport sets every viewport: viewport 1 follows before the next stereo draw.
-        state.index_one = true;
-        match half(state, x, w) {
-            Half::Left if state.phase == Phase::Before => state.phase = Phase::Left,
-            Half::Right if state.phase != Phase::Before => state.phase = Phase::Right,
-            _ => {}
-        }
     }
     // SAFETY: forwards the game's own call.
     unsafe { VIEWPORT.get(&flight)(x, y, w, h) }
 }
 
-unsafe extern "system" fn scissor(x: i32, y: i32, w: i32, h: i32) {
-    let flight = InFlight::enter();
-    if let Some(state) = STATE.locked().as_mut() {
-        state.index_one = true;
-    }
-    // SAFETY: forwards the game's own call.
-    unsafe { SCISSOR.get(&flight)(x, y, w, h) }
-}
-
 unsafe extern "system" fn clear(mask: u32) {
     let flight = InFlight::enter();
-    traced(|| {
-        let mut scissor = [0i32; 4];
-        // SAFETY: state queries into locals.
-        let on = unsafe { glIsEnabled(gl_api::GL_SCISSOR_TEST) } != 0;
-        unsafe { glGetIntegerv(gl_api::GL_SCISSOR_BOX, scissor.as_mut_ptr()) };
-        format!("clear {mask:#x} fb {}{}", draw_framebuffer(), if on { format!(" scissor {scissor:?}") } else { String::new() })
+    if let Some(state) = STATE.locked().as_mut() {
+        let framebuffer = state.draw_framebuffer;
+        traced(state, || format!("clear {mask:#x} fb {framebuffer}"));
+    }
+    if clear_goes_ahead(mask) {
+        // SAFETY: forwards the game's own call.
+        unsafe { CLEAR.get(&flight)(mask) }
+    }
+}
+
+/// The engine's framebuffer bind, made with the framebuffer standing in for it.
+fn bound(target: u32, framebuffer: u32) -> u32 {
+    let mut guard = STATE.locked();
+    let Some(state) = guard.as_mut().filter(|s| s.live) else { return framebuffer };
+    if target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER {
+        state.draw_framebuffer = framebuffer;
+    }
+    if target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER {
+        state.read_framebuffer = framebuffer;
+    }
+    state.mapped(framebuffer)
+}
+
+unsafe extern "system" fn bind_framebuffer(target: u32, framebuffer: u32) {
+    let flight = InFlight::enter();
+    let framebuffer = bound(target, framebuffer);
+    // SAFETY: forwards the game's own call (with our stand-in).
+    unsafe { BIND_FRAMEBUFFER.get(&flight)(target, framebuffer) }
+}
+
+unsafe extern "system" fn bind_framebuffer_ext(target: u32, framebuffer: u32) {
+    let flight = InFlight::enter();
+    let framebuffer = bound(target, framebuffer);
+    // SAFETY: forwards the game's own call (with our stand-in).
+    unsafe { BIND_FRAMEBUFFER_EXT.get(&flight)(target, framebuffer) }
+}
+
+unsafe extern "system" fn bind_texture(target: u32, texture: u32) {
+    let flight = InFlight::enter();
+    let texture = unit_texture(active_unit(), target, texture);
+    // SAFETY: forwards the game's own call (with our stand-in).
+    unsafe { BIND_TEXTURE.get(&flight)(target, texture) }
+}
+
+unsafe extern "system" fn bind_multi_texture(unit: u32, target: u32, texture: u32) {
+    let flight = InFlight::enter();
+    let texture = unit_texture(unit.wrapping_sub(GL_TEXTURE0), target, texture);
+    // SAFETY: forwards the game's own call (with our stand-in).
+    unsafe { BIND_MULTI_TEXTURE.get(&flight)(unit, target, texture) }
+}
+
+unsafe extern "system" fn bind_textures(first: u32, count: i32, textures: *const u32) {
+    let flight = InFlight::enter();
+    let count_usize = count.max(0) as usize;
+    let given: Option<Vec<u32>> = (!textures.is_null()).then(|| {
+        // SAFETY: the game's array of `count` names.
+        let names = unsafe { std::slice::from_raw_parts(textures, count_usize) };
+        // The target is the engine's own for its eye textures: 2D.
+        names.iter().enumerate().map(|(i, &t)| unit_texture(first + i as u32, 0x0DE1, t)).collect()
     });
-    let original = CLEAR.get(&flight);
-    match clear_plan() {
-        ClearPlan::AsIs => unsafe { original(mask) },
-        ClearPlan::Skip => {}
-        ClearPlan::Mirror([x, y, w, h]) => {
-            let scissor = SCISSOR.get(&flight);
-            let middle = STATE.locked().as_ref().map_or(0, |s| s.size.0 / 2);
-            // SAFETY: the game's own clear, made in its rect and again in the right half, its
-            // scissor put back.
-            unsafe {
-                original(mask);
-                scissor(x + middle, y, w, h);
-                original(mask);
-                scissor(x, y, w, h);
-            }
-            if let Some(state) = STATE.locked().as_mut() {
-                state.index_one = true;
-            }
+    if given.is_none() {
+        for i in 0..count_usize {
+            unit_texture(first + i as u32, 0x0DE1, 0);
         }
     }
+    let pointer = given.as_ref().map_or(textures, |g| g.as_ptr());
+    // SAFETY: forwards the game's own call (with our stand-ins).
+    unsafe { BIND_TEXTURES.get(&flight)(first, count, pointer) }
 }
 
 macro_rules! draw_detour {
