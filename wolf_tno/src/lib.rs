@@ -87,6 +87,7 @@ impl Game for Wolf {
             &settings::SETTINGS,
             &cooking::frame_rate::FRAME_RATE_COMPONENT,
             &cooking::frame_pacing::FRAME_PACING_COMPONENT,
+            &providers::window_size::EYE_SIZE,
             &PRESENT,
             &eye_site::EYES,
             &LOOK,

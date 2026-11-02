@@ -153,6 +153,10 @@ pub struct Build {
     pub frame: Site<FrameFn>,
     /// `com_syncToTime` (1: the frame loop waits for its tick, 0: it runs the next frame at once).
     pub sync_to_time: Cvar,
+    /// `r_fullscreen` (0: windowed). Windowed, the engine renders at its window's client size and
+    /// follows its resizes (`r_windowWidth` and `r_windowHeight` track `WM_SIZE`); None where not
+    /// mapped ([`crate::providers::window_size`]).
+    pub fullscreen: Option<Cvar>,
     /// The damage handlers of what the laser cuts ([`Cutting`]; None where not mapped).
     pub cutting: Option<Cutting>,
 }
@@ -697,6 +701,7 @@ pub static ROWS: [Build; 2] = unsafe { [
         ])),
         frame: Site::new("frame", 0x13dff0, &FRAME_PROLOGUE),
         sync_to_time: Cvar::id5(0x16ae1e0, "com_syncToTime"),
+        fullscreen: Some(Cvar::id5(0x1d1f240, "r_fullscreen")),
         cutting: Some(Cutting {
             chain: Site::new("chain damage", 0x6b5bd0, &[
                 Instruction::plain(&[0x40, 0x55]), // push rbp
@@ -862,6 +867,7 @@ pub static ROWS: [Build; 2] = unsafe { [
         focus_update: None,
         frame: Site::new("frame", 0x1371a0, &FRAME_PROLOGUE),
         sync_to_time: Cvar::id5(0x187fd70, "com_syncToTime"),
+        fullscreen: None,
         // Not mapped yet.
         cutting: None,
     },

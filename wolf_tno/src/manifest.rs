@@ -10,7 +10,7 @@ use monaka_producer::game::{options, options_len};
 const OPTIONS: [Opt; options_len::<Wolf>("wolf_tno")] = options::<Wolf, { options_len::<Wolf>("wolf_tno") }>("wolf_tno");
 const TOB_OPTIONS: [Opt; options_len::<Wolf>("wolf_tob")] = options::<Wolf, { options_len::<Wolf>("wolf_tob") }>("wolf_tob");
 
-const BEFORE: &str = "Start the game from Steam first. God rays, lens flares, dim shadows and screen-space reflections are switched off while VR runs (the game only gets them right in one eye).";
+const BEFORE: &str = "Start the game from Steam first. Set its display mode to windowed: only then can it render at the headset's resolution.God rays, lens flares, dim shadows and screen-space reflections are switched off while VR runs (the game only gets them right in one eye).";
 
 /// One producer for both games: the running executable picks its engine facts (`engine::ROWS`).
 pub const MANIFESTS: &[Manifest] = &[

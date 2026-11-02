@@ -19,3 +19,4 @@ pub(crate) mod pickups;
 pub(crate) mod present_entry;
 pub(crate) mod settings;
 pub(crate) mod skeleton;
+pub(crate) mod window_size;

@@ -39,6 +39,8 @@ impl PresentsPairs for Wolf {
         depth: |_| Some(gl::GlPairDepth { depth: eye_site::scene_depth, near: eye_site::near_metres }),
         // The render thread presents each frame at the start of drawing the next.
         presents_behind_drawing: true,
+        // Nothing goes out until the window is the eye size asked for (`render_size`).
+        ready: crate::providers::window_size::ready,
         ..PairLoop::new(output, entry)
     };
 }
@@ -146,6 +148,7 @@ pub unsafe extern "system" fn swap_buffers(dc: HDC) -> BOOL {
             situation::report(Situation::Video, playing, VIDEO_FRESH_MS);
         }
     }
+    crate::providers::window_size::seen(dc);
     gl::present(dc);
     crate::cooking::frame_pacing::published();
     if let Some(at) = started {

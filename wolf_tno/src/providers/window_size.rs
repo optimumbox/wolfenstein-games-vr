@@ -1,0 +1,140 @@
+//! Provider: the eye size (`monaka_stereo::eye_size`, its [`Resizes`]): the game's window made the
+//! size of both eyes side by side (or of the one eye without stereo), borderless and past the
+//! desktop's edges where need be. Windowed, the engine renders at its window's client size and
+//! follows its resizes (`r_windowWidth` and `r_windowHeight` track `WM_SIZE`), so each eye is drawn
+//! at the headset's size instead of half the monitor's. In full screen the engine keeps the display
+//! mode's size: the eyes stay the game's own then. The window's style and place go back at the
+//! stop.
+//!
+//! The window is the one the render thread presents to (`SwapBuffers`' device context: [`seen`]).
+//! Its owner is the game's main thread, which may be waiting on the render thread: each change is
+//! made from a thread of its own, so a present never waits on the window's messages.
+
+use crate::{Facts, Wolf};
+use eng_idt::Cvar;
+use monaka_core::sync::Locked;
+use monaka_hook::module::Module;
+use monaka_producer::game::{Component, Lack, Start};
+use monaka_producer::log;
+use monaka_stereo::eye_size::{self, Ask, Resizes};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::*};
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{HDC, WindowFromDC};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GWL_STYLE, GetWindowLongPtrW, GetWindowRect, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_CAPTION, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+};
+
+/// The eye size ready-made, the window's facts kept at its install.
+pub const EYE_SIZE: Component<Wolf> = Component { install, ..eye_size::eye_size::<Wolf>() };
+
+/// The window presented to (0: not seen yet).
+static WINDOW: AtomicIsize = AtomicIsize::new(0);
+/// Both eyes side by side in the window (else the one eye fills it).
+static SIDE_BY_SIDE: AtomicBool = AtomicBool::new(false);
+/// The build's `r_fullscreen`, with its executable; none where not mapped.
+static FULLSCREEN: Mutex<Option<(Module, &'static Cvar)>> = Mutex::new(None);
+/// The window's style and place before it was resized, for the stop.
+static BEFORE: Mutex<Option<Before>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct Before {
+    window: isize,
+    style: isize,
+    rect: RECT,
+}
+
+fn install(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
+    let Facts { exe, build } = *start.build;
+    *FULLSCREEN.locked() = build.fullscreen.as_ref().map(|cvar| (exe, cvar));
+    SIDE_BY_SIDE.store(crate::eyes::stereo_on(start.options), Release);
+    eye_size::want(start)
+}
+
+/// The render thread's present to `dc` (`SwapBuffers`): the window it goes to.
+pub fn seen(dc: HDC) {
+    if WINDOW.load(Relaxed) == 0 {
+        // SAFETY: a plain query on the game's own device context.
+        let window = unsafe { WindowFromDC(dc) };
+        WINDOW.store(window.0 as isize, Relaxed);
+    }
+}
+
+/// Whether a frame of `width` x `height` may be published (the same-frame loop's `ready`): the
+/// eyes in it at the size asked for, or the switch given up.
+pub fn ready(width: u32, height: u32) -> bool {
+    eye_size::ready::<Wolf>(eye_of((width, height)))
+}
+
+/// An eye's size in a frame of `frame`.
+fn eye_of(frame: (u32, u32)) -> (u32, u32) {
+    if SIDE_BY_SIDE.load(Acquire) { (frame.0 / 2, frame.1) } else { frame }
+}
+
+/// The window's client size for eyes of `eye`.
+pub fn window_for(eye: (u32, u32), side_by_side: bool) -> (u32, u32) {
+    if side_by_side { (eye.0 * 2, eye.1) } else { eye }
+}
+
+impl Resizes for Wolf {
+    fn ask(eye: (u32, u32), _presented: (u32, u32)) -> Ask {
+        let Some((exe, cvar)) = *FULLSCREEN.locked() else { return Ask::Cannot("r_fullscreen is not mapped for this game".to_owned()) };
+        match cvar.present(&exe).then(|| cvar.int(&exe)).flatten() {
+            Some(0) => {}
+            Some(_) => return Ask::Cannot("the game is in full screen: set the game's display mode to windowed".to_owned()),
+            None => return Ask::Cannot("r_fullscreen is not where this build keeps it".to_owned()),
+        }
+        let window = WINDOW.load(Relaxed);
+        if window == 0 {
+            return Ask::NotYet;
+        }
+        let (width, height) = window_for(eye, SIDE_BY_SIDE.load(Acquire));
+        std::thread::spawn(move || resize(window, width, height));
+        Ask::Asked
+    }
+
+    fn put_back() {
+        if let Some(before) = BEFORE.locked().take() {
+            std::thread::spawn(move || restore(before));
+        }
+    }
+}
+
+/// The window borderless at the desktop's top-left, its client `width` x `height`.
+fn resize(window: isize, width: u32, height: u32) {
+    let hwnd = HWND(window as _);
+    let mut rect = RECT::default();
+    // SAFETY: plain queries and changes on the game's own window; its thread handles the messages.
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return log!("eye size: the game's window is gone");
+        }
+        BEFORE.locked().get_or_insert(Before { window, style, rect });
+        let frame = (WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX).0 as isize;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !frame) | WS_POPUP.0 as isize);
+        let flags = SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE;
+        match SetWindowPos(hwnd, None, 0, 0, width as i32, height as i32, flags) {
+            Ok(()) => log!("eye size: the game's window made {width}x{height}, borderless"),
+            Err(e) => log!("eye size: the game's window stays as it is: {e}"),
+        }
+    }
+}
+
+/// The window's style and place as they were.
+fn restore(before: Before) {
+    let hwnd = HWND(before.window as _);
+    let RECT { left, top, right, bottom } = before.rect;
+    // SAFETY: as in `resize`; a window already gone fails harmlessly.
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, before.style);
+        let flags = SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE;
+        if SetWindowPos(hwnd, None, left, top, right - left, bottom - top, flags).is_ok() {
+            log!("eye size: the game's window back at {}x{}", right - left, bottom - top);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
