@@ -101,6 +101,7 @@ impl Game for Wolf {
             &pad_connected::PAD_CONNECTED,
             &hud::HUD,
             &hud_pieces::HUD_PANELS,
+            &hud_pieces::CROSSHAIR_COMPONENT,
             &cooking::auto_pickup::AUTO_PICKUP,
             &extras::mech_levers::MECH_LEVERS,
             &extras::hotwire::HOTWIRE,

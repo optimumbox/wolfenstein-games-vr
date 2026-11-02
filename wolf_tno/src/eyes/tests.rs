@@ -8,6 +8,7 @@ fn read_all(options: &Options, manifest: &Manifest) {
     EyeSettings::from_options(options, manifest);
     crate::cooking::frame_rate::ceiling(options);
     crate::cooking::body_forward::share_out(options);
+        crate::providers::hud_pieces::hides_crosshair(options);
     crate::providers::settings::no_view_bob(options, manifest);
     crate::providers::held_item::arms(options);
     crate::cooking::auto_pickup::SWITCH.on(options, manifest);

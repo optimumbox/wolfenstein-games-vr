@@ -18,17 +18,22 @@
 //! shows where the machine aims, not the centre of the HUD in front of the eyes: its surfaces are
 //! marked the same way ([`CROSSHAIR_MARK`]) and each eye draws them moved by the pixels from the
 //! layer's centre to the machine's aim in that eye ([`set_crosshair_shift`]).
+//!
+//! Out of a machine the crosshair marks the HUD's centre, where the guns no longer aim (they aim
+//! with the hands): with `crosshair=hide` ([`CROSSHAIR_COMPONENT`]) its sprite is not drawn at all.
 
 use crate::providers::engine::{self, DrawElementsFn, HudPieces, HudRenderFn, RenderSpriteFn};
 use crate::{Facts as Build, Wolf};
 use monaka_contract::protocol::{LEFT_HAND, RIGHT_HAND};
 use monaka_hook::module::Module;
 use monaka_hook::{InFlight, Original, mem};
+use monaka_contract::manifest::{Opt, Shown, choice, opt};
+use monaka_core::options::Options;
 use monaka_producer::game::{Component, Lack, Need, OrMissing, Start};
 use monaka_producer::log;
 use monaka_stereo::hud_panels::{self, Piece, Place, Side, places};
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
 use monaka_core::sync::Locked;
 use windows::Win32::Graphics::OpenGL::{GL_VIEWPORT, glGetIntegerv, glViewport};
 
@@ -39,6 +44,48 @@ pub static DRAW_ORIGINAL: Original<DrawElementsFn> = Original::new();
 /// The dynamic HUD (Monaka's): each gun's ammo on the inside of its hand and the item checklists
 /// on the back of the left hand, out of the HUD in front of the eyes.
 pub const HUD_PANELS: Component<Wolf> = Component { needs: &[Need::On(&crate::cooking::hud::HUD)], install: install_panels, summary: Some(summary), ..hud_panels::hud_panels() };
+
+/// The HUD's centre crosshair out of a driven machine (`crosshair`): hidden (the default) or shown.
+pub const CROSSHAIR_OPTION: Opt = opt(
+    "crosshair",
+    "Crosshair",
+    "Hide: the crosshair in the middle of the HUD is not drawn (the guns aim with your hands). The mech's still shows where it aims.",
+    choice(&[("hide", "Hide"), ("show", "Show")], "hide"),
+)
+.on(Shown::Game)
+.only_when("world_hud", "1");
+
+/// The crosshair as `crosshair` asks, read as the run starts; its sprite is drawn by the HUD
+/// panels' hooks ([`HUD_PANELS`]).
+pub const CROSSHAIR_COMPONENT: Component<Wolf> = Component {
+    name: "crosshair",
+    options: &[CROSSHAIR_OPTION],
+    needs: &[Need::On(&HUD_PANELS)],
+    settings: |options, _| {
+        hides_crosshair(options);
+    },
+    install: install_crosshair,
+    ..Component::NONE
+};
+
+/// Whether `options` hide the HUD's centre crosshair.
+pub fn hides_crosshair(options: &Options) -> bool {
+    options.choice("crosshair", &[("hide", true), ("show", false)], true)
+}
+
+/// The crosshair hidden out of a driven machine, and its draws left out.
+static HIDE_CROSSHAIR: AtomicBool = AtomicBool::new(false);
+static CROSSHAIR_HIDDEN: AtomicU64 = AtomicU64::new(0);
+
+fn install_crosshair(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
+    HIDE_CROSSHAIR.store(hides_crosshair(start.options), Relaxed);
+    Ok(())
+}
+
+/// Whether the crosshair is hidden now: out of a driven machine, with `crosshair=hide`.
+fn hiding_crosshair() -> bool {
+    HIDE_CROSSHAIR.load(Relaxed) && !crate::providers::camera_taken::driving()
+}
 
 /// The item checklists' piece, after the guns' ammo (by side).
 pub const CHECKLISTS: usize = 2;
@@ -110,7 +157,7 @@ fn sprite_name(sprite: usize) -> Option<String> {
 }
 
 /// Whether `sprite` is the HUD's crosshair (`hud/crosshair`): found by name once each time in a
-/// machine, then by instance.
+/// machine (or while it is hidden), then by instance.
 fn is_crosshair(sprite: usize) -> bool {
     let found = match CROSSHAIR.load(Relaxed) {
         0 => {
@@ -121,7 +168,8 @@ fn is_crosshair(sprite: usize) -> bool {
                 CROSSHAIR_DRIVE.store(crate::providers::camera_taken::drives(), Relaxed);
                 static LOGGED: AtomicU64 = AtomicU64::new(0);
                 if LOGGED.fetch_add(1, Relaxed) < 20 {
-                    log!("HUD pieces: the crosshair sprite is {sprite:#x}: it shows where the machine aims");
+                    let does = if hiding_crosshair() { "hidden" } else { "it shows where the machine aims" };
+                    log!("HUD pieces: the crosshair sprite is {sprite:#x}: {does}");
                 }
             }
             found
@@ -134,11 +182,12 @@ fn is_crosshair(sprite: usize) -> bool {
     found
 }
 
-/// Each HUD frame: the crosshair is looked for again out of a machine, in a new time in one (a
-/// checkpoint's reload rebuilds the HUD), or once the one found has not been drawn for a while.
+/// Each HUD frame: the crosshair is looked for again out of a machine (unless it is hidden), in a
+/// new time in one (a checkpoint's reload rebuilds the HUD), or once the one found has not been
+/// drawn for a while.
 fn forget_stale_crosshair() {
     let unseen = CROSSHAIR_UNSEEN.fetch_add(1, Relaxed) + 1;
-    let stale = !crate::providers::camera_taken::driving()
+    let stale = !(crate::providers::camera_taken::driving() || HIDE_CROSSHAIR.load(Relaxed))
         || CROSSHAIR_DRIVE.load(Relaxed) != crate::providers::camera_taken::drives()
         || unseen > CROSSHAIR_UNSEEN_FRAMES;
     if stale && CROSSHAIR.swap(0, Relaxed) != 0 {
@@ -162,13 +211,14 @@ static SPLIT: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64:
 
 pub fn summary() -> String {
     format!(
-        "HUD pieces: ammo drawn apart {} times (left), {} (right), checklists {}; {} draws into the panels; crosshair drawn apart {} times in a driven machine, {} draws moved onto its aim",
+        "HUD pieces: ammo drawn apart {} times (left), {} (right), checklists {}; {} draws into the panels; crosshair drawn apart {} times in a driven machine, {} draws moved onto its aim, {} times left out (hidden)",
         SPLIT[LEFT_HAND].load(Relaxed),
         SPLIT[RIGHT_HAND].load(Relaxed),
         SPLIT[CHECKLISTS].load(Relaxed),
         hud_panels::gl::draws(),
         CROSSHAIRS.load(Relaxed),
-        CROSSHAIR_MOVED.load(Relaxed)
+        CROSSHAIR_MOVED.load(Relaxed),
+        CROSSHAIR_HIDDEN.load(Relaxed)
     )
 }
 
@@ -306,14 +356,19 @@ fn note_box(piece: usize, bounds: [f32; 4], layout: (f32, f32)) {
 }
 
 /// `idSWF::RenderSprite`: a piece's sprite (and in a driven machine the crosshair) is drawn on
-/// surfaces of their own, marked with its piece (the crosshair's mark); everything else as the
-/// game draws it.
+/// surfaces of their own, marked with its piece (the crosshair's mark); a hidden crosshair not at
+/// all; everything else as the game draws it.
 unsafe extern "system" fn render_sprite(swf: usize, gui: usize, sprite: usize, state: usize, a5: usize, a6: usize) {
     let flight = InFlight::enter();
     // SAFETY: forwards the game's own call.
     let original = || unsafe { RENDER_SPRITE_ORIGINAL.get(&flight)(swf, gui, sprite, state, a5, a6) };
     let piece = hud_panels::active().then(|| piece_of_sprite(sprite)).flatten();
-    let crosshair = piece.is_none() && sprite != 0 && crate::providers::camera_taken::driving() && is_crosshair(sprite);
+    let hiding = hiding_crosshair();
+    let crosshair = piece.is_none() && sprite != 0 && (hiding || crate::providers::camera_taken::driving()) && is_crosshair(sprite);
+    if crosshair && hiding {
+        CROSSHAIR_HIDDEN.fetch_add(1, Relaxed);
+        return;
+    }
     let mark = piece.map(|piece| MARKS[piece]).or(crosshair.then_some(CROSSHAIR_MARK));
     let (Some(mark), Some(facts)) = (mark, FACTS.get()) else {
         // Which sprite is drawn where, once each (`research::hud_sprites`).
