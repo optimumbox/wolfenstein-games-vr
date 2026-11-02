@@ -19,6 +19,7 @@ pub mod hud_sprites;
 pub mod melee;
 pub mod panels;
 pub mod profile;
+pub mod shaders;
 pub mod view;
 
 use monaka_producer::research::Research;
@@ -57,6 +58,9 @@ pub struct Options {
     pub cutting: bool,
     /// `probe_hud_sprites`: log where each of the HUD movie's sprites first draws ([`hud_sprites`]).
     pub hud_sprites: bool,
+    /// `probe_shaders`: write every shader the game gave the driver beside the run's log
+    /// ([`shaders`]).
+    pub shaders: bool,
     /// `probe_player`: log The Old Blood's player fields that can hand the view to something else
     /// ([`view::player`]).
     pub player: bool,
@@ -79,6 +83,7 @@ impl Options {
             cutting: options.switch("probe_cutting", false),
             hud_sprites: options.switch("probe_hud_sprites", false),
             player: options.switch("probe_player", false),
+            shaders: options.switch("probe_shaders", false),
         }
     }
 }

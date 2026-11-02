@@ -217,6 +217,7 @@ pub unsafe extern "system" fn swap_buffers(dc: HDC) -> BOOL {
     let started = monaka_producer::debug::timing().then(std::time::Instant::now);
     if PAIRS.publishing() {
         crate::research::gl::frame(gl::frames() + 1);
+        crate::research::shaders::frame(gl::frames() + 1);
         crate::research::profile::frame();
         if let Some(playing) = video_playing() {
             situation::report(Situation::Video, playing, VIDEO_FRESH_MS);
