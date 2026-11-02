@@ -538,7 +538,7 @@ pub fn tracking_space(origin_axis: &[f32; 12], pose: &HeadPose) -> Option<Mat34>
     let convention = eng_idt::camera_convention(setup.config.units_per_metre);
     // The field of view only has to look like one: it is not used.
     let own = eyes_camera(View { origin_axis: *origin_axis, fov: [80.0, 50.0] });
-    let drawn = turned_view(&own, pose, sights::head_position(&setup.shared, pose, 0.0), &setup.config, &setup.shared, &convention, false, look::baked::<Wolf>(None))?;
+    let drawn = turned_view(&own, pose, eyes_position(&setup.shared, pose, 0.0), &setup.config, &setup.shared, &convention, false, look::baked::<Wolf>(None))?;
     let eye = camera_of(&drawn.origin_axis, &convention)?;
     // The hands are tracked against the real head, which the drawn view stands for.
     Some(camera::tracking_space(&eye, pose.orientation, pose.position))
@@ -636,8 +636,8 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
             if sighted > 0.0 {
                 SIGHTED.fetch_add(1, Relaxed);
             }
-            let position = sights::head_position(&setup.shared, pose, sighted);
             let cutscene = levels_camera();
+            let position = eyes_position(&setup.shared, pose, sighted);
             let camera = eyes_camera(own);
             let turned = turned_view(&camera, pose, position, &setup.config, &setup.shared, &convention, setup.shared.headset_fov, baked).map(|mut turned| {
                 crate::research::view::with_extra_yaw(&mut turned.origin_axis);
@@ -731,6 +731,14 @@ pub fn warp_eye(n: u64, dominant: Option<DominantEye>) -> usize {
 /// driven machine's keeps its pitch, which the stick aims.
 fn levels_camera() -> bool {
     crate::providers::camera_taken::controlled() && !crate::providers::camera_taken::mounted()
+}
+
+/// Where the eyes sit against the camera they are built on for the head's `pose`, `sighted` into
+/// aiming down sights ([`sights::head_position`]): on that camera while [`levels_camera`]. A
+/// cutscene's camera sits where the player's head was drawn, its own head hidden; the real head's
+/// steps and leans would carry the eyes out of the body, so only its turn is taken.
+fn eyes_position(shared: &Shared, pose: &HeadPose, sighted: f32) -> [f32; 3] {
+    if levels_camera() { [0.0; 3] } else { sights::head_position(shared, pose, sighted) }
 }
 
 /// The camera the eyes are built on for the game camera `own` (levelled while
