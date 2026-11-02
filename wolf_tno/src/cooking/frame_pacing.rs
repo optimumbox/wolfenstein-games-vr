@@ -246,6 +246,12 @@ fn set_pacing(pacing: bool) {
         cvar.set_int(exe, i32::from(!pacing));
     }
     let mut state = STATE.locked();
+    // The paced stretch's tallies, however short, then a fresh window for the next.
+    if !pacing {
+        let (now, period) = (now_ns(), state.period);
+        log_window(&mut state, now, period, true);
+        state.window = Window::new(0);
+    }
     state.last = None;
     state.last_started = 0;
     PUBLISHED.store(0, Relaxed);
@@ -315,7 +321,7 @@ fn pace() {
     state.last = Some(slot);
     state.frames += 1;
     state.window.frames += 1;
-    log_window(&mut state, now, timing.period_ns);
+    log_window(&mut state, now, timing.period_ns, false);
     drop(state);
     // A slot further off than a frame's refreshes is not this grid's: no wait.
     if slot > now && slot - now <= (refreshes + 1) * timing.period_ns {
@@ -334,13 +340,16 @@ fn pace() {
     state.last_started = started;
 }
 
-/// Every [`WINDOW_NS`], the window's tallies logged and started afresh.
-fn log_window(state: &mut State, now: u64, period: u64) {
+/// Every [`WINDOW_NS`] (or at once when `ending`, the pacing stopping), the window's tallies
+/// logged and started afresh.
+fn log_window(state: &mut State, now: u64, period: u64, ending: bool) {
     if state.window.since == 0 {
-        state.window = Window::new(now);
+        if !ending {
+            state.window = Window::new(now);
+        }
         return;
     }
-    if now.saturating_sub(state.window.since) < WINDOW_NS {
+    if now.saturating_sub(state.window.since) < WINDOW_NS && !(ending && state.window.frames > 0) {
         return;
     }
     let w = state.window;

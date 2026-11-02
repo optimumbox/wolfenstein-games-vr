@@ -7,6 +7,10 @@
 //! ([`dlss`]) both eyes drawn smaller and each upscaled to the eye size. A full-screen video
 //! (`engine::Build::video`), drawn over the whole window rather than per eye, is reported as a
 //! situation (`Situation::Video`), so the loop sends those frames whole to the flat screen.
+//!
+//! While pairs go out the window's vsync is off ([`vsync`]): the frames start on the headset's
+//! refresh (`cooking::frame_pacing`), and a present held for the desktop monitor's (144 Hz against
+//! a 90 Hz headset) beats against it, costing frames. The game's own interval goes back after.
 
 use crate::{Facts, Wolf};
 use monaka_hook::module::Module;
@@ -219,6 +223,7 @@ pub unsafe extern "system" fn swap_buffers(dc: HDC) -> BOOL {
         }
     }
     crate::providers::window_size::seen(dc);
+    vsync::follow(PAIRS.publishing());
     gl::present(dc);
     crate::cooking::frame_pacing::published();
     if let Some(at) = started {
@@ -255,3 +260,80 @@ fn render_thread_cpu() -> std::time::Duration {
 
 /// When the game's last `SwapBuffers` returned (its render thread's time between swaps).
 static LAST_SWAP: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// The window's swap interval (`WGL_EXT_swap_control`), held at 0 while pairs go out, on the render
+/// thread with the game's context current.
+mod vsync {
+    use monaka_producer::log;
+    use std::sync::Mutex;
+    use windows::Win32::Graphics::OpenGL::wglGetProcAddress;
+    use windows::core::{BOOL, s};
+
+    type SwapIntervalFn = unsafe extern "system" fn(i32) -> BOOL;
+    type GetSwapIntervalFn = unsafe extern "system" fn() -> i32;
+
+    /// Times the engine set its own interval again that are logged.
+    const LOGGED: u64 = 5;
+
+    struct Vsync {
+        set: SwapIntervalFn,
+        get: GetSwapIntervalFn,
+        /// The game's interval before it was turned off; none while the game's own holds.
+        game: Option<i32>,
+        /// Times the interval was found back on and turned off again.
+        again: u64,
+    }
+
+    /// Loaded at the first present (none: not yet; `Err`: the driver has no swap control).
+    static STATE: Mutex<Option<Result<Vsync, ()>>> = Mutex::new(None);
+
+    fn load() -> Result<Vsync, ()> {
+        // SAFETY: asks the current context's driver for its WGL_EXT_swap_control entry points.
+        let (set, get) = unsafe { (wglGetProcAddress(s!("wglSwapIntervalEXT")), wglGetProcAddress(s!("wglGetSwapIntervalEXT"))) };
+        match (set, get) {
+            (Some(set), Some(get)) if (set as usize) >= 4 && (get as usize) >= 4 => {
+                // SAFETY: the driver's functions with the signatures WGL_EXT_swap_control gives.
+                Ok(unsafe { Vsync { set: std::mem::transmute::<_, SwapIntervalFn>(set), get: std::mem::transmute::<_, GetSwapIntervalFn>(get), game: None, again: 0 } })
+            }
+            _ => {
+                log!("vsync: the driver has no WGL_EXT_swap_control; the game's own stays");
+                Err(())
+            }
+        }
+    }
+
+    /// At each present: vsync off while `publishing` (turned off again whenever the engine set it
+    /// back), the game's own interval back once not.
+    pub fn follow(publishing: bool) {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_none() && !publishing {
+            return;
+        }
+        let Ok(vsync) = state.get_or_insert_with(load) else { return };
+        // SAFETY: WGL_EXT_swap_control's calls on this thread's current context (the game's).
+        unsafe {
+            let now = (vsync.get)();
+            match (publishing, vsync.game) {
+                (true, _) if now == 0 => {}
+                (true, None) => {
+                    vsync.game = Some(now);
+                    let _ = (vsync.set)(0);
+                    log!("vsync: off while pairs go out (the game's interval was {now})");
+                }
+                (true, Some(_)) => {
+                    vsync.again += 1;
+                    let _ = (vsync.set)(0);
+                    if vsync.again <= LOGGED {
+                        log!("vsync: the game set an interval of {now} again; off once more");
+                    }
+                }
+                (false, Some(game)) => {
+                    let _ = (vsync.set)(game);
+                    vsync.game = None;
+                    log!("vsync: the game's interval of {game} back");
+                }
+                (false, None) => {}
+            }
+        }
+    }
+}
