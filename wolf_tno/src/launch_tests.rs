@@ -19,7 +19,7 @@ fn defaults_write_the_manifests_values() {
     let tob = MANIFESTS.iter().find(|m| m.id == "wolf_tob").unwrap();
     assert_eq!(
         options_file(tob, &Values::default()),
-        "disable_view_bobbing=1\nframe_rate=60\nstereo=same\ndlss=quality\ndlss_sharpness=0.5\ndominant_eye=right\nhead_position=lean\neye_separation=0.064\naim=hand_rig\nmove_heading=head\nfinger_tracking=1\nfinger_binary=0\ncontroller_pad=1\nhud_scale=0.35\nhud_distance=2\nworld_hud=1\ncrosshair=hide\nauto_pickup=1\nother_builds=0"
+        "disable_view_bobbing=1\ndisable_screen_shake=0\nframe_rate=60\nstereo=same\ndlss=quality\ndlss_sharpness=0.5\ndominant_eye=right\nhead_position=lean\neye_separation=0.064\naim=hand_rig\nbody_turn=1\nturn=smooth\nmove_heading=head\nhide_free_hand=0\nfinger_tracking=1\nfinger_binary=0\ncontroller_pad=1\nhud_scale=0.35\nhud_distance=2\nworld_hud=1\ncrosshair=hide\nauto_pickup=1\nother_builds=0"
     );
 }
 
