@@ -29,6 +29,25 @@ pub struct Converted {
     pub rows: [i32; 4],
     /// The locations of the stereo uniform's rows: the eye matrix's four, then the switch.
     pub stereo: [i32; convert::STEREO_ROWS],
+    /// Its fragment shader reads the scene's maps at its own pixel ([`convert::reads_screen`]).
+    pub reads_screen: bool,
+    /// Its render program's name.
+    pub name: &'static str,
+    /// Its fragment shader reads the scene's maps layered ([`convert::layered_fragment`]).
+    pub screen: Option<&'static Screen>,
+}
+
+/// A converted program whose fragment shader reads the scene's maps at the layer it draws into
+/// and its rows for the other eye's copy from [`convert::RIGHT_ROWS`].
+#[derive(Debug)]
+pub struct Screen {
+    /// Each layered map: the engine's sampler's location, and the unit its array sampler reads.
+    pub maps: Vec<(i32, u32)>,
+    /// The first location and count of the vertex rows (`_va_`) and the fragment rows (`_fa_`),
+    /// and the right rows' first location (each array's locations in a row).
+    pub vertex_rows: (i32, usize),
+    pub fragment_rows: (i32, usize),
+    pub right_rows: i32,
 }
 
 /// The engine's program names swept.
@@ -37,6 +56,10 @@ const LAST_NAME: u32 = 16384;
 const SWAPS_PER_FRAME: usize = 48;
 /// The longest the driver is waited for, per batch of compiles.
 const COMPILE_PATIENCE: Duration = Duration::from_secs(60);
+/// Whether programs reading the scene's maps are converted to read them at the layer they draw
+/// into ([`convert::layered_fragment`]). Off: their draws are in the passes' rests, which each eye
+/// draws anyway, and learning their rows asked the driver for uniforms on the render thread.
+pub const LAYERED_SCREEN: bool = false;
 
 enum Stage {
     Idle,
@@ -48,12 +71,23 @@ enum Stage {
     Failed,
 }
 
-/// One engine program to convert: its render program and the converted scratch program.
+/// One engine program to convert: its render program and the converted scratch program, with
+/// the screen maps its fragment shader reads layered and what links it with the plain one
+/// should the layered one not link.
 struct Job {
     engine: u32,
     source: usize,
     rows: [usize; 4],
     scratch: u32,
+    maps: Vec<String>,
+    plain: Option<Relink>,
+}
+
+struct Relink {
+    vertex: String,
+    fragment: String,
+    attributes: Vec<(String, u32)>,
+    outputs: Vec<(String, u32)>,
 }
 
 pub struct Conversion {
@@ -105,9 +139,11 @@ impl Conversion {
                     stage
                 }
             }
-            Stage::Converting { jobs, since } => {
+            Stage::Converting { mut jobs, since } => {
                 if !jobs.iter().all(|j| gl.program_done(j.scratch)) && since.elapsed() < COMPILE_PATIENCE {
                     Stage::Converting { jobs, since }
+                } else if relink_plain(gl, &mut jobs, &self.sources) {
+                    Stage::Converting { jobs, since: Instant::now() }
                 } else {
                     Stage::Swapping { jobs, done: 0 }
                 }
@@ -140,6 +176,25 @@ impl Conversion {
         };
         None
     }
+}
+
+/// The jobs whose layered fragment shader did not link linked again with the plain one; whether
+/// any was.
+fn relink_plain(gl: &Gl, jobs: &mut [Job], sources: &[Renderprog]) -> bool {
+    let mut any = false;
+    for job in jobs.iter_mut() {
+        let Some(plain) = job.plain.take() else { continue };
+        let Err(why) = gl.linked(job.scratch) else { continue };
+        if !any {
+            log!("single pass: {} does not link reading the scene's maps layered ({}): each eye draws it", sources[job.source].name, why.lines().next().unwrap_or(""));
+        }
+        any = true;
+        // SAFETY: our own scratch program.
+        unsafe { (gl.delete_program)(job.scratch) };
+        job.scratch = gl.program(&plain.vertex, &plain.fragment, &plain.attributes, &plain.outputs);
+        job.maps.clear();
+    }
+    any
 }
 
 fn start_reading() -> Stage {
@@ -203,8 +258,15 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         engine_programs += 1;
         // Converted by an earlier run in this process: known by its stereo uniform, its source by
         // its other uniforms' names.
-        if let Some(converted) = converted_before(gl, engine, sources, &names) {
-            already.push(converted);
+        if let Some((converted, source)) = converted_before(gl, engine, sources, &names) {
+            // Converted before its fragment shader read the scene's maps layered: converted again.
+            let layered = gl.uniforms(engine).iter().any(|u| u.name.starts_with(convert::LAYERED_PREFIX));
+            let wanted = LAYERED_SCREEN && converted.reads_screen && convert::layered_fragment(&sources[source].fragment).is_some();
+            if layered == wanted {
+                already.push(converted);
+            } else if let Some(job) = job(gl, engine, &gl.uniforms(engine), source, &sources[source]) {
+                jobs.push(job);
+            }
             continue;
         }
         let Some(key) = gl.binary(engine).and_then(|(_, b)| gl_api::assembly_key(&b)) else { continue };
@@ -214,18 +276,13 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         let Some(&source) = candidates.iter().find(|&&c| names[c] == own).or_else(|| (candidates.len() == 1).then(|| &candidates[0])) else { continue };
         matched += 1;
         let program = &sources[source];
-        let Some(rows) = convert::position_rows(&program.vertex) else {
+        if convert::position_rows(&program.vertex).is_none() {
             flat += 1;
             continue;
-        };
-        let Some(vertex) = convert::stereo_vertex(&program.vertex) else { continue };
-        let located = |u: &convert::Uniform| uniforms.iter().find(|a| a.name == u.name).and_then(|a| a.locations.first().copied()).filter(|&l| l >= 0);
-        let vertex = convert::with_locations(&vertex, &located);
-        let fragment = convert::with_locations(&program.fragment, &located);
-        // SAFETY: plain queries with NUL-terminated names.
-        let outputs = outputs(program, |name| u32::try_from(unsafe { (gl.get_frag_data_location)(engine, gl_api::c_name(name).as_ptr()) }).ok());
-        let scratch = gl.program(&vertex, &fragment, &gl.attributes(engine), &outputs);
-        jobs.push(Job { engine, source, rows, scratch });
+        }
+        if let Some(job) = job(gl, engine, &uniforms, source, program) {
+            jobs.push(job);
+        }
     }
     log!(
         "single pass: {engine_programs} engine programs, {} converted before, {matched} matched to their render program ({flat} full-screen or 2D, left as they are); converting {}",
@@ -238,14 +295,100 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
     Stage::Converting { jobs, since: Instant::now() }
 }
 
+/// The converted scratch program for `engine` from its render program `program` (`sources[source]`),
+/// with the engine program's own uniform, attribute and output locations; its fragment shader
+/// reads the scene's maps layered where it can.
+fn job(gl: &Gl, engine: u32, uniforms: &[ActiveUniform], source: usize, program: &Renderprog) -> Option<Job> {
+    let rows = convert::position_rows(&program.vertex)?;
+    let vertex = convert::stereo_vertex(&program.vertex)?;
+    let located = |u: &convert::Uniform| uniforms.iter().find(|a| a.name == u.name).and_then(|a| a.locations.first().copied()).filter(|&l| l >= 0);
+    let vertex = convert::with_locations(&vertex, &located);
+    let plain = convert::with_locations(&program.fragment, &located);
+    let layered = (LAYERED_SCREEN && convert::reads_screen(&program.fragment)).then(|| convert::layered_fragment(&program.fragment)).flatten();
+    // SAFETY: plain queries with NUL-terminated names.
+    let outputs = outputs(program, |name| u32::try_from(unsafe { (gl.get_frag_data_location)(engine, gl_api::c_name(name).as_ptr()) }).ok());
+    let attributes = gl.attributes(engine);
+    Some(match layered {
+        Some(layered) => {
+            let fragment = convert::with_locations(&layered.source, &located);
+            let scratch = gl.program(&vertex, &fragment, &attributes, &outputs);
+            Job { engine, source, rows, scratch, maps: layered.maps, plain: Some(Relink { vertex, fragment: plain, attributes, outputs }) }
+        }
+        None => Job { engine, source, rows, scratch: gl.program(&vertex, &plain, &attributes, &outputs), maps: Vec::new(), plain: None },
+    })
+}
+
 /// An engine program an earlier run converted: its locations, from the render program with the
-/// same uniforms (its own less the stereo uniform).
-fn converted_before(gl: &Gl, engine: u32, sources: &[Renderprog], names: &[Vec<String>]) -> Option<Converted> {
+/// same uniforms (its own less ours), and that program's index.
+fn converted_before(gl: &Gl, engine: u32, sources: &[Renderprog], names: &[Vec<String>]) -> Option<(Converted, usize)> {
     let stereo = locations(gl, engine, &[convert::STEREO_UNIFORM], convert::STEREO_ROWS)?;
-    let own: Vec<String> = uniform_names(&gl.uniforms(engine)).into_iter().filter(|n| n != convert::STEREO_UNIFORM).collect();
-    let rows = (0..sources.len()).filter(|&i| names[i] == own).find_map(|i| convert::position_rows(&sources[i].vertex))?;
+    let own: Vec<String> = uniform_names(&gl.uniforms(engine)).into_iter().filter(|n| !n.starts_with("monaka_")).collect();
+    let (rows, index) = (0..sources.len()).filter(|&i| names[i] == own).find_map(|i| Some((convert::position_rows(&sources[i].vertex)?, i)))?;
+    let source = &sources[index];
     let rows = locations(gl, engine, &rows.map(|r| format!("_va_[{r}]")).iter().map(String::as_str).collect::<Vec<_>>(), 0)?;
-    Some(Converted { program: engine, rows: rows.try_into().ok()?, stereo: stereo.try_into().ok()? })
+    let maps = convert::layered_fragment(&source.fragment).filter(|_| LAYERED_SCREEN).map(|l| l.maps).unwrap_or_default();
+    let converted = Converted {
+        program: engine,
+        rows: rows.try_into().ok()?,
+        stereo: stereo.try_into().ok()?,
+        reads_screen: convert::reads_screen(&source.fragment),
+        name: leak(&source.name),
+        screen: screen(gl, engine, &maps),
+    };
+    Some((converted, index))
+}
+
+/// The layered maps' array samplers given units of their own (the last ones, which the engine's
+/// samplers do not use), and the rows' locations; none when the program does not read `maps`
+/// layered.
+fn screen(gl: &Gl, program: u32, maps: &[String]) -> Option<&'static Screen> {
+    if maps.is_empty() {
+        return None;
+    }
+    let uniforms = gl.uniforms(program);
+    let in_a_row = |name: &str| {
+        let uniform = uniforms.iter().find(|u| u.name == name)?;
+        let first = *uniform.locations.first()?;
+        uniform.locations.iter().enumerate().all(|(i, &l)| l == first + i as i32).then_some((first, uniform.locations.len()))
+    };
+    let vertex_rows = in_a_row("_va_")?;
+    let fragment_rows = in_a_row(convert::FRAGMENT_ROWS)?;
+    let (right_rows, count) = in_a_row(convert::RIGHT_ROWS)?;
+    if count != fragment_rows.1 {
+        return None;
+    }
+    let mut most = 0;
+    // SAFETY: a state query into a local (GL_MAX_TEXTURE_IMAGE_UNITS).
+    unsafe { windows::Win32::Graphics::OpenGL::glGetIntegerv(0x8872, &mut most) };
+    let engines: Vec<i32> = uniforms
+        .iter()
+        .filter(|u| !u.name.starts_with("monaka_") && gl_api::components(u.kind) == Some((1, true)))
+        .filter_map(|u| gl.values(program, u))
+        .flatten()
+        .filter_map(|v| match v {
+            gl_api::Values::Ints(v) => v.first().copied(),
+            gl_api::Values::Floats(_) => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (i, map) in maps.iter().enumerate() {
+        let unit = most - 1 - i as i32;
+        if unit < 0 || engines.contains(&unit) {
+            return None;
+        }
+        let ours = format!("{}{map}", convert::LAYERED_PREFIX);
+        let (Some(engine), Some(layered)) = (uniforms.iter().find(|u| &u.name == map), uniforms.iter().find(|u| u.name == ours)) else { continue };
+        let (Some(&engine), Some(&layered)) = (engine.locations.first(), layered.locations.first()) else { continue };
+        // SAFETY: a plain GL call on the engine's program, with one int.
+        unsafe { (gl.program_uniform_1iv)(program, layered, 1, &unit) };
+        out.push((engine, unit as u32));
+    }
+    (!out.is_empty()).then(|| &*Box::leak(Box::new(Screen { maps: out, vertex_rows, fragment_rows, right_rows })))
+}
+
+/// A render program's name kept for the run (a few hundred, made once).
+fn leak(name: &str) -> &'static str {
+    Box::leak(name.to_owned().into_boxed_str())
 }
 
 /// The locations of `names` in `program` (with `rows` > 0: the rows of the one array named), none
@@ -292,7 +435,7 @@ fn swap(gl: &Gl, job: &Job, source: &Renderprog) -> Result<Converted, String> {
     if rows.iter().chain(&stereo).any(|&l| l < 0) {
         return Err(put_back(format!("{} has no _va_ rows or stereo uniform", source.name)));
     }
-    Ok(Converted { program: engine, rows, stereo })
+    Ok(Converted { program: engine, rows, stereo, reads_screen: convert::reads_screen(&source.fragment), name: leak(&source.name), screen: screen(gl, engine, &job.maps) })
 }
 
 fn restore(gl: &Gl, program: u32, uniforms: &[ActiveUniform], values: &[Option<Vec<gl_api::Values>>], blocks: &[u32]) {

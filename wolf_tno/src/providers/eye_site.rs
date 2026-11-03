@@ -291,10 +291,13 @@ pub fn warps(config: &EyeSettings, shared: &Shared, build: &Build) -> bool {
     config.stereo && config.stereo_method == StereoMethod::Afw && shared.head_tracking && shared.headset_fov && build.scene_depth.is_some()
 }
 
-/// The FSR scale (eye size over render size per side) this run upscales by: with frame warping and
-/// FSR chosen.
+/// The scale (eye size over render size per side) this run upscales by with frame warping: FSR's
+/// when chosen, else DLSS's (each eye upscaled by DLSS in FSR's place, `GlFsr::dlss`).
 pub fn fsr_scale(config: &EyeSettings, shared: &Shared, build: &Build) -> Option<f32> {
-    config.fsr.filter(|_| warps(config, shared, build)).map(|fsr| fsr.scale)
+    if !warps(config, shared, build) {
+        return None;
+    }
+    config.fsr.map(|fsr| fsr.scale).or_else(|| config.dlss.map(|dlss| 1.0 / dlss.quality.scale()))
 }
 
 /// Where the eye drawn with frame warping lands in the window (x, y from the top-left, width,
@@ -418,6 +421,17 @@ static LAST_COMMANDS: AtomicU64 = AtomicU64::new(0);
 static SIGHTED: AtomicU64 = AtomicU64::new(0);
 /// Frame warping: one eye drawn a frame ([`warps`]).
 static WARPING: AtomicBool = AtomicBool::new(false);
+/// With frame warping, the engine is in its own side-by-side layout for now: no view was built
+/// for [`MENU_SWAPS`] presents (a menu, the title, a loading screen), whose screens it draws for
+/// each eye only in that layout ([`menu_layout`]).
+static MENU_LAYOUT: AtomicBool = AtomicBool::new(false);
+/// Whether the frame being presented was drawn in the side-by-side layout: the layout as it was at
+/// the `SwapBuffers` before ([`drawn_side_by_side`]).
+static DRAWN_SIDE_BY_SIDE: AtomicBool = AtomicBool::new(false);
+/// Presents since the last view build (frame warping).
+static SWAPS_UNBUILT: AtomicU32 = AtomicU32::new(0);
+/// Presents without a view build after which the menu layout comes in.
+const MENU_SWAPS: u32 = 3;
 /// The eye this view build draws (0 left), with frame warping.
 static FRAME_EYE: AtomicUsize = AtomicUsize::new(0);
 /// The projection the engine made for this build's eye (its frustum maker's matrix, game units),
@@ -620,6 +634,10 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
     };
     let mut saved = Saved::<View, { engine::PLAYER_VIEWS }>::new();
     let warping = WARPING.load(Acquire);
+    if warping {
+        SWAPS_UNBUILT.store(0, Relaxed);
+        menu_layout(false);
+    }
     let eye = warp_eye(build, setup.filter(|s| s.config.afw_dominant).map(|s| s.config.dominant_eye));
     let mut eye_view = None;
     let dlss = DLSS.get().copied().filter(|_| !warping);
@@ -875,6 +893,47 @@ pub fn warp_shot() -> Option<GlShot> {
     let other = <Wolf as EyeGeometry>::frustum(&ticket.pose, 1 - eye);
     Some(GlShot { shot: Shot::labelled(Pending { eye, pose: ticket.pose }, rendered, separation, other), jitter })
 }
+
+/// At each `SwapBuffers` with frame warping: whether the frame being presented was drawn with both
+/// eyes side by side (`GlWarp::side_by_side`); after [`MENU_SWAPS`] presents without a view build,
+/// the engine's own side-by-side layout for the next frames, so a menu is drawn for each eye as
+/// with same-frame stereo rather than once into the one eye's half.
+pub fn drawn_side_by_side() -> bool {
+    let drawn = DRAWN_SIDE_BY_SIDE.swap(MENU_LAYOUT.load(Relaxed), Relaxed);
+    if SWAPS_UNBUILT.fetch_add(1, Relaxed) + 1 >= MENU_SWAPS {
+        menu_layout(true);
+    }
+    // In a menu, every 10 s: how the game reads the pad there (a menu slow to answer).
+    static MENU_LOGGED: AtomicU64 = AtomicU64::new(0);
+    let now = monaka_channel::tick();
+    if drawn && now.saturating_sub(MENU_LOGGED.load(Relaxed)) >= 10_000 {
+        MENU_LOGGED.store(now, Relaxed);
+        log!("menu: {}", monaka_pad::window_line());
+    }
+    drawn
+}
+
+/// The engine's side-by-side layout (`menu`) or the one-eye layout of frame warping, switched only
+/// from the other of the two (not after the stop put the game's own back).
+fn menu_layout(menu: bool) {
+    if MENU_LAYOUT.load(Relaxed) == menu {
+        return;
+    }
+    let (Some(setup), Some(&one_eye)) = (SETUP.get(), ONE_EYE.get()) else { return };
+    let setting = LayoutSetting { exe: setup.exe, build: setup.build };
+    let side_by_side = setup.exe.at(setup.build.layout_left_right.0);
+    let (from, to) = if menu { (one_eye, side_by_side) } else { (side_by_side, one_eye) };
+    if setting.read() != Some(from) || !setting.write(&to) {
+        return;
+    }
+    MENU_LAYOUT.store(menu, Relaxed);
+    if MENU_SWITCHES.fetch_add(1, Relaxed) < 20 {
+        log!("frame warping: {}", if menu { "no view built: the side-by-side layout for the menu, both halves as the pair" } else { "a view built: one eye a frame again" });
+    }
+}
+
+/// Times the menu layout came in or went (logged the first few).
+static MENU_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
 /// FSR's jitter phases for `scale` (eye size over render size per side): AMD's count, 8 times the
 /// pixel ratio.

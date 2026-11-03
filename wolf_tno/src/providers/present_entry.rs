@@ -21,7 +21,7 @@ use monaka_producer::situation::{self, Situation};
 use crate::providers::eye_site;
 use monaka_stereo::afw::Rules;
 use monaka_stereo::afw::d3d11::FrameGeneration;
-use monaka_stereo::same_frame::gl::{GlDlss, GlFsr, GlWarp};
+use monaka_stereo::same_frame::gl::{GlDlss, GlFsr, GlFsrDlss, GlWarp};
 use monaka_core::sync::Locked;
 use monaka_stereo::same_frame::timing::Stage;
 use monaka_stereo::same_frame::{Output, PAIRS, PairLoop, PresentsPairs, gl};
@@ -66,16 +66,27 @@ fn warp(start: &Start<'_, Wolf>) -> Option<GlWarp> {
     }
     let mut leaked: Option<&'static std::path::Path> = None;
     let mut dlls = || *leaked.get_or_insert_with(|| Box::leak(start.options.text("fsr_dlls").map_or_else(|| start.session.dir().to_path_buf(), std::path::PathBuf::from).into_boxed_path()));
-    let fsr = eye_site::fsr_scale(&config, start.shared, start.build.build).and_then(|_| {
-        let settings = config.fsr?;
-        Some(GlFsr {
-            display: [0.5, 1.0],
-            sharpness: settings.sharpness,
-            jitter_sign: settings.jitter_sign,
-            // The engine's depth: standard, with an infinite far plane.
-            depth_flags: monaka_stereo::upscaler::fsr11::STANDARD_INFINITE,
-            dlls: dlls(),
-        })
+    // The engine's depth: standard, with an infinite far plane.
+    let depth_flags = monaka_stereo::upscaler::fsr11::STANDARD_INFINITE;
+    let leak = |p: std::path::PathBuf| -> &'static std::path::Path { Box::leak(p.into_boxed_path()) };
+    // FSR when chosen, else DLSS (as chosen, with its sharpening) upscales each eye.
+    let fsr = eye_site::fsr_scale(&config, start.shared, start.build.build).and_then(|_| match (config.fsr, config.dlss) {
+        (Some(settings), _) => Some(GlFsr { display: [0.5, 1.0], sharpness: settings.sharpness, jitter_sign: settings.jitter_sign, depth_flags, dlls: dlls(), dlss: None }),
+        (None, Some(settings)) => {
+            let found = dlss_folder(start);
+            if found.is_none() {
+                log!("DLSS: {DLSS_DLL} was not found beside the pack; each eye is resampled");
+            }
+            Some(GlFsr {
+                display: [0.5, 1.0],
+                sharpness: settings.sharpness,
+                jitter_sign: settings.jitter_sign,
+                depth_flags,
+                dlls: leak(found.unwrap_or_default()),
+                dlss: Some(GlFsrDlss { quality: settings.quality, data: leak(start.session.dir().join("ngx")) }),
+            })
+        }
+        (None, None) => None,
     });
     let framegen = config.framegen.then(|| FrameGeneration {
         dlls: dlls(),
@@ -88,16 +99,25 @@ fn warp(start: &Start<'_, Wolf>) -> Option<GlWarp> {
     Some(GlWarp {
         shot: eye_site::warp_shot,
         depth: eye_site::scene_depth,
+        side_by_side: eye_site::drawn_side_by_side,
         region,
         fsr,
         framegen,
         // The eye's own last real frame only fills gaps: up to a refresh old, it shows the hands
-        // where they were (a ghost hand where it was preferred over the warp).
-        rules: Rules::WHOLE.every(eye_site::REFRESH).fill_first(false),
+        // where they were (a ghost hand where it was preferred over the warp), so never within the
+        // hands' reach (the gun's ghost beside it): those gaps show what is behind.
+        rules: Rules::WHOLE.every(eye_site::REFRESH).fill_first(false).held_reach(HELD_REACH_CM),
         // Command line only: `afw_sources=1` shows where each warped pixel came from.
         sources: start.options.text("afw_sources").and_then(|t| t.trim().parse().ok()).unwrap_or(0),
+        // Command line only: `afw_snapshots=N` writes N warped pairs beside the log (6 while the
+        // warp's faults around the hands are looked into).
+        snapshots: start.options.text("afw_snapshots").and_then(|t| t.trim().parse().ok()).unwrap_or(6),
     })
 }
+
+/// How far from the eyes the hands and what they hold reach (centimetres): frame warping never fills
+/// a gap there from the eye's own last frame.
+const HELD_REACH_CM: u16 = 90;
 
 /// With DLSS chosen, both eyes drawn each frame and an eye size asked for: the window made the
 /// render size, each eye's projection jittered, and DLSS bringing each eye to the eye size. NVIDIA's

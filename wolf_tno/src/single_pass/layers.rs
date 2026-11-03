@@ -133,6 +133,10 @@ impl Layers {
                 unsafe {
                     (gl.create_textures)(GL_TEXTURE_2D_ARRAY, 1, &mut array);
                     (gl.texture_storage_3d)(array, 1, format, size.0, size.1, 2);
+                    // Sampled whole too, by the programs reading the scene's maps layered.
+                    for pname in SAMPLING {
+                        (gl.texture_parameter_i)(array, pname, texture_parameter(gl, texture, pname));
+                    }
                     (gl.gen_textures)(2, views.as_mut_ptr());
                     for (layer, &view) in views.iter().enumerate() {
                         (gl.texture_view)(view, GL_TEXTURE_2D, array, format, 0, 1, layer as u32, 1);
@@ -194,6 +198,11 @@ impl Layers {
     /// The engine framebuffers stood in for, with ours.
     pub fn stand(&self, framebuffer: u32) -> Option<Stand> {
         self.framebuffers.get(&framebuffer).copied()
+    }
+
+    /// The array standing in for an engine eye texture.
+    pub fn array(&self, texture: u32) -> Option<u32> {
+        self.textures.get(&texture).map(|t| t.array)
     }
 
     /// The view of an engine eye texture's `layer`.

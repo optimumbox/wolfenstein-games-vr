@@ -21,7 +21,7 @@ fn widen(rows: &Rows) -> M {
     rows.map(|row| row.map(f64::from))
 }
 
-fn multiply(a: &M, b: &M) -> M {
+pub(super) fn multiply(a: &M, b: &M) -> M {
     let mut out = [[0.0; 4]; 4];
     for (i, row) in out.iter_mut().enumerate() {
         for (j, cell) in row.iter_mut().enumerate() {
@@ -32,7 +32,7 @@ fn multiply(a: &M, b: &M) -> M {
 }
 
 /// The inverse, none when the matrix is (nearly) singular for its scale.
-fn invert(m: &M) -> Option<M> {
+pub(super) fn invert(m: &M) -> Option<M> {
     let mut a = *m;
     let mut inverse = [[0.0; 4]; 4];
     for (i, row) in inverse.iter_mut().enumerate() {
@@ -65,6 +65,11 @@ fn invert(m: &M) -> Option<M> {
         }
     }
     Some(inverse)
+}
+
+/// How far `e · left` is from `right`, relative to `right`'s size.
+pub fn misfit(e: &Rows, left: &Rows, right: &Rows) -> f64 {
+    disagreement(&widen(e), left, right)
 }
 
 /// How far `e · left` is from `right`, relative to `right`'s size.

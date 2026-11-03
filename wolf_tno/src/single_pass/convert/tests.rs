@@ -52,3 +52,97 @@ fn the_stereo_vertex_shader_keeps_main_and_adds_the_other_eye() {
 fn fragment_outputs_are_named() {
     assert_eq!(outputs("out vec4 out_FragColor0;\nout vec4 out_FragColor1;\nin vec4 vofi;\n"), vec!["out_FragColor0", "out_FragColor1"]);
 }
+
+#[test]
+fn programs_reading_the_scene_at_their_pixel_are_told_apart() {
+    // A decal placing itself by the depth under it.
+    assert!(reads_screen("uniform sampler2D samp_viewdepthmap;\nin vec4 gl_FragCoord;\nvoid main() {\n\tvec2 tc = screenPosToTexcoord( gl_FragCoord.xy, _fa_[0 ] );\n\tfloat z = tex2Ddepth( samp_viewdepthmap, tc );\n}\n"));
+    // A dither by the pixel, or the scene's map read without it, is the same in either eye's copy.
+    assert!(!reads_screen("uniform sampler2D samp_dither256map;\nin vec4 gl_FragCoord;\nvoid main() {\n\tvec2 texcoord = gl_FragCoord.xy * ( 1.0 / 256.0 );\n}\n"));
+    assert!(!reads_screen("uniform sampler2D samp_viewcolormap;\nin vec4 vofi_TexCoord0;\nvoid main() {\n}\n"));
+}
+
+const LIGHT: &str = "#version 150\n\
+vec4 tex2D( sampler2D sampler, vec2 texcoord ) { return texture( sampler, texcoord.xy ); }\n\
+vec4 tex2D( sampler2DShadow sampler, vec3 texcoord ) { return vec4( texture( sampler, texcoord.xyz ) ); }\n\
+vec4 tex2Dproj( sampler2D sampler, vec3 texcoord ) { return textureProj( sampler, texcoord ); }\n\
+float tex2Ddepth ( sampler2D image, vec2 texcoord ) { return tex2D( image, texcoord ).x; }\n\
+float ComputeSoftParticleScale ( sampler2D image, vec2 tc, float z, float softness ) {\n\
+\tfloat depth = tex2Ddepth( image, tc );\n\
+\treturn ( depth - z ) * softness;\n\
+}\n\
+vec2 screenPosToTexcoord ( vec2 pos, vec4 bias_scale ) { return ( pos * bias_scale.zw + bias_scale.xy ); }\n\
+uniform vec4 _fa_ [3];\n\
+uniform sampler2D samp_viewdepthmap;\n\
+uniform sampler2D samp_lightfalloffmap;\n\
+in vec4 gl_FragCoord;\n\
+out vec4 out_FragColor0;\n\
+void main() {\n\
+\tvec2 tc = screenPosToTexcoord( gl_FragCoord.xy, _fa_[0 ] );\n\
+\tfloat z = tex2Ddepth( samp_viewdepthmap, tc );\n\
+\tfloat s = ComputeSoftParticleScale( samp_viewdepthmap, tc, z, 2.0 );\n\
+\tout_FragColor0 = tex2D( samp_lightfalloffmap, vec2( z, 0.5 ) ) * _fa_[ 1 + 1 ] * s;\n\
+}\n";
+
+#[test]
+fn screen_maps_are_read_at_the_drawn_layer() {
+    let layered = layered_fragment(LIGHT).expect("converts");
+    assert_eq!(layered.maps, vec!["samp_viewdepthmap"]);
+    assert_eq!(layered.rows, 3);
+    let s = &layered.source;
+    assert!(s.starts_with("#version 150\n#extension GL_ARB_fragment_layer_viewport : require\n"), "{s}");
+    // Overloads of the helpers taking a 2D sampler, the lookups at the layer.
+    assert!(s.contains("vec4 tex2D( sampler2DArray sampler, vec2 texcoord ) { return texture( sampler, vec3( texcoord.xy, float( gl_Layer ) ) ); }"), "{s}");
+    assert!(s.contains("float tex2Ddepth ( sampler2DArray image, vec2 texcoord ) { return tex2D( image, texcoord ).x; }"), "{s}");
+    assert!(s.contains("float ComputeSoftParticleScale ( sampler2DArray image, vec2 tc, float z, float softness ) {\n\tfloat depth = tex2Ddepth( image, tc );"), "{s}");
+    // Not the projective lookup (arrays have none), nor the shadow sampler's.
+    assert!(!s.contains("tex2Dproj( sampler2DArray"), "{s}");
+    assert!(!s.contains("sampler2DArrayShadow"), "{s}");
+    // The map's calls choose by layer; other maps are left as they are.
+    assert!(s.contains("float z = ( gl_Layer != 0 ? tex2Ddepth( monaka_l_samp_viewdepthmap, tc ) : tex2Ddepth( samp_viewdepthmap, tc ) );"), "{s}");
+    assert!(s.contains("( gl_Layer != 0 ? ComputeSoftParticleScale( monaka_l_samp_viewdepthmap, tc, z, 2.0 ) : ComputeSoftParticleScale( samp_viewdepthmap, tc, z, 2.0 ) )"), "{s}");
+    assert!(s.contains("tex2D( samp_lightfalloffmap, vec2( z, 0.5 ) ) * monaka_fa[ 1 + 1 ]"), "{s}");
+    assert!(s.contains("uniform sampler2D samp_viewdepthmap;\nuniform sampler2DArray monaka_l_samp_viewdepthmap;\n"), "{s}");
+    assert!(!s.contains("monaka_l_samp_lightfalloffmap"), "{s}");
+    // The rows: the other eye's in layer 1.
+    assert!(s.contains("uniform vec4 _fa_ [3];\nuniform vec4 monaka_fr[3];\nvec4 monaka_fa[3];\n"), "{s}");
+    assert!(s.contains("screenPosToTexcoord( gl_FragCoord.xy, monaka_fa[0 ] )"), "{s}");
+    assert!(s.contains("void monaka_fmain() {"), "{s}");
+    assert!(s.contains("monaka_fa[i] = gl_Layer != 0 ? monaka_fr[i] : _fa_[i];"), "{s}");
+    assert_eq!(uniforms(s).iter().filter(|(_, u)| u.name == "_fa_").count(), 1);
+}
+
+#[test]
+fn a_screen_map_used_otherwise_is_not_layered() {
+    // Passed to a lookup straight: no helper to overload.
+    assert_eq!(layered_fragment("#version 150\nuniform sampler2D samp_viewdepthmap;\nin vec4 gl_FragCoord;\nvoid main() {\n\tfloat z = texture( samp_viewdepthmap, gl_FragCoord.xy ).x;\n}\n"), None);
+    // A multisampled map is not a 2D one.
+    assert_eq!(layered_fragment("#version 150\nuniform sampler2DMS samp_viewtargetms;\nin vec4 gl_FragCoord;\nvoid main() {\n}\n"), None);
+}
+
+/// Every render program extracted into `MONAKA_RENDERPROGS` (`tools/sp/resources.py`) that reads
+/// the scene's maps, converted.
+#[test]
+#[ignore]
+fn the_games_screen_programs_convert() {
+    let Ok(folder) = std::env::var("MONAKA_RENDERPROGS") else { return };
+    let (mut reading, mut layered) = (0, 0);
+    for entry in std::fs::read_dir(folder).expect("a folder") {
+        let bytes = std::fs::read(entry.expect("an entry").path()).expect("readable");
+        let text: String = bytes.iter().map(|&b| b as char).collect();
+        for run in text.split(|c: char| !(c == '\t' || c == '\n' || c == '\r' || (' '..='~').contains(&c))).filter(|r| r.len() >= 200) {
+            if run.contains("gl_Position") || !reads_screen(run) {
+                continue;
+            }
+            reading += 1;
+            match layered_fragment(run) {
+                Some(l) => {
+                    layered += 1;
+                    assert!(!l.source.contains("( samp_view") || l.source.contains("monaka_l_"), "{}", l.source);
+                }
+                None => println!("not layered:\n{}", &run[run.find("void main").unwrap_or(0)..]),
+            }
+        }
+    }
+    println!("{layered} of {reading} layered");
+}

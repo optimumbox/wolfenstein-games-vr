@@ -19,7 +19,7 @@
 //! - [`EYES`](providers::eye_site::EYES): stereo by the engine's side-by-side layout, the player's
 //!   render view turned by the head at the view builder, each eye given the headset's frustum;
 //! - [`SINGLE_PASS`]: both eyes drawn by the left eye's view, the right eye's view skipping what
-//!   is drawn (on trial, `single_pass=1`; [`single_pass`]);
+//!   is drawn (`stereo=single`; [`single_pass`]);
 //! - [`LOOK`]: the player looks and shoots where the head points (Monaka's look, through the
 //!   command's angles, [`providers::look`]);
 //! - [`GUNS`]: each gun on its controller ([`providers::held_item`]); [`GUN`]: each shot from the
@@ -153,7 +153,7 @@ pub(crate) fn on(place: usize) -> bool {
 /// eyes. It reports a full-screen video, which goes to the flat screen.
 pub const PRESENT: Component<Wolf> = Component { reports: &[Situation::Video], ..monaka_stereo::same_frame::same_frame() };
 
-/// Single pass (on trial, `single_pass=1`): the engine's scene programs converted to draw both
+/// Single pass (the stereo method `stereo=single`, [`eyes::SINGLE_PASS_STEREO`]): the engine's scene programs converted to draw both
 /// eyes at once, the left eye's view drawing the right eye's too and the right eye's view skipping
 /// those draws ([`single_pass`]). Its work is at each `SwapBuffers`; at the stop the render thread
 /// turns the converted programs back to one eye before the hooks come out.
@@ -161,9 +161,9 @@ pub const SINGLE_PASS: Component<Wolf> = Component {
     name: "single_pass",
     needs: &[Need::On(&eye_site::EYES)],
     settings: |options, _| {
-        options.switch("single_pass", false);
+        eyes::single_pass_on(options);
     },
-    on: |run| On::when(run.options.switch("single_pass", false), "single_pass is off"),
+    on: |run| On::when(eyes::single_pass_on(run.options), "the stereo method is not Single-pass (Same-frame)"),
     give_back: single_pass::draws::give_back,
     let_go: Some(single_pass::draws::let_go),
     summary: Some(single_pass::draws::summary),

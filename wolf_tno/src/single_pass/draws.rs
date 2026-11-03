@@ -25,6 +25,24 @@
 //! weapon, their depth squeezed in front of the world) is not carried by the eye matrix, which
 //! fits the world's: each pass draws it into its own layer ([`depth_ratio`]).
 //!
+//! The detours ask the driver nothing per call: a state query waits for the driver's own thread.
+//! The active texture unit and what draws write are kept from the engine's own calls ([`Shadow`]),
+//! checked against queries now and then.
+//!
+//! Some programs place their vertices by more than the position rows (glows and sprites turned to
+//! the camera, among them): the eye matrix puts their copy where the right eye's own pass would
+//! not. Every [`CHECK_EVERY`] frames each of the right eye's stretch draws is looked for among the
+//! left eye's draws of its program, carried by the matrix; a program whose draws mostly are not
+//! found is drawn by each eye from then on, like the hands ([`Misfits`]). So is every program whose
+//! fragment shader reads the scene's depth, normal or colour maps at its own pixel (decals, lights,
+//! soft particles: [`convert::reads_screen`](super::convert::reads_screen)): the copy would read the
+//! left eye's maps and place itself by the left eye's pixel.
+//!
+//! The scene's stretch is mostly the engine's occlusion queries: each object's depth drawn, writing
+//! nothing, inside a samples-passed query. The left eye's, drawn for both eyes, counts the samples of
+//! either; so each of the right eye's queries whose draw is the copy of one of the left's (found by
+//! the eye matrix) is not made, and its result is read from that left query ([`QUERIES_SHARED`]).
+//!
 //! The stand-ins are made once the scene's framebuffers have been seen for a while
 //! ([`DISCOVERY_FRAMES`]); at each `SwapBuffers` the frame's last layer is copied back into the
 //! engine's textures, for what reads them at the present (the frame's depth).
@@ -35,7 +53,8 @@
 use super::eye_matrix::{self, Rows};
 use super::gl_api::{self, Gl};
 use super::layers::Layers;
-use super::programs::{Conversion, Converted};
+use super::programs::{Conversion, Converted, Screen};
+use super::screen::{self, Drawn, Learner, Row};
 use monaka_core::sync::Locked;
 use monaka_hook::module::Module;
 use monaka_hook::{Hooks, InFlight, Original};
@@ -43,7 +62,7 @@ use monaka_producer::log;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 use std::time::{Duration, Instant};
 use windows::Win32::Graphics::OpenGL::{glGetBooleanv, glGetIntegerv, glIsEnabled};
 
@@ -69,6 +88,19 @@ struct Program {
     rows: Rows,
     switch: bool,
     matrix: u64,
+    /// For a program reading the scene's maps layered: its vertex and fragment rows as uploaded
+    /// (read from the driver at its first draw), the right rows last given, and the units its
+    /// maps' samplers read (looked at again on the checking frames).
+    vertex: Vec<Row>,
+    fragment: Vec<Row>,
+    right_given: Vec<Row>,
+    map_units: Vec<u32>,
+}
+
+impl Program {
+    fn new(converted: Converted) -> Self {
+        Self { converted, rows: [[0.0; 4]; 4], switch: false, matrix: 0, vertex: Vec::new(), fragment: Vec::new(), right_given: Vec::new(), map_units: Vec::new() }
+    }
 }
 
 #[derive(Default)]
@@ -89,13 +121,119 @@ struct Counts {
     in_stretch: u64,
     /// The right eye's stretch draws writing neither colour nor depth (its culling's), drawn.
     unwritten: u64,
+    /// Of those: inside a query, with the stencil test on, with the rasterizer discarding.
+    unwritten_query: u64,
+    unwritten_stencil: u64,
+    unwritten_discard: u64,
+    unwritten_depth_test: u64,
+    /// The right eye's queries answered by the left eye's.
+    queries_shared: u64,
+    /// Checked ones (on the shadow's check frames) writing colour to a draw buffer past the first.
+    unwritten_checked: u64,
+    unwritten_other_buffers: u64,
     /// The stretch's draws with another depth projection than the world's, drawn by each pass.
     own_projection: u64,
+    /// The stretch's draws of programs the eye matrix does not carry, or that read the scene's maps
+    /// at their own pixel, drawn by each pass.
+    misfit_draws: u64,
+    /// Draws of programs reading the scene's maps made for both eyes.
+    screen_shared: u64,
+}
+
+/// The frames between checks of the right eye's draws against the left's carried by the matrix.
+const CHECK_EVERY: u64 = 15;
+/// Checked draws needed before a program is judged, and the share not found that makes it a misfit:
+/// most of them, as a draw the left eye culled is not found either (the world's depth pass, half
+/// not found, is carried well; the glows' programs miss all but a few).
+const JUDGED_AFTER: u64 = 12;
+const MISFIT_SHARE: f64 = 0.8;
+
+/// The programs the eye matrix does not carry: each one's checked draws and those not found, and
+/// the programs judged misfits (drawn by each pass).
+#[derive(Default)]
+struct Misfits {
+    checked: HashMap<u32, (u64, u64)>,
+    misfits: HashSet<u32>,
+    /// A checked frame's left-eye stretch rows by program.
+    left: HashMap<u32, Vec<Rows>>,
+}
+
+impl Misfits {
+    /// The right eye's draw of `program` with `rows`, against the left eye's carried by `matrix`.
+    fn check(&mut self, program: u32, name: &str, rows: &Rows, matrix: &Rows) {
+        let found = self.left.get(&program).is_some_and(|left| left.iter().any(|l| eye_matrix::misfit(matrix, l, rows) <= eye_matrix::AGREES * 10.0));
+        let (checked, missed) = self.checked.entry(program).or_default();
+        *checked += 1;
+        *missed += u64::from(!found);
+        if *checked >= JUDGED_AFTER && *missed as f64 > *checked as f64 * MISFIT_SHARE && self.misfits.insert(program) {
+            log!("single pass: program {program} ({name}) is not carried by the eye matrix ({missed} of {checked} draws not found): each eye draws it");
+        }
+    }
+}
+
+/// The render thread's time per frame by part, from the swap: before the left eye's pass, its
+/// stretch, the rest of it, the right eye's stretch, the rest of it (to the next swap); and the
+/// draws in each, with the time in the draw detour's own work.
+#[derive(Default)]
+struct Profile {
+    part: usize,
+    since: Option<Instant>,
+    times: [Duration; 5],
+    draws: [u64; 5],
+    ours: Duration,
+    frames: u64,
+    /// The frame's last draw, and the time from it to the swap.
+    last_draw: Option<Instant>,
+    after_last: Duration,
+    /// The rests' time by the framebuffer drawn into ("L28", "R0"): from the draw before (or the
+    /// stretch's end) to each draw, and the draws.
+    by_target: HashMap<String, (Duration, u64)>,
+}
+
+impl Profile {
+    fn enter(&mut self, part: usize) {
+        let now = Instant::now();
+        if let Some(since) = self.since {
+            self.times[self.part] += now - since;
+        }
+        self.since = Some(now);
+        self.part = part;
+    }
+
+    fn report(&mut self) -> String {
+        let frames = self.frames.max(1) as f64;
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / frames;
+        let parts = ["before the left pass", "left stretch", "left rest", "right stretch", "right rest"];
+        let text = parts
+            .iter()
+            .enumerate()
+            .map(|(i, name)| format!("{name} {:.2} ms ({:.0} draws)", ms(self.times[i]), self.draws[i] as f64 / frames))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let waits = WAITED
+            .iter()
+            .zip(WAITS)
+            .filter_map(|((time, calls), name)| {
+                let (time, calls) = (time.swap(0, Relaxed), calls.swap(0, Relaxed));
+                (calls > 0).then(|| format!("{name} {:.2} ms ({:.0})", time as f64 / 1e6 / frames, calls as f64 / frames))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut targets: Vec<_> = self.by_target.drain().collect();
+        targets.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        let targets = targets.iter().take(14).map(|(name, (time, draws))| format!("{name} {:.2} ms ({:.0})", ms(*time), *draws as f64 / frames)).collect::<Vec<_>>().join(", ");
+        let text = format!("{text}; the rests by framebuffer: {targets}; the draw detour's own work {:.2} ms; from the last draw to the swap {:.2} ms; in the engine's waits and reads: {waits}", ms(self.ours), ms(self.after_last));
+        *self = Self { part: self.part, since: self.since, ..Self::default() };
+        text
+    }
 }
 
 /// The live frames whose passes are written to the log: each run of draws into one framebuffer
 /// and viewport as a line, with the clears between them.
 const TRACED_FRAMES: std::ops::Range<u64> = 600..602;
+/// Whether the render thread is profiled (by part, by framebuffer, the engine's waits timed) and
+/// frames [`TRACED_FRAMES`] traced: research only, it costs the render thread time per draw.
+const PROFILING: bool = false;
 const TRACED_LINES: usize = 600;
 
 /// A traced frame: its lines and the run of draws being counted.
@@ -145,6 +283,23 @@ struct State {
     left: Vec<(u32, Rows)>,
     right: Vec<(u32, Rows)>,
     counts: Counts,
+    /// The right eye's draws writing neither colour nor depth, by program.
+    unwritten_by: HashMap<u32, u64>,
+    /// The right eye's stretch draws each eye draws itself (its own projection, or a misfit), by
+    /// program.
+    own_by: HashMap<u32, u64>,
+    /// The left eye's queries made around stretch draws for both eyes this frame (id and rows), and
+    /// where the right eye's pass looks next.
+    left_queries: Vec<(u32, Rows)>,
+    query_cursor: usize,
+    misfits: Misfits,
+    /// The right eye's rows of the programs reading the scene's maps, learnt.
+    screen: Learner,
+    /// The arrays bound to the units of the layered maps' samplers.
+    map_arrays: HashMap<u32, u32>,
+    /// The rows kept from the engine's uploads disagreed with the driver's: read from it always.
+    rows_untrusted: bool,
+    profile: Profile,
     agreeing: (usize, usize),
     logged: Option<Instant>,
     live_frames: u64,
@@ -183,6 +338,15 @@ fn state() -> State {
         left: Vec::new(),
         right: Vec::new(),
         counts: Counts::default(),
+        unwritten_by: HashMap::new(),
+        own_by: HashMap::new(),
+        left_queries: Vec::new(),
+        query_cursor: 0,
+        misfits: Misfits::default(),
+        screen: Learner::default(),
+        map_arrays: HashMap::new(),
+        rows_untrusted: false,
+        profile: Profile::default(),
         agreeing: (0, 0),
         logged: None,
         live_frames: 0,
@@ -271,7 +435,11 @@ pub fn frame(on: bool) {
     let Some(gl) = state.gl.as_ref() else { return };
     if !state.conversion.finished() {
         if let Some(converted) = state.conversion.step(gl) {
-            state.programs = converted.into_iter().map(|c| (c.program, Program { converted: c, rows: [[0.0; 4]; 4], switch: false, matrix: 0 })).collect();
+            let reading = converted.iter().filter(|c| c.reads_screen).count();
+            log!("single pass: {reading} of {} converted programs read the scene's maps at their own pixel: each eye draws them", converted.len());
+            let layered = converted.iter().filter(|c| c.screen.is_some()).count();
+            log!("single pass: {layered} of them read the maps at the layer they draw into, for both eyes in one draw once their right eye's rows are learnt");
+            state.programs = converted.into_iter().map(|c| (c.program, Program::new(c))).collect();
         }
         return;
     }
@@ -300,7 +468,7 @@ pub fn frame(on: bool) {
         let lines = trace.lines;
         log!("single pass: frame {} traced:\n  {}", state.live_frames - 1, lines.join("\n  "));
     }
-    if TRACED_FRAMES.contains(&state.live_frames) {
+    if PROFILING && TRACED_FRAMES.contains(&state.live_frames) {
         state.trace = Some(Trace { lines: Vec::new(), run: None, draws: 0, scene: 0, binds: Vec::new() });
     }
     let passes = state.pass;
@@ -317,15 +485,28 @@ pub fn frame(on: bool) {
         state.counts.frames_off += 1;
     }
     state.counts.odd_frames += u64::from(passes != 2);
+    state.screen.end_frame(state.matrix.as_ref());
     state.matrix = measured.map(|m| m.matrix);
     state.matrix_number += 1;
     state.agreeing = measured.map_or((0, pairs.len()), |m| (m.agreeing, m.looked_at));
     state.left.clear();
+    state.misfits.left.clear();
+    state.left_queries.clear();
+    state.query_cursor = 0;
+    SHARING.store(false, Relaxed);
     state.world_depth = median(&mut state.depth_ratios);
     state.depth_ratios.clear();
     state.right.clear();
     state.pass = 0;
+    PASS.store(0, Relaxed);
     state.cut = false;
+    if passes == 2 {
+        state.profile.frames += 1;
+    }
+    if let Some(last) = state.profile.last_draw.take() {
+        state.profile.after_last += last.elapsed();
+    }
+    state.profile.enter(0);
     if state.layers.is_none() && !state.layers_failed && passes == 2 && state.live_frames >= DISCOVERY_FRAMES && !state.seen.is_empty() {
         let seen: Vec<u32> = state.seen.iter().copied().collect();
         let eye = (state.size.0 / 2, state.size.1);
@@ -356,8 +537,40 @@ pub fn frame(on: bool) {
             state.agreeing.0,
             state.agreeing.1
         );
+        if PROFILING {
+            log!("single pass: render thread per frame: {}", state.profile.report());
+        }
+        let frames = c.frames_on.max(1) as f64;
+        let queries = QUERIES.iter().map(|(target, by_pass)| {
+            let by_pass: Vec<String> = by_pass.iter().map(|n| format!("{:.1}", n.load(Relaxed) as f64 / frames)).collect();
+            format!("{target:#x} {}", by_pass.join("/"))
+        });
         log!(
-            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch; {} of the right eye's writing neither colour nor depth, drawn; {} with their own depth projection, drawn by each eye (world's {:?})",
+            "single pass: of the right eye's draws writing neither colour nor depth: {} in a query, {} with the stencil test on, {} discarding, {} with the depth test on, {} of {} checked writing colour past the first draw buffer; by program: {}; conditional renders per frame {:.1}; the right eye's queries answered by the left eye's {:.1}; queries begun per frame (before/left/right pass): {}",
+            c.unwritten_query,
+            c.unwritten_stencil,
+            c.unwritten_discard,
+            c.unwritten_depth_test,
+            c.unwritten_other_buffers,
+            c.unwritten_checked,
+            {
+                let mut by: Vec<_> = state.unwritten_by.iter().map(|(p, n)| (*n, state.programs.get(p).map_or("?", |p| p.converted.name), *p)).collect();
+                by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                by.iter().take(16).map(|(n, name, p)| format!("{name} ({p}) {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
+            },
+            CONDITIONAL.load(Relaxed) as f64 / frames,
+            c.queries_shared as f64 / frames,
+            queries.collect::<Vec<_>>().join(", ")
+        );
+        let (shared, own) = state.screen.counts();
+        log!("single pass: programs reading the scene's maps: {shared} drawn for both eyes, {own} by each eye, the rest being learnt");
+        log!("single pass: the right eye's stretch draws each eye draws itself, per frame by program: {}", {
+            let mut by: Vec<_> = state.own_by.iter().map(|(p, n)| (*n, state.programs.get(p).map_or("?", |p| p.converted.name), *p)).collect();
+            by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            by.iter().take(24).map(|(n, name, p)| format!("{name} ({p}) {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
+        });
+        log!(
+            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch; {} of the right eye's writing neither colour nor depth, drawn; {} with their own depth projection, drawn by each eye (world's {:?}); {} of programs reading the scene's maps or not carried by the eye matrix ({} judged), drawn by each eye; {} of programs reading the scene's maps made for both eyes",
             c.draws,
             c.converted,
             c.perspective,
@@ -365,7 +578,10 @@ pub fn frame(on: bool) {
             c.in_stretch,
             c.unwritten,
             c.own_projection,
-            state.world_depth
+            state.world_depth,
+            c.misfit_draws,
+            state.misfits.misfits.len(),
+            c.screen_shared
         );
     }
 }
@@ -373,6 +589,8 @@ pub fn frame(on: bool) {
 /// The stop on the render thread: every switch off, the engine's own objects bound again, then the
 /// detours stand aside.
 fn stop(state: &mut State) {
+    SHARING.store(false, Relaxed);
+    forward_pending();
     if let Some(gl) = state.gl.as_ref() {
         for program in state.programs.values_mut() {
             set_switch(gl, program, false);
@@ -389,6 +607,7 @@ fn stop(state: &mut State) {
     state.layers_failed = false;
     state.seen.clear();
     state.units.clear();
+    state.map_arrays.clear();
     state.tried = false;
     LET_GO.store(true, Release);
 }
@@ -459,6 +678,21 @@ type DrawElementsInstancedBaseInstanceFn = unsafe extern "system" fn(u32, i32, u
 type DrawElementsInstancedBaseVertexBaseInstanceFn = unsafe extern "system" fn(u32, i32, u32, *const c_void, i32, i32, u32);
 type DrawArraysInstancedBaseInstanceFn = unsafe extern "system" fn(u32, i32, i32, i32, u32);
 type MultiDrawElementsIndirectBindlessFn = unsafe extern "system" fn(u32, u32, *const c_void, i32, i32, i32);
+type CapFn = unsafe extern "system" fn(u32);
+type VoidFn = unsafe extern "system" fn();
+type ReadPixelsFn = unsafe extern "system" fn(i32, i32, i32, i32, u32, u32, *mut c_void);
+type ClientWaitSyncFn = unsafe extern "system" fn(*const c_void, u32, u64) -> u32;
+type WaitSyncFn = unsafe extern "system" fn(*const c_void, u32, u64);
+type GetSyncivFn = unsafe extern "system" fn(*const c_void, u32, i32, *mut i32, *mut i32);
+type GetBufferSubDataFn = unsafe extern "system" fn(u32, isize, isize, *mut c_void);
+type MapBufferRangeFn = unsafe extern "system" fn(u32, isize, isize, u32) -> *mut c_void;
+type MapBufferFn = unsafe extern "system" fn(u32, u32) -> *mut c_void;
+type GetvFn = unsafe extern "system" fn(u32, *mut c_void);
+type GetTexImageFn = unsafe extern "system" fn(u32, i32, u32, u32, *mut c_void);
+type GetQueryObjectFn = unsafe extern "system" fn(u32, u32, *mut c_void);
+type ColorMaskFn = unsafe extern "system" fn(u8, u8, u8, u8);
+type DepthMaskFn = unsafe extern "system" fn(u8);
+type BeginQueryFn = unsafe extern "system" fn(u32, u32);
 
 static USE_PROGRAM: Original<UseProgramFn> = Original::new();
 static UNIFORM_4FV: Original<Uniform4fvFn> = Original::new();
@@ -488,6 +722,75 @@ static DRAW_ELEMENTS_INSTANCED_BASE_INSTANCE: Original<DrawElementsInstancedBase
 static DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE: Original<DrawElementsInstancedBaseVertexBaseInstanceFn> = Original::new();
 static DRAW_ARRAYS_INSTANCED_BASE_INSTANCE: Original<DrawArraysInstancedBaseInstanceFn> = Original::new();
 static MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS: Original<MultiDrawElementsIndirectBindlessFn> = Original::new();
+static ACTIVE_TEXTURE: Original<CapFn> = Original::new();
+static READ_PIXELS: Original<ReadPixelsFn> = Original::new();
+static FINISH: Original<VoidFn> = Original::new();
+static FLUSH: Original<VoidFn> = Original::new();
+static CLIENT_WAIT_SYNC: Original<ClientWaitSyncFn> = Original::new();
+static WAIT_SYNC: Original<WaitSyncFn> = Original::new();
+static GET_SYNC_IV: Original<GetSyncivFn> = Original::new();
+static GET_BUFFER_SUB_DATA: Original<GetBufferSubDataFn> = Original::new();
+static MAP_BUFFER_RANGE: Original<MapBufferRangeFn> = Original::new();
+static MAP_BUFFER: Original<MapBufferFn> = Original::new();
+static GET_INTEGER_V: Original<GetvFn> = Original::new();
+static GET_BOOLEAN_V: Original<GetvFn> = Original::new();
+static GET_FLOAT_V: Original<GetvFn> = Original::new();
+static GET_TEX_IMAGE: Original<GetTexImageFn> = Original::new();
+static GET_QUERY_OBJECT_UIV: Original<GetQueryObjectFn> = Original::new();
+static GET_QUERY_OBJECT_UI64V: Original<GetQueryObjectFn> = Original::new();
+static GET_QUERY_OBJECT_IV: Original<GetQueryObjectFn> = Original::new();
+static GET_QUERY_OBJECT_UIV_ARB: Original<GetQueryObjectFn> = Original::new();
+static GET_QUERY_OBJECT_IV_ARB: Original<GetQueryObjectFn> = Original::new();
+static GET_QUERY_OBJECT_I64V: Original<GetQueryObjectFn> = Original::new();
+
+/// The engine's calls that may wait for the driver or the GPU, timed: their names, and their time
+/// (nanoseconds) and calls since the last report.
+const WAITS: [&str; 19] = [
+    "glReadPixels",
+    "glFinish",
+    "glFlush",
+    "glClientWaitSync",
+    "glWaitSync",
+    "glGetSynciv",
+    "glGetBufferSubData",
+    "glMapBufferRange",
+    "glMapBuffer",
+    "glGetIntegerv",
+    "glGetBooleanv",
+    "glGetFloatv",
+    "glGetTexImage",
+    "glGetQueryObjectuiv",
+    "glGetQueryObjectui64v",
+    "glGetQueryObjectiv",
+    "glGetQueryObjectuivARB",
+    "glGetQueryObjectivARB",
+    "glGetQueryObjecti64v",
+];
+static WAITED: [(AtomicU64, AtomicU64); 19] = [const { (AtomicU64::new(0), AtomicU64::new(0)) }; 19];
+
+/// `call` timed as the engine's wait `index`.
+fn timed<T>(index: usize, call: impl FnOnce() -> T) -> T {
+    if !PROFILING {
+        return call();
+    }
+    let started = Instant::now();
+    let out = call();
+    WAITED[index].0.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+    WAITED[index].1.fetch_add(1, Relaxed);
+    out
+}
+static COLOR_MASK: Original<ColorMaskFn> = Original::new();
+static DEPTH_MASK: Original<DepthMaskFn> = Original::new();
+static BEGIN_QUERY: Original<BeginQueryFn> = Original::new();
+static END_QUERY: Original<CapFn> = Original::new();
+static BEGIN_QUERY_ARB: Original<BeginQueryFn> = Original::new();
+static END_QUERY_ARB: Original<CapFn> = Original::new();
+static BEGIN_OCCLUSION_NV: Original<CapFn> = Original::new();
+static END_OCCLUSION_NV: Original<VoidFn> = Original::new();
+static BEGIN_CONDITIONAL: Original<BeginQueryFn> = Original::new();
+static BEGIN_CONDITIONAL_NV: Original<BeginQueryFn> = Original::new();
+static ENABLE: Original<CapFn> = Original::new();
+static DISABLE: Original<CapFn> = Original::new();
 
 /// Where the executable's data holds `address`.
 fn slots(exe: &Module, address: usize) -> Vec<usize> {
@@ -571,6 +874,45 @@ fn install() -> bool {
     draws += hook!(DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE, "glDrawElementsInstancedBaseVertexBaseInstance", draw_elements_instanced_base_vertex_base_instance as DrawElementsInstancedBaseVertexBaseInstanceFn, false);
     draws += hook!(DRAW_ARRAYS_INSTANCED_BASE_INSTANCE, "glDrawArraysInstancedBaseInstance", draw_arrays_instanced_base_instance as DrawArraysInstancedBaseInstanceFn, false);
     draws += hook!(MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS, "glMultiDrawElementsIndirectBindlessNV", multi_draw_elements_indirect_bindless as MultiDrawElementsIndirectBindlessFn, false);
+    let unit = hook!(ACTIVE_TEXTURE, "glActiveTexture", active_texture as CapFn, false);
+    let state_kept = [
+        hook!(COLOR_MASK, "glColorMask", color_mask as ColorMaskFn, false),
+        hook!(DEPTH_MASK, "glDepthMask", depth_mask as DepthMaskFn, false),
+        hook!(ENABLE, "glEnable", enable as CapFn, false),
+        hook!(DISABLE, "glDisable", disable as CapFn, false),
+    ];
+    hook!(BEGIN_QUERY, "glBeginQuery", begin_query as BeginQueryFn, false);
+    hook!(END_QUERY, "glEndQuery", end_query as CapFn, false);
+    hook!(BEGIN_QUERY_ARB, "glBeginQueryARB", begin_query_arb as BeginQueryFn, false);
+    hook!(END_QUERY_ARB, "glEndQueryARB", end_query_arb as CapFn, false);
+    hook!(BEGIN_OCCLUSION_NV, "glBeginOcclusionQueryNV", begin_occlusion_nv as CapFn, false);
+    hook!(END_OCCLUSION_NV, "glEndOcclusionQueryNV", end_occlusion_nv as VoidFn, false);
+    hook!(BEGIN_CONDITIONAL, "glBeginConditionalRender", begin_conditional as BeginQueryFn, false);
+    hook!(BEGIN_CONDITIONAL_NV, "glBeginConditionalRenderNV", begin_conditional_nv as BeginQueryFn, false);
+    if PROFILING {
+        hook!(READ_PIXELS, "glReadPixels", read_pixels as ReadPixelsFn, false);
+        hook!(FINISH, "glFinish", finish as VoidFn, false);
+        hook!(FLUSH, "glFlush", flush as VoidFn, false);
+        hook!(CLIENT_WAIT_SYNC, "glClientWaitSync", client_wait_sync as ClientWaitSyncFn, false);
+        hook!(WAIT_SYNC, "glWaitSync", wait_sync as WaitSyncFn, false);
+        hook!(GET_SYNC_IV, "glGetSynciv", get_synciv as GetSyncivFn, false);
+        hook!(GET_BUFFER_SUB_DATA, "glGetBufferSubData", get_buffer_sub_data as GetBufferSubDataFn, false);
+        hook!(MAP_BUFFER_RANGE, "glMapBufferRange", map_buffer_range as MapBufferRangeFn, false);
+        hook!(MAP_BUFFER, "glMapBuffer", map_buffer as MapBufferFn, false);
+        hook!(GET_INTEGER_V, "glGetIntegerv", get_integer_v as GetvFn, false);
+        hook!(GET_BOOLEAN_V, "glGetBooleanv", get_boolean_v as GetvFn, false);
+        hook!(GET_FLOAT_V, "glGetFloatv", get_float_v as GetvFn, false);
+        hook!(GET_TEX_IMAGE, "glGetTexImage", get_tex_image as GetTexImageFn, false);
+    }
+    hook!(GET_QUERY_OBJECT_UIV, "glGetQueryObjectuiv", get_query_object_uiv as GetQueryObjectFn, false);
+    hook!(GET_QUERY_OBJECT_UI64V, "glGetQueryObjectui64v", get_query_object_ui64v as GetQueryObjectFn, false);
+    hook!(GET_QUERY_OBJECT_IV, "glGetQueryObjectiv", get_query_object_iv as GetQueryObjectFn, false);
+    hook!(GET_QUERY_OBJECT_UIV_ARB, "glGetQueryObjectuivARB", get_query_object_uiv_arb as GetQueryObjectFn, false);
+    hook!(GET_QUERY_OBJECT_IV_ARB, "glGetQueryObjectivARB", get_query_object_iv_arb as GetQueryObjectFn, false);
+    hook!(GET_QUERY_OBJECT_I64V, "glGetQueryObjecti64v", get_query_object_i64v as GetQueryObjectFn, false);
+    Shadow::take();
+    UNIT_TRUSTED.store(unit > 0, Relaxed);
+    SHADOW_TRUSTED.store(state_kept.iter().all(|&n| n > 0), Relaxed);
     log!("single pass: the engine's GL functions found: {}", found.join(", "));
     if draws == 0 {
         log!("single pass: off: none of the engine's draw functions found");
@@ -607,16 +949,162 @@ fn uploaded(state: &mut State, program: u32, location: i32, count: i32, values: 
             program.rows[row] = unsafe { *values.add(offset as usize * 4).cast::<[f32; 4]>() };
         }
     }
+    if let Some(screen) = program.converted.screen {
+        kept(&mut program.vertex, screen.vertex_rows, location, count, values);
+        kept(&mut program.fragment, screen.fragment_rows, location, count, values);
+    }
+}
+
+/// An upload of `count` rows at `location` kept in `rows` (the array at `first`, once read).
+fn kept(rows: &mut [Row], (first, n): (i32, usize), location: i32, count: i32, values: *const f32) {
+    if rows.len() != n || values.is_null() {
+        return;
+    }
+    for i in 0..count.max(0) {
+        let at = location + i - first;
+        if (0..n as i32).contains(&at) {
+            // SAFETY: the engine's buffer holds `count` vec4s.
+            rows[at as usize] = unsafe { *values.add(i as usize * 4).cast::<Row>() };
+        }
+    }
+}
+
+/// `n` rows of `program` from `first`, as the driver has them.
+fn driver_rows(gl: &Gl, program: u32, (first, n): (i32, usize)) -> Vec<Row> {
+    (0..n as i32)
+        .map(|i| {
+            let mut row = [0.0; 4];
+            // SAFETY: a plain query into a vec4.
+            unsafe { (gl.get_uniform_fv)(program, first + i, row.as_mut_ptr()) };
+            row
+        })
+        .collect()
+}
+
+/// A program reading the scene's maps about to draw in the stretch: its rows brought up to date
+/// (read from the driver the first time, on the checking frames to check them, and always once
+/// they disagreed), the draw recorded for learning, and the arrays its maps read when it is drawn
+/// for both eyes; none when each eye draws it.
+fn screen_draw(state: &mut State, current: u32, screen: &Screen, rows: &Rows, checking: bool) -> Option<Vec<(u32, u32)>> {
+    let gl = state.gl.as_ref()?;
+    let program = state.programs.get_mut(&current)?;
+    let wants = state.screen.wants(current, checking);
+    let shared = state.screen.shared(current).is_some();
+    if !wants && !shared {
+        return None;
+    }
+    if program.vertex.len() != screen.vertex_rows.1 || state.rows_untrusted {
+        program.vertex = driver_rows(gl, current, screen.vertex_rows);
+        program.fragment = driver_rows(gl, current, screen.fragment_rows);
+    } else if checking {
+        let (vertex, fragment) = (driver_rows(gl, current, screen.vertex_rows), driver_rows(gl, current, screen.fragment_rows));
+        if vertex != program.vertex || fragment != program.fragment {
+            log!("single pass: the rows kept from the engine's uploads disagree with the driver's ({}): read from the driver from here", program.converted.name);
+            state.rows_untrusted = true;
+            program.vertex = vertex;
+            program.fragment = fragment;
+        }
+    }
+    if wants && state.matrix.is_some() && (state.pass == 1 || state.pass == 2) {
+        let position: Vec<usize> = program.converted.rows.iter().map(|&at| (at - screen.vertex_rows.0) as usize).collect();
+        let vertex = program.vertex.iter().enumerate().filter(|(i, _)| !position.contains(i)).map(|(_, row)| *row).collect();
+        let drawn = Drawn { program: current, name: program.converted.name, position: *rows, vertex, fragment: program.fragment.clone() };
+        let list = if state.pass == 1 { &mut state.screen.left } else { &mut state.screen.right };
+        if list.len() < SCREEN_RECORDED {
+            list.push(drawn);
+        }
+    }
+    if !shared {
+        return None;
+    }
+    if program.map_units.len() != screen.maps.len() || checking {
+        program.map_units = screen
+            .maps
+            .iter()
+            .map(|&(location, _)| {
+                let mut unit = 0;
+                // SAFETY: a plain query into an int.
+                unsafe { (gl.get_uniform_iv)(current, location, &mut unit) };
+                unit as u32
+            })
+            .collect();
+    }
+    let layers = state.layers.as_ref()?;
+    screen.maps.iter().zip(&program.map_units).map(|(&(_, ours), unit)| Some((ours, layers.array(state.units.get(unit)?.1)?))).collect()
+}
+
+/// The left eye's draw of a program reading the scene's maps made for both eyes: its maps'
+/// arrays bound to their samplers' units, and the right eye's rows given (worked out from the
+/// left eye's).
+fn give_right_eye(gl: &Gl, program: &mut Program, learner: &Learner, map_arrays: &mut HashMap<u32, u32>, arrays: &[(u32, u32)]) {
+    for &(unit, array) in arrays {
+        if map_arrays.get(&unit) != Some(&array) {
+            // SAFETY: a plain bind of our array to a unit the engine's samplers do not use.
+            unsafe { (gl.bind_multi_texture)(GL_TEXTURE0 + unit, GL_TEXTURE_2D_ARRAY, array) };
+            map_arrays.insert(unit, array);
+        }
+    }
+    let (Some(screen), Some((carried, k))) = (program.converted.screen, learner.shared(program.converted.program)) else { return };
+    let right: Vec<Row> = program.fragment.iter().zip(carried).map(|(row, &carried)| if carried { screen::carry(row, k) } else { *row }).collect();
+    if right != program.right_given {
+        // SAFETY: a plain GL call on the engine's program, with as many vec4s as its right rows.
+        unsafe { (gl.program_uniform_4fv)(program.converted.program, screen.right_rows, right.len() as i32, right.as_ptr().cast()) };
+        program.right_given = right;
+    }
 }
 
 /// Whether the draw about to be made goes ahead (one of the right eye's pass already drawn is
 /// skipped).
 fn draw() -> bool {
+    let goes_ahead = draw_locked();
+    match PENDING.load(Relaxed) {
+        // A query of the right eye answered by the left eye's: nothing in it is drawn.
+        PENDING_SHARED => false,
+        PENDING_OPEN => {
+            forward_pending();
+            goes_ahead
+        }
+        _ => goes_ahead,
+    }
+}
+
+/// The left eye's query whose draw the right eye's draw with `rows` copies, looked for from
+/// `cursor` on (the passes make their queries in much the same order), then from the start.
+fn left_query(left: &[(u32, Rows)], cursor: &mut usize, matrix: &Rows, rows: &Rows) -> Option<u32> {
+    let start = (*cursor).min(left.len());
+    let at = (start..left.len()).chain(0..start).find(|&i| eye_matrix::misfit(matrix, &left[i].1, rows) <= eye_matrix::AGREES * 10.0)?;
+    *cursor = at + 1;
+    Some(left[at].0)
+}
+
+fn draw_locked() -> bool {
     let mut guard = STATE.locked();
     let Some(state) = guard.as_mut() else { return true };
     if !state.live {
         return true;
     }
+    if !PROFILING {
+        return draw_in(state);
+    }
+    let started = Instant::now();
+    if matches!(state.profile.part, 2 | 4) {
+        let since = state.profile.last_draw.into_iter().chain(state.profile.since).max();
+        if let Some(since) = since {
+            let name = format!("{}{}", if state.profile.part == 2 { 'L' } else { 'R' }, state.draw_framebuffer);
+            let entry = state.profile.by_target.entry(name).or_default();
+            entry.0 += started - since;
+            entry.1 += 1;
+        }
+    }
+    let goes_ahead = draw_in(state);
+    state.profile.draws[state.profile.part] += 1;
+    let now = Instant::now();
+    state.profile.ours += now - started;
+    state.profile.last_draw = Some(now);
+    goes_ahead
+}
+
+fn draw_in(state: &mut State) -> bool {
     state.counts.draws += 1;
     let current = state.current;
     let rows = state.programs.get(&current).map(|p| p.rows);
@@ -637,30 +1125,56 @@ fn draw() -> bool {
         // The scene's stretch ends: the left eye's pass draws into its own layer from here.
         state.cut = true;
         stretch = false;
+        state.profile.enter(if state.pass >= 2 { 4 } else { 2 });
         if state.pass == 1 {
             state.rebind();
         }
     }
     state.counts.in_stretch += u64::from(stretch);
     let Some(rows) = rows else { return true };
-    let Some(gl) = state.gl.as_ref() else { return true };
     let ratio = depth_ratio(&rows);
     if stretch && state.pass == 1 && state.depth_ratios.len() < DEPTH_RATIOS {
         state.depth_ratios.extend(ratio);
     }
-    let own_projection = stretch && state.world_depth.zip(ratio).is_some_and(|(world, ratio)| (ratio - world).abs() > 1e-3 * world.abs().max(1e-6));
+    let checking = state.live_frames % CHECK_EVERY == 0;
+    let screen = state.programs.get(&current).and_then(|p| p.converted.screen);
+    let screen_arrays = screen.filter(|_| stretch).and_then(|screen| screen_draw(state, current, screen, &rows, checking));
+    let Some(gl) = state.gl.as_ref() else { return true };
+    let misfit = stretch && (state.misfits.misfits.contains(&current) || state.programs.get(&current).is_some_and(|p| p.converted.reads_screen) && screen_arrays.is_none());
+    let own_projection = misfit || stretch && state.world_depth.zip(ratio).is_some_and(|(world, ratio)| (ratio - world).abs() > 1e-3 * world.abs().max(1e-6));
+    if PENDING.load(Relaxed) == PENDING_OPEN && stretch && state.pass == 2 && !own_projection && let Some(matrix) = state.matrix.as_ref() {
+        if let Some(left) = left_query(&state.left_queries, &mut state.query_cursor, matrix, &rows) {
+            // Found: counted for the program's judgment too, or only the draws not found would be.
+            if checking {
+                let name = state.programs.get(&current).map_or("?", |p| p.converted.name);
+                state.misfits.check(current, name, &rows, matrix);
+            }
+            let right = PENDING_ID.load(Relaxed);
+            QUERIES_SHARED.lock().unwrap_or_else(|e| e.into_inner()).insert(right, left);
+            PENDING.store(PENDING_SHARED, Relaxed);
+            state.counts.queries_shared += 1;
+            return false;
+        }
+    }
     let program = state.programs.get_mut(&current).expect("looked up above");
     if own_projection {
+        state.counts.misfit_draws += u64::from(misfit);
         // Drawn into the pass's own layer (the switch off: layer 0 of the layered framebuffer in
         // the left eye's pass, the right eye's layer in its own).
         set_switch(gl, program, false);
         state.counts.own_projection += 1;
+        if state.pass == 2 {
+            *state.own_by.entry(current).or_default() += 1;
+        }
         return true;
     }
     match (stretch, state.pass) {
         (true, 1) => {
             if state.left.len() < RECORDED {
                 state.left.push((current, rows));
+            }
+            if checking {
+                state.misfits.left.entry(current).or_default().push(rows);
             }
             let Some(matrix) = state.matrix else {
                 set_switch(gl, program, false);
@@ -673,17 +1187,41 @@ fn draw() -> bool {
                 }
                 program.matrix = state.matrix_number;
             }
+            if let Some(arrays) = &screen_arrays {
+                give_right_eye(gl, program, &state.screen, &mut state.map_arrays, arrays);
+                state.counts.screen_shared += 1;
+            }
             set_switch(gl, program, true);
             state.counts.stereo += 1;
+            let query = ACTIVE_QUERY_ID.load(Relaxed);
+            if query != 0 && state.left_queries.last().is_none_or(|(id, _)| *id != query) {
+                state.left_queries.push((query, rows));
+            }
             true
         }
         (true, _) => {
             if state.right.len() < RECORDED {
                 state.right.push((current, rows));
             }
+            if checking && let Some(matrix) = state.matrix.as_ref() {
+                let name = state.programs.get(&current).map_or("?", |p| p.converted.name);
+                state.misfits.check(current, name, &rows, matrix);
+            }
+            let program = state.programs.get_mut(&current).expect("looked up above");
             set_switch(gl, program, false);
-            if !Writes::now().any() {
+            let check = state.live_frames % SHADOW_CHECK_EVERY == 0;
+            if !Shadow::writes(check).any() {
                 state.counts.unwritten += 1;
+                let bits = SHADOW.load(Relaxed);
+                state.counts.unwritten_query += u64::from(ACTIVE_QUERY.load(Relaxed) != 0);
+                state.counts.unwritten_stencil += u64::from(bits & STENCIL_TEST != 0);
+                state.counts.unwritten_discard += u64::from(bits & DISCARD != 0);
+                state.counts.unwritten_depth_test += u64::from(bits & DEPTH_TEST != 0);
+                *state.unwritten_by.entry(current).or_default() += 1;
+                if check {
+                    state.counts.unwritten_checked += 1;
+                    state.counts.unwritten_other_buffers += u64::from(other_buffers_written());
+                }
                 return true;
             }
             if state.matrix.is_some() {
@@ -701,6 +1239,9 @@ fn draw() -> bool {
 
 /// The left eye's stretch ratios kept a frame.
 const DEPTH_RATIOS: usize = 512;
+/// The draws of programs reading the scene's maps recorded per pass and frame, for learning.
+const SCREEN_RECORDED: usize = 1024;
+const GL_TEXTURE_2D_ARRAY: u32 = 0x8C1A;
 
 /// A draw's depth projection: its z row against its w row (x, y, z parts). A perspective
 /// projection's z row is its w row times a constant (the view's own z) plus a constant, so draws
@@ -719,10 +1260,185 @@ fn median(values: &mut [f32]) -> Option<f32> {
 /// What the draw about to be made writes into its framebuffer. One writing neither colour nor
 /// depth leaves the eye textures as they are: its effect is elsewhere (the engine's GPU culling
 /// tests), and the right eye's pass makes its own.
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct Writes {
     colour: bool,
     depth: bool,
     discard: bool,
+}
+
+/// The frames between checks of the shadowed state against queries.
+const SHADOW_CHECK_EVERY: u64 = 97;
+
+/// The GL state the detours need, kept from the engine's own calls (`glActiveTexture`,
+/// `glColorMask`, `glDepthMask`, `glEnable`, `glDisable`): bits of [`SHADOW`]. Checked against
+/// queries now and then; once it disagrees (state set some way not hooked) it is queried always.
+struct Shadow;
+
+static SHADOW: AtomicU32 = AtomicU32::new(0);
+/// The active texture unit (its offset from `GL_TEXTURE0`).
+static ACTIVE_UNIT: AtomicU32 = AtomicU32::new(0);
+/// The shadow is trusted: every function it is kept from hooked, no check disagreeing.
+static SHADOW_TRUSTED: AtomicBool = AtomicBool::new(false);
+static UNIT_TRUSTED: AtomicBool = AtomicBool::new(false);
+
+const COLOUR_BITS: u32 = 0xF;
+const DEPTH_WRITE: u32 = 0x10;
+const DEPTH_TEST: u32 = 0x20;
+const DISCARD: u32 = 0x40;
+const STENCIL_TEST: u32 = 0x80;
+const GL_DEPTH_TEST: u32 = 0x0B71;
+const GL_STENCIL_TEST: u32 = 0x0B90;
+
+/// The query begun and not yet ended (its target; 0 for none), the pass the frame is in (0 before
+/// the left eye's, 1, 2), and the queries begun per target and pass.
+static ACTIVE_QUERY: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_QUERY_ID: AtomicU32 = AtomicU32::new(0);
+
+/// The right eye's pass may answer its queries by the left eye's ([`SHARING`]): a samples-passed
+/// query it begins is held back ([`PENDING_OPEN`]) until its first draw, which either is a copy of a
+/// left query's draw ([`PENDING_SHARED`]: the query is not made, nor anything in it drawn) or not
+/// (the query is begun then, as the engine began it).
+static SHARING: AtomicBool = AtomicBool::new(false);
+static PENDING: AtomicU32 = AtomicU32::new(PENDING_NONE);
+static PENDING_ID: AtomicU32 = AtomicU32::new(0);
+static PENDING_TARGET: AtomicU32 = AtomicU32::new(0);
+static PENDING_ARB: AtomicBool = AtomicBool::new(false);
+const PENDING_NONE: u32 = 0;
+const PENDING_OPEN: u32 = 1;
+const PENDING_SHARED: u32 = 2;
+const GL_SAMPLES_PASSED: u32 = 0x8914;
+/// The right eye's queries answered by the left eye's: right id to left id.
+static QUERIES_SHARED: std::sync::LazyLock<Mutex<HashMap<u32, u32>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The held-back query begun as the engine began it.
+fn forward_pending() {
+    if PENDING.load(Relaxed) != PENDING_OPEN {
+        return;
+    }
+    PENDING.store(PENDING_NONE, Relaxed);
+    let flight = InFlight::enter();
+    let (target, id) = (PENDING_TARGET.load(Relaxed), PENDING_ID.load(Relaxed));
+    // SAFETY: the game's own call, made late.
+    unsafe {
+        if PENDING_ARB.load(Relaxed) {
+            BEGIN_QUERY_ARB.get(&flight)(target, id);
+        } else {
+            BEGIN_QUERY.get(&flight)(target, id);
+        }
+    }
+}
+
+/// Whether the engine's query begin is held back.
+fn hold_back(target: u32, id: u32, arb: bool) -> bool {
+    QUERIES_SHARED.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    if target != GL_SAMPLES_PASSED || !SHARING.load(Relaxed) || PENDING.load(Relaxed) != PENDING_NONE {
+        return false;
+    }
+    PENDING_TARGET.store(target, Relaxed);
+    PENDING_ID.store(id, Relaxed);
+    PENDING_ARB.store(arb, Relaxed);
+    PENDING.store(PENDING_OPEN, Relaxed);
+    true
+}
+
+/// Whether the engine's query end is made (not for a query answered by the left eye's).
+fn end_goes_ahead() -> bool {
+    match PENDING.load(Relaxed) {
+        PENDING_SHARED => {
+            PENDING.store(PENDING_NONE, Relaxed);
+            false
+        }
+        PENDING_OPEN => {
+            // Nothing drawn in it: made as the engine made it.
+            forward_pending();
+            true
+        }
+        _ => true,
+    }
+}
+
+/// The query the engine reads: the left eye's for one of the right eye's answered by it.
+fn answering(id: u32) -> u32 {
+    QUERIES_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied().unwrap_or(id)
+}
+/// Conditional renders begun.
+static CONDITIONAL: AtomicU64 = AtomicU64::new(0);
+static PASS: AtomicU32 = AtomicU32::new(0);
+static QUERIES: [(u32, [AtomicU64; 3]); 5] = [
+    (0x8914, [const { AtomicU64::new(0) }; 3]),
+    (0x8C2F, [const { AtomicU64::new(0) }; 3]),
+    (0x8D6A, [const { AtomicU64::new(0) }; 3]),
+    (0x88BF, [const { AtomicU64::new(0) }; 3]),
+    (0x8C87, [const { AtomicU64::new(0) }; 3]),
+];
+const GL_RASTERIZER_DISCARD: u32 = 0x8C89;
+
+impl Shadow {
+    fn set(bits: u32, on: bool) {
+        if on {
+            SHADOW.fetch_or(bits, Relaxed);
+        } else {
+            SHADOW.fetch_and(!bits, Relaxed);
+        }
+    }
+
+    fn capability(cap: u32) -> u32 {
+        match cap {
+            GL_DEPTH_TEST => DEPTH_TEST,
+            GL_RASTERIZER_DISCARD => DISCARD,
+            GL_STENCIL_TEST => STENCIL_TEST,
+            _ => 0,
+        }
+    }
+
+    /// The shadow taken from the driver (at the install, the context current).
+    fn take() {
+        let mut bits = 0;
+        let mut colour = [0u8; 4];
+        let mut depth_write = 0u8;
+        let mut unit = 0;
+        // SAFETY: state queries into locals.
+        unsafe {
+            glGetBooleanv(0x0C23, colour.as_mut_ptr());
+            glGetBooleanv(0x0B72, &mut depth_write);
+            bits |= colour.iter().enumerate().fold(0, |b, (i, &c)| b | (u32::from(c != 0) << i));
+            bits |= if depth_write != 0 { DEPTH_WRITE } else { 0 };
+            bits |= if glIsEnabled(GL_DEPTH_TEST) != 0 { DEPTH_TEST } else { 0 };
+            bits |= if glIsEnabled(GL_RASTERIZER_DISCARD) != 0 { DISCARD } else { 0 };
+            bits |= if glIsEnabled(GL_STENCIL_TEST) != 0 { STENCIL_TEST } else { 0 };
+            glGetIntegerv(0x84E0, &mut unit);
+        }
+        SHADOW.store(bits, Relaxed);
+        ACTIVE_UNIT.store((unit as u32).wrapping_sub(GL_TEXTURE0), Relaxed);
+    }
+
+    fn shadowed() -> Writes {
+        let bits = SHADOW.load(Relaxed);
+        Writes { colour: bits & COLOUR_BITS != 0, depth: bits & DEPTH_WRITE != 0 && bits & DEPTH_TEST != 0, discard: bits & DISCARD != 0 }
+    }
+
+    /// What the draw writes: the shadow's, or queried when it is not trusted or `check`ed.
+    fn writes(check: bool) -> Writes {
+        if !SHADOW_TRUSTED.load(Relaxed) {
+            return Writes::now();
+        }
+        let shadowed = Self::shadowed();
+        if check {
+            let queried = Writes::now();
+            if queried != shadowed {
+                SHADOW_TRUSTED.store(false, Relaxed);
+                log!("single pass: the kept draw state disagrees with the driver's ({shadowed:?}, queried {queried:?}): queried from now on");
+            }
+            return queried;
+        }
+        shadowed
+    }
+
+    /// The active texture unit: the shadow's, or queried when it is not trusted.
+    fn unit() -> u32 {
+        if UNIT_TRUSTED.load(Relaxed) { ACTIVE_UNIT.load(Relaxed) } else { active_unit() }
+    }
 }
 
 impl Writes {
@@ -758,7 +1474,10 @@ fn clear_goes_ahead(mask: u32) -> bool {
     }
     if mask & (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT) == GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT {
         state.pass += 1;
+        PASS.store(state.pass.min(2) as u32, Relaxed);
+        SHARING.store(state.pass == 2 && state.matrix.is_some() && !state.left_queries.is_empty(), Relaxed);
         state.cut = false;
+        state.profile.enter(if state.pass >= 2 { 3 } else { 1 });
         state.rebind();
     }
     let layered = state.layers.as_ref().and_then(|l| l.stand(state.draw_framebuffer)).is_some_and(|s| s.layered.is_some());
@@ -939,9 +1658,179 @@ unsafe extern "system" fn bind_framebuffer_ext(target: u32, framebuffer: u32) {
     unsafe { BIND_FRAMEBUFFER_EXT.get(&flight)(target, framebuffer) }
 }
 
+macro_rules! timed_detour {
+    ($name:ident, $original:ident, $index:expr, ($($arg:ident: $ty:ty),*) $(-> $ret:ty)?) => {
+        unsafe extern "system" fn $name($($arg: $ty),*) $(-> $ret)? {
+            let flight = InFlight::enter();
+            // SAFETY: forwards the game's own call.
+            timed($index, || unsafe { $original.get(&flight)($($arg),*) })
+        }
+    };
+}
+
+timed_detour!(read_pixels, READ_PIXELS, 0, (x: i32, y: i32, w: i32, h: i32, format: u32, kind: u32, out: *mut c_void));
+timed_detour!(finish, FINISH, 1, ());
+timed_detour!(flush, FLUSH, 2, ());
+timed_detour!(client_wait_sync, CLIENT_WAIT_SYNC, 3, (sync: *const c_void, flags: u32, timeout: u64) -> u32);
+timed_detour!(wait_sync, WAIT_SYNC, 4, (sync: *const c_void, flags: u32, timeout: u64));
+timed_detour!(get_synciv, GET_SYNC_IV, 5, (sync: *const c_void, pname: u32, size: i32, length: *mut i32, values: *mut i32));
+timed_detour!(get_buffer_sub_data, GET_BUFFER_SUB_DATA, 6, (target: u32, offset: isize, size: isize, out: *mut c_void));
+timed_detour!(map_buffer_range, MAP_BUFFER_RANGE, 7, (target: u32, offset: isize, size: isize, access: u32) -> *mut c_void);
+timed_detour!(map_buffer, MAP_BUFFER, 8, (target: u32, access: u32) -> *mut c_void);
+timed_detour!(get_integer_v, GET_INTEGER_V, 9, (pname: u32, out: *mut c_void));
+timed_detour!(get_boolean_v, GET_BOOLEAN_V, 10, (pname: u32, out: *mut c_void));
+timed_detour!(get_float_v, GET_FLOAT_V, 11, (pname: u32, out: *mut c_void));
+timed_detour!(get_tex_image, GET_TEX_IMAGE, 12, (target: u32, level: i32, format: u32, kind: u32, out: *mut c_void));
+macro_rules! query_detour {
+    ($name:ident, $original:ident, $index:expr) => {
+        unsafe extern "system" fn $name(id: u32, pname: u32, out: *mut c_void) {
+            let flight = InFlight::enter();
+            let id = answering(id);
+            // SAFETY: forwards the game's own call (for the query answering it).
+            timed($index, || unsafe { $original.get(&flight)(id, pname, out) })
+        }
+    };
+}
+
+query_detour!(get_query_object_uiv, GET_QUERY_OBJECT_UIV, 13);
+query_detour!(get_query_object_ui64v, GET_QUERY_OBJECT_UI64V, 14);
+query_detour!(get_query_object_iv, GET_QUERY_OBJECT_IV, 15);
+query_detour!(get_query_object_uiv_arb, GET_QUERY_OBJECT_UIV_ARB, 16);
+query_detour!(get_query_object_iv_arb, GET_QUERY_OBJECT_IV_ARB, 17);
+query_detour!(get_query_object_i64v, GET_QUERY_OBJECT_I64V, 18);
+
+unsafe extern "system" fn active_texture(unit: u32) {
+    let flight = InFlight::enter();
+    ACTIVE_UNIT.store(unit.wrapping_sub(GL_TEXTURE0), Relaxed);
+    // SAFETY: forwards the game's own call.
+    unsafe { ACTIVE_TEXTURE.get(&flight)(unit) }
+}
+
+unsafe extern "system" fn color_mask(r: u8, g: u8, b: u8, a: u8) {
+    let flight = InFlight::enter();
+    let bits = [r, g, b, a].iter().enumerate().fold(0, |bits, (i, &c)| bits | (u32::from(c != 0) << i));
+    Shadow::set(COLOUR_BITS & !bits, false);
+    Shadow::set(bits, true);
+    // SAFETY: forwards the game's own call.
+    unsafe { COLOR_MASK.get(&flight)(r, g, b, a) }
+}
+
+unsafe extern "system" fn depth_mask(on: u8) {
+    let flight = InFlight::enter();
+    Shadow::set(DEPTH_WRITE, on != 0);
+    // SAFETY: forwards the game's own call.
+    unsafe { DEPTH_MASK.get(&flight)(on) }
+}
+
+unsafe extern "system" fn begin_query(target: u32, id: u32) {
+    let flight = InFlight::enter();
+    query_begun(target, id);
+    if hold_back(target, id, false) {
+        return;
+    }
+    // SAFETY: forwards the game's own call.
+    unsafe { BEGIN_QUERY.get(&flight)(target, id) }
+}
+
+/// Whether any draw buffer past the first has a colour write mask on (`glGetBooleani_v`).
+fn other_buffers_written() -> bool {
+    type GetBooleaniFn = unsafe extern "system" fn(u32, u32, *mut u8);
+    static GET: std::sync::OnceLock<Option<GetBooleaniFn>> = std::sync::OnceLock::new();
+    // SAFETY: the driver's glGetBooleani_v, of that signature.
+    let Some(get) = *GET.get_or_init(|| gl_api::address("glGetBooleani_v").map(|a| unsafe { std::mem::transmute::<usize, GetBooleaniFn>(a) })) else { return false };
+    (1..8).any(|buffer| {
+        let mut mask = [0u8; 4];
+        // SAFETY: GL_COLOR_WRITEMASK for one draw buffer, four booleans.
+        unsafe { get(0x0C23, buffer, mask.as_mut_ptr()) };
+        mask.iter().any(|&m| m != 0)
+    })
+}
+
+fn query_begun(target: u32, id: u32) {
+    ACTIVE_QUERY.store(target, Relaxed);
+    ACTIVE_QUERY_ID.store(id, Relaxed);
+    if let Some((_, by_pass)) = QUERIES.iter().find(|(t, _)| *t == target) {
+        by_pass[PASS.load(Relaxed) as usize].fetch_add(1, Relaxed);
+    }
+}
+
+unsafe extern "system" fn begin_query_arb(target: u32, id: u32) {
+    let flight = InFlight::enter();
+    query_begun(target, id);
+    if hold_back(target, id, true) {
+        return;
+    }
+    // SAFETY: forwards the game's own call.
+    unsafe { BEGIN_QUERY_ARB.get(&flight)(target, id) }
+}
+
+unsafe extern "system" fn end_query_arb(target: u32) {
+    let flight = InFlight::enter();
+    ACTIVE_QUERY.store(0, Relaxed);
+    ACTIVE_QUERY_ID.store(0, Relaxed);
+    if !end_goes_ahead() {
+        return;
+    }
+    // SAFETY: forwards the game's own call.
+    unsafe { END_QUERY_ARB.get(&flight)(target) }
+}
+
+unsafe extern "system" fn begin_occlusion_nv(id: u32) {
+    let flight = InFlight::enter();
+    query_begun(0x8914, id);
+    // SAFETY: forwards the game's own call.
+    unsafe { BEGIN_OCCLUSION_NV.get(&flight)(id) }
+}
+
+unsafe extern "system" fn end_occlusion_nv() {
+    let flight = InFlight::enter();
+    ACTIVE_QUERY.store(0, Relaxed);
+    // SAFETY: forwards the game's own call.
+    unsafe { END_OCCLUSION_NV.get(&flight)() }
+}
+
+unsafe extern "system" fn begin_conditional(id: u32, mode: u32) {
+    let flight = InFlight::enter();
+    CONDITIONAL.fetch_add(1, Relaxed);
+    // SAFETY: forwards the game's own call.
+    unsafe { BEGIN_CONDITIONAL.get(&flight)(id, mode) }
+}
+
+unsafe extern "system" fn begin_conditional_nv(id: u32, mode: u32) {
+    let flight = InFlight::enter();
+    CONDITIONAL.fetch_add(1, Relaxed);
+    // SAFETY: forwards the game's own call.
+    unsafe { BEGIN_CONDITIONAL_NV.get(&flight)(id, mode) }
+}
+
+unsafe extern "system" fn end_query(target: u32) {
+    let flight = InFlight::enter();
+    ACTIVE_QUERY.store(0, Relaxed);
+    ACTIVE_QUERY_ID.store(0, Relaxed);
+    if !end_goes_ahead() {
+        return;
+    }
+    // SAFETY: forwards the game's own call.
+    unsafe { END_QUERY.get(&flight)(target) }
+}
+
+unsafe extern "system" fn enable(cap: u32) {
+    let flight = InFlight::enter();
+    Shadow::set(Shadow::capability(cap), true);
+    // SAFETY: forwards the game's own call.
+    unsafe { ENABLE.get(&flight)(cap) }
+}
+
+unsafe extern "system" fn disable(cap: u32) {
+    let flight = InFlight::enter();
+    Shadow::set(Shadow::capability(cap), false);
+    // SAFETY: forwards the game's own call.
+    unsafe { DISABLE.get(&flight)(cap) }
+}
+
 unsafe extern "system" fn bind_texture(target: u32, texture: u32) {
     let flight = InFlight::enter();
-    let texture = unit_texture(active_unit(), target, texture);
+    let texture = unit_texture(Shadow::unit(), target, texture);
     // SAFETY: forwards the game's own call (with our stand-in).
     unsafe { BIND_TEXTURE.get(&flight)(target, texture) }
 }

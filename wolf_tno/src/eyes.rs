@@ -3,7 +3,7 @@
 
 use monaka_contract::manifest::{Kind, Manifest, Opt, Shown, SteamFiles, choice, opt};
 use monaka_core::options::{Options, Shared};
-use monaka_core::rendering::{FrameGenerator, STEREO_OFF, StereoMethod, frame_generation, stereo_method};
+use monaka_core::rendering::{FrameGenerator, Offer, STEREO_OFF, StereoMethod, frame_generation, stereo_method};
 use monaka_contract::protocol::HeadPose;
 
 /// The eye that sits where the game camera is, so it looks straight down the weapon's sights.
@@ -16,9 +16,20 @@ pub enum DominantEye {
     Right,
 }
 
-/// How the eyes are made: both in one frame by the engine's side-by-side layout (the default), or
-/// one per frame with the other warped from it by its depth (AFW).
-pub const STEREO: Opt = stereo_method(&[StereoMethod::SameFrame.offer(), StereoMethod::Afw.experimental(), STEREO_OFF], StereoMethod::SameFrame);
+/// How the eyes are made: both in one frame by the engine's side-by-side layout (the default), the
+/// same with both eyes drawn by one pass ([`SINGLE_PASS_STEREO`]), or one per frame with the other
+/// warped from it by its depth (AFW).
+pub const STEREO: Opt = stereo_method(&[StereoMethod::SameFrame.offer(), SINGLE_PASS_STEREO, StereoMethod::Afw.experimental(), STEREO_OFF], StereoMethod::SameFrame);
+
+/// Single pass ([`crate::single_pass`]): same-frame stereo with the engine's scene programs
+/// converted to draw both eyes at once. Everything else takes it as Standard (Same-frame); any other
+/// method leaves single pass off.
+pub const SINGLE_PASS_STEREO: Offer = ("single", "Single-pass (Same-frame)");
+
+/// Whether the run's stereo method is [`SINGLE_PASS_STEREO`].
+pub fn single_pass_on(options: &Options) -> bool {
+    options.text(STEREO.id).is_some_and(|method| method.trim().eq_ignore_ascii_case(SINGLE_PASS_STEREO.0))
+}
 
 /// FSR upscaling ([`EyeSettings::fsr`]): with frame warping, each eye drawn smaller and upscaled.
 pub const FSR: Opt = opt("fsr", "FSR upscaling", "Renders each eye smaller, then upscales it. Needs Dying Light 2's FidelityFX DLLs.", Kind::Switch { default: false })
@@ -50,14 +61,12 @@ pub const DLSS: Opt = opt(
     "NVIDIA DLSS (RTX GPUs): each eye renders smaller, then DLSS upscales it to the headset's resolution. DLAA keeps the full resolution and only smooths edges.",
     choice(&[("off", "Off"), ("dlaa", "DLAA"), ("quality", "Quality"), ("balanced", "Balanced"), ("performance", "Performance"), ("ultra_performance", "Ultra performance")], "quality"),
 )
-.on(Shown::Rendering)
-.only_when("stereo", "same");
+.on(Shown::Rendering);
 /// Contrast-adaptive sharpening after DLSS (as Killing Floor 2 VR's): DLSS's own sharpening is gone
 /// from its newer models.
 pub const DLSS_SHARPNESS: Opt =
     opt("dlss_sharpness", "DLSS sharpness", "Sharpens the upscaled image. 0 turns sharpening off.", Kind::Number { min: 0.0, max: 1.0, step: 0.05, default: 0.5 })
-        .on(Shown::Rendering)
-        .only_when("stereo", "same");
+        .on(Shown::Rendering);
 
 /// DLSS settings (`dlss`, `dlss_sharpness`, and `dlss_jitter_sign` on the command line only).
 #[derive(Clone, Copy, Debug, PartialEq)]
