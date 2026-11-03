@@ -177,6 +177,30 @@ pub fn hands_view(layout: &HandsLayout, hands: usize) -> Option<[f32; 12]> {
 static ONTO_ARMS: AtomicU64 = AtomicU64::new(0);
 static ONTO_ARMS_MOST: AtomicU32 = AtomicU32::new(0);
 
+/// The arms model drawn this far (units, 50 a metre) or more from the player's view is animated off
+/// it (a rope climb, a ledge shuffle), not a frame behind it while walking.
+const ANIMATED_OFF: f32 = 8.0;
+/// Items placed while the arms model was animated off the view.
+static ANIMATED: AtomicU64 = AtomicU64::new(0);
+
+/// `view` (origin, then axis rows) as a placement of unit scale.
+fn placement(view: [f32; 12]) -> Model {
+    Model { origin: [view[0], view[1], view[2]], axis: std::array::from_fn(|i| view[3 + i]), scale: [1.0; 3] }
+}
+
+/// While the arms model (`actual`, as the game draws it) is animated off the player's view: that
+/// view and the eyes' (the render view; the player's without one), both as placed. Held items and
+/// the hands then go on the controllers as the eyes see them: on a rope climb the arms swing off
+/// a camera that stays put, and following them took the gun off its controller.
+fn animated_off(layout: &HandsLayout, hands: usize, actual: &Model) -> Option<([f32; 12], [f32; 12])> {
+    let view = crate::providers::follow_head::as_placed(hands_view(layout, hands)?);
+    if length(sub(actual.origin, [view[0], view[1], view[2]])) < ANIMATED_OFF {
+        return None;
+    }
+    let eyes = crate::providers::eye_site::render_view().map(crate::providers::follow_head::as_placed).unwrap_or(view);
+    Some((view, eyes))
+}
+
 /// Where an item placed at `placed` (world origin and axis rows, from the player's view as the rig
 /// takes it) goes with the arms model where the game actually drew it this frame: the hands are
 /// posed in that model, so an item held stays in its hand when the model is drawn off the view (a
@@ -185,6 +209,15 @@ static ONTO_ARMS_MOST: AtomicU32 = AtomicU32::new(0);
 pub fn onto_arms_as_drawn(layout: &HandsLayout, hands: usize, placed: (Vec3, [f32; 9])) -> (Vec3, [f32; 9]) {
     let (Some(live), Some(view)) = (live(layout, hands), hands_view(layout, hands)) else { return placed };
     let Some(actual) = model(live.entity) else { return placed };
+    if let Some((view, eyes)) = animated_off(layout, hands, &actual) {
+        let (view, eyes) = (placement(view), placement(eyes));
+        let n = ANIMATED.fetch_add(1, Relaxed) + 1;
+        if log::seldom(n, 5) {
+            let off = length(sub(actual.origin, view.origin));
+            log!("arms: the arms model animated {off:.1} units off the view: the items and hands on the controllers as the eyes see them ({n} so far)");
+        }
+        return (eyes.to_world(view.to_model(placed.0)), eyes.rows_to_world(&view.rows_to_model(&placed.1)));
+    }
     let view = crate::providers::follow_head::as_placed(view);
     let assumed = Model { origin: [view[0], view[1], view[2]], axis: std::array::from_fn(|i| view[3 + i]), scale: actual.scale };
     let origin = actual.to_world(assumed.to_model(placed.0));
@@ -508,6 +541,15 @@ fn prepare(layout: &HandsLayout, hands: usize, live: &Live, pose: usize, targets
     if behind > 0.5 && STALE_LOGS.fetch_add(1, Relaxed) < 5 {
         log!("arms: the arms model's placement is {behind:.2} units from the player's view at the kick");
     }
+    // Animated off the view (a rope climb): the targets in the model where the game draws it, moved
+    // with the eyes, so the hands meet the controllers where the eyes see them.
+    let drawn = match animated_off(layout, hands, &m) {
+        Some((view, eyes)) => {
+            let (view, eyes) = (placement(view), placement(eyes));
+            Model { origin: view.to_world(eyes.to_model(m.origin)), axis: view.rows_to_world(&eyes.rows_to_model(&m.axis)), scale: m.scale }
+        }
+        None => drawn,
+    };
     let target = |(origin, axis): (Vec3, [f32; 9])| from_rotation(&rotation_from_rows(&drawn.rows_to_model(&axis), basis), drawn.to_model(origin));
     // The bones' space in tracking space, as the targets were placed: model to world, then world
     // to tracking.
