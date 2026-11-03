@@ -159,6 +159,8 @@ pub fn pad(pad: &mut Gamepad) {
     if let Some(out) = out {
         (pad.thumb_lx, pad.thumb_ly) = turned_stick(pad.thumb_lx, pad.thumb_ly, out);
     }
+    // Last, on the game camera's own heading: room-scale following's push.
+    crate::cooking::room_scale::pad(pad);
 }
 
 /// The body's heading of its own, in tracking space (radians, positive left, as the head's share).

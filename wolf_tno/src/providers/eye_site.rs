@@ -30,6 +30,7 @@ use eng_idt::MakeFrustumFn;
 use crate::{Facts, Wolf};
 use eng_idt::view::{Players, Saved};
 use monaka_body::look::{self, Share, command};
+use monaka_body::roomscale;
 use monaka_core::camera::{self, Base, EyeView, Frustum, HeadPosition, Mat34};
 use monaka_core::convention::CameraConvention;
 use monaka_core::feature::Feature;
@@ -536,6 +537,12 @@ fn turned_view(
     let placed = HeadPose { position, ..*pose };
     let shared_here = Shared { head_position: HeadPosition::Full, headset_fov, ..*shared };
     let base = Base::game_or_swap(baked.map(|share| [share.yaw, share.pitch]));
+    // Room-scale following: the eyes built on the game camera moved back by what the body walked
+    // for the head (never on a cutscene's or another camera, where the eyes are not the player's).
+    let camera = match roomscale::active() && !levels_camera() && !crate::providers::camera_taken::controlled() {
+        true => roomscale::follow_view(&camera, base, shared.head_position.position(pose)).unwrap_or(camera),
+        false => camera,
+    };
     let centre = EyeView::of(&camera, base, &placed, 0, &shared_here, false, own.fov.map(f32::to_radians))?.centre;
     let (origin, axis) = eng_idt::view::origin_axis(convention, &centre)?;
     let fov = if headset_fov {
@@ -672,6 +679,12 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
                 SIGHTED.fetch_add(1, Relaxed);
             }
             let cutscene = levels_camera();
+            if player == 0
+                && !cutscene
+                && let Some(game) = camera_of(&own.origin_axis, &convention)
+            {
+                crate::cooking::room_scale::step(&game);
+            }
             let position = eyes_position(&setup.shared, pose, sighted);
             let camera = eyes_camera(own);
             let turned = turned_view(&camera, pose, position, &setup.config, &setup.shared, &convention, setup.shared.headset_fov, baked).map(|mut turned| {

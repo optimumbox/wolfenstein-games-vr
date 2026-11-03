@@ -11,4 +11,5 @@ pub(crate) mod head;
 pub(crate) mod hud;
 pub(crate) mod journal;
 pub(crate) mod knife_throw;
+pub(crate) mod room_scale;
 pub(crate) mod sights;

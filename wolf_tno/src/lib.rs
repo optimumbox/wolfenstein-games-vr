@@ -99,6 +99,7 @@ impl Game for Wolf {
             &LOOK,
             &cooking::body_forward::MOVE_HEADING_COMPONENT,
             &GUNS,
+            &cooking::room_scale::ROOM_SCALE,
             &GUN,
             &HAND_RIG,
             &FINGERS,
