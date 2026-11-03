@@ -76,3 +76,11 @@ fn the_head_steers_by_default() {
     assert_eq!(share_out(&Options::parse("move_heading=body")), 1.0);
     assert_eq!(share_out(&Options::parse("move_heading=sideways")), 0.0, "unknown: the default");
 }
+
+#[test]
+fn a_menu_takes_the_stick_as_a_steady_step() {
+    assert_eq!(menu_step(0, -30000), (0, -32767), "down, full");
+    assert_eq!(menu_step(0, -29999), (0, -32767), "the dither's flip is the same step");
+    assert_eq!(menu_step(20000, 9000), (32767, 0), "its main axis alone");
+    assert_eq!(menu_step(9000, -9000), (0, 0), "under half: at rest");
+}

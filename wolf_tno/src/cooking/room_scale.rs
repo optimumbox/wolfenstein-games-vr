@@ -12,8 +12,13 @@
 //! the head alone.
 //!
 //! Waits while the player walks with the stick themselves, while the player's own camera is not the
-//! view (a cutscene, another camera), on a mounted gun, in the mech and while a menu or the weapon
-//! wheel holds the player.
+//! view (a cutscene, another camera), on a mounted gun, in the mech, while a menu or the weapon
+//! wheel holds the player, and while the view turns (a turn in place swings the eyes about the neck:
+//! not a step).
+//!
+//! The game walks only on a push past its own dead zone, and then at a walk, so following pushes
+//! only once the gap is a step's ([`START_SPEED`]) and keeps on until it has nearly closed
+//! ([`STOP_SPEED`]): small gaps pushed at once lurch the body instead of walking it.
 
 use crate::Wolf;
 use crate::providers::camera_taken;
@@ -40,7 +45,7 @@ impl Steps for Wolf {
 
     fn summary() -> String {
         let s = STEP.locked();
-        format!("room-scale pushes: {} steps pushing, {:.2} m walked by them", s.pushing, s.walked)
+        format!("room-scale pushes: {} steps pushing, {:.2} m walked by them, {} steps held while the view turned", s.pushing, s.walked, s.turns_held)
     }
 }
 
@@ -60,6 +65,14 @@ const PUSH_FRESH: Duration = Duration::from_millis(150);
 const JUMP: f32 = 0.5;
 /// How often a line on the pushes is logged while they walk (seconds).
 const LOG_EVERY: f32 = 10.0;
+/// Following starts pushing at this speed asked (m/s: a gap of about 12 cm at the default
+/// response) and stops under [`STOP_SPEED`] (about 4 cm).
+const START_SPEED: f32 = 0.75;
+const STOP_SPEED: f32 = 0.1;
+/// The view turning faster than this (radians a second) is a turn, not a step: following waits
+/// until [`TURN_SETTLE`] after it slows.
+const TURNING: f32 = 60.0 * std::f32::consts::PI / 180.0;
+const TURN_SETTLE: Duration = Duration::from_millis(250);
 
 struct Step {
     /// The body's place (the game camera's, metres) at the last view build, and when.
@@ -74,6 +87,12 @@ struct Step {
     walked_sum: f32,
     samples: u32,
     logged: Option<Instant>,
+    /// The camera's heading at the last view build (radians), when it last turned fast, and
+    /// whether a push is under way (between [`START_SPEED`] and [`STOP_SPEED`]).
+    heading: Option<f32>,
+    turned: Option<Instant>,
+    following: bool,
+    turns_held: u64,
 }
 
 static STEP: Mutex<Step> = Mutex::new(Step {
@@ -86,6 +105,10 @@ static STEP: Mutex<Step> = Mutex::new(Step {
     walked_sum: 0.0,
     samples: 0,
     logged: None,
+    heading: None,
+    turned: None,
+    following: false,
+    turns_held: 0,
 });
 
 /// When the player last pushed the left stick themselves (`monaka_channel::tick`).
@@ -115,8 +138,22 @@ pub fn step(camera: &Mat34) {
     }
     let now = Instant::now();
     let body = [camera[3], camera[7], camera[11]];
-    let waiting = waiting();
+    let mut waiting = waiting();
     let mut s = STEP.locked();
+    // A turn of the view (the head turning the body, the stick): the eyes swing about the neck.
+    let heading = camera[2].atan2(camera[10]);
+    if let (Some(last), Some((_, at))) = (s.heading, s.body) {
+        let dt = now.duration_since(at).as_secs_f32();
+        let turn = (heading - last + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+        if dt > 0.0 && turn.abs() / dt > TURNING {
+            s.turned = Some(now);
+        }
+    }
+    s.heading = Some(heading);
+    if waiting.is_none() && s.turned.is_some_and(|at| now.duration_since(at) < TURN_SETTLE) {
+        waiting = Some(Wait::Animated);
+        s.turns_held += 1;
+    }
     if let Some((before, at)) = s.body {
         let moved = [body[0] - before[0], 0.0, body[2] - before[2]];
         let distance = moved[0].hypot(moved[2]);
@@ -133,7 +170,12 @@ pub fn step(camera: &Mat34) {
     }
     s.body = Some((body, now));
     let follow = roomscale::follow(waiting);
-    let push = push_for(follow, camera);
+    let speed = follow[0].hypot(follow[1]);
+    s.following = match s.following {
+        true => speed >= STOP_SPEED,
+        false => speed >= START_SPEED,
+    };
+    let push = if s.following { push_for(follow, camera) } else { [0.0; 2] };
     if push != [0.0; 2] {
         s.pushed = Some(now);
         s.pushing += 1;

@@ -288,7 +288,8 @@ fn pace() {
     let now = now_ns();
     let fresh = timing.filter(|t| now.saturating_sub(t.woke_ns) < STALE_NS && t.period_ns > 0).map(steady);
     let refreshes = fresh.zip(rate.read()).and_then(|(t, hz)| refreshes_per_frame(t.period_ns, hz));
-    let (Some(timing), Some(refreshes)) = (fresh, refreshes) else {
+    // A menu runs on the engine's own clock: held to the headset's grid, it answers seconds late.
+    let (Some(timing), Some(refreshes), false) = (fresh, refreshes, crate::providers::eye_site::in_menu()) else {
         set_pacing(false);
         return;
     };

@@ -136,6 +136,10 @@ pub fn take_snapped() -> f32 {
 /// while it would only zoom (`cooking::sights`), and Y held opening the journal
 /// (`cooking::journal`).
 pub fn pad(pad: &mut Gamepad) {
+    if crate::providers::eye_site::in_menu() {
+        menu_stick(pad);
+        return;
+    }
     crate::cooking::sights::no_zoom(pad);
     crate::cooking::journal::pad(pad);
     // The knife's throw reads the trigger before the swings let go of it.
@@ -161,6 +165,36 @@ pub fn pad(pad: &mut Gamepad) {
     }
     // Last, on the game camera's own heading: room-scale following's push.
     crate::cooking::room_scale::pad(pad);
+}
+
+/// A stick past this share of its range is a menu step; under it, at rest.
+const MENU_STEP: f32 = 0.5;
+
+/// In a menu: the left stick as a steady step along its main axis, full or centred. The VR stick's
+/// own noise and the pad's dither change the state every few reads, and the menu takes a changing
+/// stick as a push that has not settled, stepping seconds late.
+fn menu_stick(pad: &mut Gamepad) {
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    static LAST: Mutex<(i16, i16)> = Mutex::new((0, 0));
+    let step = menu_step(pad.thumb_lx, pad.thumb_ly);
+    (pad.thumb_lx, pad.thumb_ly) = step;
+    let mut last = LAST.locked();
+    if *last != step {
+        if LOGGED.fetch_add(1, Relaxed) < 200 {
+            monaka_producer::log!("menu stick: {:?} -> {:?} handed to the game", *last, step);
+        }
+        *last = step;
+    }
+}
+
+/// The step a left stick at `x`, `y` is in a menu: its main axis at full, past [`MENU_STEP`].
+pub fn menu_step(x: i16, y: i16) -> (i16, i16) {
+    let (fx, fy) = (f32::from(x) / 32767.0, f32::from(y) / 32767.0);
+    if fx.hypot(fy) < MENU_STEP {
+        return (0, 0);
+    }
+    let full = |v: f32| if v < 0.0 { -32767 } else { 32767 };
+    if fx.abs() > fy.abs() { (full(fx), 0) } else { (0, full(fy)) }
 }
 
 /// The body's heading of its own, in tracking space (radians, positive left, as the head's share).

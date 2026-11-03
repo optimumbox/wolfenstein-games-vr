@@ -926,6 +926,11 @@ pub fn drawn_side_by_side() -> bool {
     drawn
 }
 
+/// Whether a menu is up (frame warping's side-by-side layout for it is in).
+pub fn in_menu() -> bool {
+    MENU_LAYOUT.load(Relaxed)
+}
+
 /// The engine's side-by-side layout (`menu`) or the one-eye layout of frame warping, switched only
 /// from the other of the two (not after the stop put the game's own back).
 fn menu_layout(menu: bool) {
