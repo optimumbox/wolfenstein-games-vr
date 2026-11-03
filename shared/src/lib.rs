@@ -56,6 +56,32 @@ impl Cvar {
         Self::new(name_pointer, name, Layout::ID_TECH_6)
     }
 
+    /// A cvar of `exe` its build's table does not list, found by `name` as the engine holds it
+    /// now (its name pointers are written at start-up, so it is looked for in the running image,
+    /// never the file): the pointer to the name string in the image's data whose values before it
+    /// agree (the integer the float's whole part, as the engine keeps both). A scan of the image's
+    /// data, once a run.
+    pub fn find(exe: &Module, name: &'static str, layout: Layout) -> Option<&'static Cvar> {
+        let code = exe.kept_code()?;
+        let data = || code.sections().iter().filter(|s| !s.executable);
+        let needle = [&[0u8][..], name.as_bytes(), &[0]].concat();
+        let string = data().find_map(|s| s.bytes.windows(needle.len()).position(|w| w == needle).map(|at| s.rva as usize + at + 1))?;
+        let target = (exe.base() + string) as u64;
+        let mut found = data().flat_map(|s| {
+            let rva = s.rva as usize;
+            s.bytes.as_chunks::<8>().0.iter().enumerate().filter(move |(_, b)| u64::from_le_bytes(**b) == target).map(move |(i, _)| rva + i * 8)
+        });
+        let cvar = found.find_map(|at| {
+            let cvar = Cvar::new(at, name, layout);
+            cvar.int(exe).zip(cvar.float(exe)).is_some_and(|(i, f)| f.is_finite() && f as i32 == i).then_some(cvar)
+        });
+        match cvar {
+            Some(cvar) => log!("{name}: found at {:#x}", cvar.name_pointer),
+            None => log!("{name}: not found in the running game"),
+        }
+        Some(Box::leak(Box::new(cvar?)))
+    }
+
     /// Whether this build has the cvar where expected (the name pointer names it).
     pub fn present(&self, exe: &Module) -> bool {
         mem::read::<usize>(exe.at(self.name_pointer)).and_then(|p| mem::read_c_string(p, 64)).is_some_and(|n| n == self.name)

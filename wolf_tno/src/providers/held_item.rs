@@ -24,6 +24,7 @@ use crate::{Facts, Wolf};
 use monaka_body::held::{HeldItems, InWorld, Kind, Line, NoModel, WorldLine};
 use monaka_core::camera::{Mat34, all_finite, apply3, compose, from_rotation, mul3, position, rotation_part, transpose3};
 use monaka_core::math::{Vec3, cross, dot, length, midpoint, scale, sub, unit};
+use monaka_contract::manifest;
 use monaka_contract::protocol::{HandPose, HeadPose, LEFT_HAND, RIGHT_HAND};
 use monaka_core::sync::Locked;
 use monaka_hook::{InFlight, Original, mem};
@@ -172,7 +173,8 @@ pub fn install_guns(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
     monaka_body::controllers::open(start.channel()?);
     // With the guns in the controllers' hands, the arms follow them (`arms=0`: as animated).
     let rig = start.shared.aim.rig && arms(start.options);
-    install(&facts.layout, crate::eyes(start).units_per_metre, crate::research::options().guns, rig, rig && start.shared.fingers.tracking);
+    let hide_free_hand = rig && start.options.switch(HIDE_FREE_HAND.id, false);
+    install(&facts.layout, crate::eyes(start).units_per_metre, crate::research::options().guns, rig, rig && start.shared.fingers.tracking, hide_free_hand);
     start.hooks.site(&PLACE_ORIGINAL, &exe, &facts.place_item, place_item)?;
     start.hooks.site(&TAG_ORIGINAL, &exe, &facts.tag_transform, tag_transform)?;
     crate::extras::laser::install(start.hooks, &exe, facts)?;
@@ -188,7 +190,16 @@ pub struct Setup {
     pub arms: bool,
     /// A free hand's fingers follow tracking.
     pub fingers: bool,
+    /// The left arm hidden while its hand holds nothing ([`HIDE_FREE_HAND`]).
+    pub hide_free_hand: bool,
 }
+
+/// The left arm out of sight while its hand holds nothing (the right holding a one-handed weapon:
+/// the knife, a pipe, a grenade); a rifle's front hand and a second gun stay.
+pub const HIDE_FREE_HAND: manifest::Opt =
+    manifest::opt("hide_free_hand", "Hide free hand", "Hides your left hand when it holds nothing.", manifest::Kind::Switch { default: false })
+        .on(manifest::Shown::Skeleton)
+        .only_when("aim", "hand_rig");
 
 static SETUP: OnceLock<Setup> = OnceLock::new();
 
@@ -231,8 +242,8 @@ static PLACEMENTS: AtomicU64 = AtomicU64::new(0);
 static MOVED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 static UNTRACKED: AtomicU64 = AtomicU64::new(0);
 
-fn install(layout: &'static HandsLayout, units_per_metre: f32, synthetic: bool, arms: bool, fingers: bool) {
-    let _ = SETUP.set(Setup { layout, units_per_metre, synthetic, arms, fingers });
+fn install(layout: &'static HandsLayout, units_per_metre: f32, synthetic: bool, arms: bool, fingers: bool, hide_free_hand: bool) {
+    let _ = SETUP.set(Setup { layout, units_per_metre, synthetic, arms, fingers, hide_free_hand });
     if synthetic {
         log!("guns: synthetic controllers (probe_guns)");
     }

@@ -337,6 +337,40 @@ fn wrist_joints(header: usize, parents: &[i32]) -> Option<[usize; 3]> {
     Some(joints)
 }
 
+/// The left arm's joints, the shoulder first (everything under the left attach joint: the hand,
+/// the fingers, the forearm, the elbow), by skeleton header.
+static LEFT_ARM: Mutex<Option<(usize, Arc<Vec<usize>>)>> = Mutex::new(None);
+/// The scale a hidden arm's joints get: every vertex they carry drawn at the shoulder.
+const HIDDEN_SCALE: f32 = 1e-3;
+
+/// The left arm's joints of the skeleton `header` with `parents`, the shoulder first.
+fn left_arm(header: usize, parents: &[i32]) -> Option<Arc<Vec<usize>>> {
+    let mut kept = LEFT_ARM.locked();
+    if let Some((h, joints)) = kept.as_ref()
+        && *h == header
+    {
+        return Some(joints.clone());
+    }
+    let right = (*RIGHT_ROOT.locked())?;
+    let hands_root = *parents.get(right)?;
+    let left = (0..parents.len()).find(|&j| j != right && parents[j] == hands_root)?;
+    let arm = find_arm(parents, left)?;
+    let joints: Arc<Vec<usize>> = Arc::new(std::iter::once(arm.shoulder).chain(arm.subtree.into_iter().filter(|&j| j != arm.shoulder)).collect());
+    *kept = Some((header, joints.clone()));
+    Some(joints)
+}
+
+/// The arm `joints` (the shoulder first) shrunk to a point at the shoulder: out of sight, its
+/// bounds no wider.
+fn hide(skeleton: &JobPose<'_>, joints: &[usize]) {
+    let Some(shoulder) = joints.first().and_then(|&s| skeleton.world(s as i32)) else { return };
+    let s = HIDDEN_SCALE;
+    let point: Mat34 = [s, 0.0, 0.0, shoulder[3], 0.0, s, 0.0, shoulder[7], 0.0, 0.0, s, shoulder[11]];
+    for &joint in joints {
+        skeleton.set_world(joint as i32, &point);
+    }
+}
+
 /// In the blend job, before the rig moves anything: the game's own wrists in `pose` (the hands'
 /// joint array of the skeleton `header` with `parents`) kept for [`carried_wrists`].
 fn note_game_wrists(header: usize, pose: usize, parents: &[i32]) {
@@ -393,6 +427,8 @@ struct Frame {
     header: usize,
     parents: Arc<Vec<i32>>,
     inputs: Inputs,
+    /// The left arm hidden: its hand holds nothing and the player hides it.
+    hide_left: bool,
 }
 
 /// The frames prepared for blend jobs that have not reached their bounds yet, oldest first. A job
@@ -438,16 +474,19 @@ fn publish(frames: &[Frame]) {
 /// (`targets` by side: the world origin and axis rows each hand's gun gets; the left one only while
 /// it follows its controller; `tracking`: the headset's tracking space in the world (canonical) the
 /// targets were placed from, in an engine of `units_per_metre`; `dual` with a gun in each hand;
-/// `fingers`: a free hand's fingers follow tracking). The job puts them there ([`job_pose`]); they
-/// are drawn with the next frame.
-pub fn kick(layout: &HandsLayout, hands: usize, targets: [Option<(Vec3, [f32; 9])>; 2], tracking: Option<Mat34>, units_per_metre: f32, dual: bool, fingers: bool) {
+/// `fingers`: a free hand's fingers follow tracking; `hide_free`: a free left hand is hidden). The
+/// job puts them there ([`job_pose`]); they are drawn with the next frame.
+#[allow(clippy::too_many_arguments)]
+pub fn kick(layout: &HandsLayout, hands: usize, targets: [Option<(Vec3, [f32; 9])>; 2], tracking: Option<Mat34>, units_per_metre: f32, dual: bool, fingers: bool, hide_free: bool) {
     KICKS.fetch_add(1, Relaxed);
     // The left hand beside a one-handed weapon holds nothing; otherwise it holds a gun, its own
     // or the right one's. The right hand holds its gun or melee weapon.
-    *HELD.locked() = [if targets[LEFT_HAND].is_some() && !dual { Kind::Nothing } else { Kind::Gun }, held_item::right_kind(layout, hands)];
+    let free = targets[LEFT_HAND].is_some() && !dual;
+    *HELD.locked() = [if free { Kind::Nothing } else { Kind::Gun }, held_item::right_kind(layout, hands)];
     let Some(live) = live(layout, hands) else { return };
     let Some(pose) = mem::read::<usize>(live.animator + layout.back_joints).filter(|&p| p != 0) else { return };
-    set_frame(pose, prepare(layout, hands, &live, pose, targets, tracking, units_per_metre, fingers));
+    let frame = prepare(layout, hands, &live, pose, targets, tracking, units_per_metre, fingers).map(|frame| Frame { hide_left: free && hide_free, ..frame });
+    set_frame(pose, frame);
 }
 
 // The kick's facts passed on as they are.
@@ -474,7 +513,7 @@ fn prepare(layout: &HandsLayout, hands: usize, live: &Live, pose: usize, targets
     // to tracking.
     let space = compose(&rigid_inverse(&tracking?), &drawn.to_canonical(units_per_metre)?);
     let inputs = hand_rig::capture::<crate::Wolf>(Moment { hands: Hands::Attached { right: right_root, targets: targets.map(|t| t.map(target)), space }, fingers });
-    Some(Frame { pose, header: live.header, parents, inputs })
+    Some(Frame { pose, header: live.header, parents, inputs, hide_left: false })
 }
 
 static EDITED: AtomicU64 = AtomicU64::new(0);
@@ -547,6 +586,11 @@ pub fn job_pose(pose: usize) {
     match hand_rig::pose::<crate::Wolf>(&skeleton, &animated, &frame.inputs) {
         Ok(_) => {
             EDITED.fetch_add(1, Relaxed);
+            if frame.hide_left
+                && let Some(arm) = left_arm(frame.header, &frame.parents)
+            {
+                hide(&skeleton, &arm);
+            }
         }
         Err(why) => {
             if REFUSED.fetch_add(1, Relaxed) < 5 {
@@ -580,7 +624,7 @@ pub unsafe extern "system" fn arms_kick(hands: usize) {
         let target = |side| tracking.as_ref().and_then(|t| held_item::item_at(setup, t, hands, side));
         let left = if dual || free { target(LEFT_HAND) } else { None };
         let right = target(RIGHT_HAND);
-        kick(setup.layout, hands, [left, right], tracking.map(|(space, _)| space), setup.units_per_metre(), dual, setup.fingers);
+        kick(setup.layout, hands, [left, right], tracking.map(|(space, _)| space), setup.units_per_metre(), dual, setup.fingers, setup.hide_free_hand);
     }
     // SAFETY: forwards the game's own call.
     unsafe { KICK_ORIGINAL.get(&flight)(hands) }

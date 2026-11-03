@@ -11,9 +11,10 @@ This is a game pack for [Monaka VR](https://github.com/Mamfro/monaka_vr), which 
 > **Alpha.** Expect bugs and missing pieces. Until Monaka's API settles, things change often,
 > and a pack made for an older Monaka may stop working with a newer one.
 >
-> **Before you play,** start the game from Steam first. God rays, lens flares, dim shadows and
-> screen-space reflections are switched off while VR runs (the game only gets them right in one
-> eye).
+> **To play,** press Play in Monaka VR: it starts the game itself (or joins it if it is already
+> running). Starting the game from Steam while SteamVR runs puts it on SteamVR's flat Theater
+> screen instead. God rays, lens flares, dim shadows and screen-space reflections are switched off
+> while VR runs (the game only gets them right in one eye).
 
 ## Games
 
@@ -61,8 +62,9 @@ ADS has been removed, since you can actually do it with your own hands.
 
 ## Known bugs
 
-* The beginning of Chapter 14 is slightly bugged and BJ is not able to get off of the floor. Exiting and re-entering VR fixes it.
+* The beginning of Chapter 14 is slightly bugged and BJ is not able to get off of the floor. Exiting and re-entering VR fixes it. I have not been able to track down a fix for this yet since, well, in order to debug the issue I need to exit VR, which fixes it.
 * Grenades are not physically throwable yet, they simply are throwable with the right trigger when equipped. I need to make them work the same as knives.
+* Blood textures and bullet hole textures may differ per eye in rare situations
 
 ## For developers
 

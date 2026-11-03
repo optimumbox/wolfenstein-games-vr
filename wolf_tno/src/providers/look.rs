@@ -37,7 +37,9 @@ impl Looks for Wolf {
         start.hooks.site(&USERCMD_BUILDER_ORIGINAL, &exe, &build.usercmd_builder, usercmd_builder)?;
         start.hooks.site(&camera_taken::VIEW_CAMERA_ORIGINAL, &exe, &build.view_camera, camera_taken::view_camera)?;
         crate::providers::focus::install(start.hooks, &exe, build)?;
-        // The run goes halfway between where the head looks and where the body faces.
+        // The run goes halfway between where the head looks and where the body faces (or the
+        // body turns with the player).
+        crate::cooking::body_forward::configure(start.options, start.manifest);
         monaka_pad::rewrite(Some(crate::cooking::body_forward::pad));
         Ok(())
     }
@@ -73,7 +75,12 @@ pub unsafe extern "system" fn usercmd_builder(generator: usize, out: usize, play
     COMMANDS.fetch_add(1, Relaxed);
     COMMAND_THREAD.store(monaka_hook::thread_id(), Relaxed);
     if let Some(&scale) = SCALE.get() {
-        engine::COMMANDS.rewrite(generator, out, player as u32 as usize, scale, command::built);
+        // A snap turn goes in as the player's own turn (yaw positive left), under the head's share.
+        let snapped = crate::cooking::body_forward::take_snapped();
+        engine::COMMANDS.rewrite(generator, out, player as u32 as usize, scale, |pitch, yaw| {
+            let yaw = yaw - snapped;
+            command::built(pitch, yaw).or((snapped != 0.0).then_some((pitch, yaw)))
+        });
     }
     result
 }

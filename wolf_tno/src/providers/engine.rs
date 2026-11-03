@@ -11,6 +11,21 @@ use monaka_hook::{Instruction, Site, mem};
 /// A screen layout's first view record (rva) and the name its header carries.
 pub type Layout = (usize, &'static str);
 
+/// The window the game renders into: the cvars `vid_restart` sizes it from, and the command
+/// system that runs it. Windowed (`r_fullscreen` 0), the engine renders at `r_windowWidth` x
+/// `r_windowHeight` (their integer values, read directly) and clamps the window itself to its
+/// monitor; full screen, at the monitor's or the mode's size.
+pub struct Window {
+    pub fullscreen: Cvar,
+    pub width: Cvar,
+    pub height: Cvar,
+    /// The pointer to the command system (`idCmdSystem*`), and its vtable (rva): its method at
+    /// [`QUEUE_COMMAND`] `(this, text)` queues text for the main loop to run between frames, as
+    /// typed at the console.
+    pub commands: usize,
+    pub commands_vtable: usize,
+}
+
 /// One game build: where its engine keeps what the producer uses.
 pub struct Build {
     pub game: &'static str,
@@ -37,6 +52,9 @@ pub struct Build {
     /// still; the player moves and looks around it).
     pub stop_time: Cvar,
     pub pause_on_alt_tab: Cvar,
+    /// The game's window size and the command that applies it (`crate::providers::window_size`);
+    /// none where not mapped.
+    pub window: Option<Window>,
     /// The camera's horizontal field of view at rest (default 80). Aiming down sights narrows the
     /// render view's below it (The Old Blood: 80 to 65 over 7 frames).
     pub fov: Cvar,
@@ -522,6 +540,13 @@ pub static ROWS: [Build; 2] = unsafe { [
         stereo_screen_separation: Cvar::id5(0x1ccd840, "stereoRender_screenSeparation"),
         stereo_gui_offset: Cvar::id5(0x1ccd8c0, "stereoRender_guiOffset"),
         pause_on_alt_tab: Cvar::id5(0x1d70e50, "win_pauseOnAltTab"),
+        window: Some(Window {
+            fullscreen: Cvar::id5(0x1d1f240, "r_fullscreen"),
+            width: Cvar::id5(0x1d1f3c0, "r_windowWidth"),
+            height: Cvar::id5(0x1d1f440, "r_windowHeight"),
+            commands: 0x15ba108,
+            commands_vtable: 0x104fa68,
+        }),
         stop_time: Cvar::id5(0x1da3000, "g_stopTime"),
         fov: Cvar::id5(0x1da5a00, "g_fov"),
         god_rays_off: (Cvar::id5(0x1d16820, "r_skipGodRays"), 1),
@@ -732,6 +757,7 @@ pub static ROWS: [Build; 2] = unsafe { [
         stereo_screen_separation: Cvar::id5(0x1ed2ca0, "stereoRender_screenSeparation"),
         stereo_gui_offset: Cvar::id5(0x1ed2d20, "stereoRender_guiOffset"),
         pause_on_alt_tab: Cvar::id5(0x1f82d50, "win_pauseOnAltTab"),
+        window: None,
         stop_time: Cvar::id5(0x1fa8be0, "g_stopTime"),
         fov: Cvar::id5(0x1fab6e0, "g_fov"),
         // No r_skipGodRays in this build; quality 0 is what the engine stores when god rays are

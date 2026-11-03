@@ -9,7 +9,7 @@
 //! while it is on ([`freeze_frame`]): the world stands still, the player's view goes on. The ledger
 //! puts it back when VR stops.
 
-use crate::providers::engine::GameRateFn;
+use crate::providers::engine::{self, GameRateFn};
 use crate::{Facts, Wolf};
 use eng_idt::Cvar;
 use monaka_contract::debug_draw::Category;
@@ -17,18 +17,24 @@ use monaka_hook::module::Module;
 use monaka_producer::log;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering::*};
-use monaka_contract::manifest::DISABLE_VIEW_BOBBING;
+use monaka_contract::manifest::{DISABLE_VIEW_BOBBING, Kind, Opt, Shown, opt};
 use monaka_hook::mem;
 use monaka_producer::game::{Component, Lack, Start};
 use monaka_producer::ledger::Setting;
 
+/// The view's shake (explosions, hits, the ground trembling) off (`view_allowCameraShake` 0), as
+/// [`DISABLE_VIEW_BOBBING`] takes the bob.
+pub const DISABLE_SCREEN_SHAKE: Opt = opt("disable_screen_shake", "Disable screen shake", "", Kind::Switch { default: false }).on(Shown::Game);
+
 /// What the game needs set while VR runs: it keeps playing without focus (the viewer, SteamVR or a
-/// PC check have it), and its view bob goes (Monaka's own setting).
+/// PC check have it), its view bob goes (Monaka's own setting), and its screen shake when the
+/// player says ([`DISABLE_SCREEN_SHAKE`]).
 pub const SETTINGS: Component<Wolf> = Component {
     name: "settings",
-    options: &[DISABLE_VIEW_BOBBING],
+    options: &[DISABLE_VIEW_BOBBING, DISABLE_SCREEN_SHAKE],
     settings: |options, manifest| {
         no_view_bob(options, manifest);
+        options.switch(DISABLE_SCREEN_SHAKE.id, false);
     },
     install: install_settings,
     ..Component::NONE
@@ -46,6 +52,9 @@ fn install_settings(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
     if no_view_bob(start.options, start.manifest) {
         eng_idt::set_int(start.ledger, &exe, &build.no_bob, 1, "the view bobs with the character's steps");
     }
+    if start.options.switch(DISABLE_SCREEN_SHAKE.id, false) {
+        no_screen_shake(start.ledger, &exe, build);
+    }
     crate::research::cvars::apply(start.ledger, &exe);
     // Kept at 0 by the ledger (what it holds at the stop goes back), so the world never stays
     // frozen after VR.
@@ -54,6 +63,37 @@ fn install_settings(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
         monaka_producer::debug::offer(Category::FreezeWorld);
     }
     Ok(())
+}
+
+/// What shakes the view, each set to 0 while the screen shake is off: the camera shakes
+/// (explosions, hits) and the weapons' kick as they fire (switched off, and its amplitudes);
+/// whether each is a float.
+const SHAKES: &[(&str, bool)] = &[
+    ("view_allowCameraShake", false),
+    ("g_weaponkick", false),
+    ("g_kickAmplitude", true),
+    ("view_kickAmplitude_min", true),
+    ("view_kickAmplitude_max", true),
+];
+
+/// The screen shake off ([`SHAKES`]): cvars no build's table lists, found in the running game
+/// ([`eng_idt::Cvar::find`]; the lookup checked once against `pm_noBob`, which the table does
+/// list). One the game does not have is left out.
+fn no_screen_shake(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module, build: &engine::Build) {
+    if let Some(bob) = Cvar::find(exe, build.no_bob.name, eng_idt::Layout::ID_TECH_5)
+        && bob.name_pointer != build.no_bob.name_pointer
+    {
+        log!("cvar lookup: {} found at {:#x}, the table has {:#x}; the screen shake stays", bob.name, bob.name_pointer, build.no_bob.name_pointer);
+        return;
+    }
+    for &(name, float) in SHAKES {
+        let Some(cvar) = Cvar::find(exe, name, eng_idt::Layout::ID_TECH_5) else { continue };
+        if float {
+            eng_idt::set_float(ledger, exe, cvar, 0.0, "the view shakes");
+        } else {
+            eng_idt::set_int(ledger, exe, cvar, 0, "the view shakes");
+        }
+    }
 }
 
 /// The executable and `g_stopTime`, once the ledger holds it.

@@ -63,7 +63,8 @@ use monaka_body::finger_rig::ChainSource;
 use monaka_body::hand_rig::{self, Climbing, HandRig, Holds, Method, Rig};
 use monaka_body::held::Kind;
 use monaka_core::feature::Feature;
-use monaka_contract::manifest::{AIM_MOTION, AIM_MOUSE, Manifest, aim, aims};
+use monaka_contract::manifest::{AIM_MOTION, AIM_MOUSE, Manifest, TURN, aim, aims};
+use monaka_core::pad::StickTurn;
 use monaka_core::options::Options;
 use monaka_core::situation::Situation;
 use monaka_hook::module::Module;
@@ -119,6 +120,11 @@ impl Game for Wolf {
     fn prepare(_: &'static Session, _: &'static Manifest, options: &Options) -> Result<Facts, Rejection> {
         let host = monaka_hook::module::host_name();
         let (build, exe) = engine::BUILDS.pick(|b| b.exe.eq_ignore_ascii_case(&host), &host)?;
+        // Joined as it starts, nothing is touched before the engine has a screen layout (its
+        // renderer up, its settings read): the launcher asks again.
+        if engine::current_layout(&exe, build, &[build.layout_single, build.layout_left_right]).is_none() {
+            return Err(Rejection::not_ready("the engine is not up yet (or is in another layout)"));
+        }
         log!("{}", build.game);
         research::PROBES.configure(options);
         research::view::PLAYER_FIELDS.store(research::options().player && build.exe == "WolfOldBlood_x64.exe", Ordering::Relaxed);
@@ -175,7 +181,12 @@ pub const SINGLE_PASS: Component<Wolf> = Component {
 /// mouse and stick, handed back at the stop. Stands down while another camera has the view (a
 /// cutscene, a takedown), which it reports.
 pub const LOOK: Component<Wolf> = Component {
-    options: &[aim(&[AIM_MOTION, ("head", "Look-based"), AIM_MOUSE], aims::HAND_RIG)],
+    options: &[aim(&[AIM_MOTION, ("head", "Look-based"), AIM_MOUSE], aims::HAND_RIG), cooking::body_forward::BODY_TURN, TURN],
+    settings: |options, manifest| {
+        options.switch("pause_hold", true);
+        options.switch(cooking::body_forward::BODY_TURN.id, true);
+        StickTurn::from_options(options, manifest, StickTurn::smooth(0.0), StickTurn::SNAP);
+    },
     summary: Some(|| format!("{}\n{}\n{}", monaka_body::look::command::summary(), providers::camera_taken::summary(), providers::focus::summary())),
     ..monaka_body::look::look()
 };
@@ -189,6 +200,10 @@ pub const LOOK: Component<Wolf> = Component {
 pub const GUNS: Component<Wolf> = Component {
     name: "guns",
     features: &[Feature::HandRig],
+    options: &[held_item::HIDE_FREE_HAND],
+    settings: |options, _| {
+        options.switch(held_item::HIDE_FREE_HAND.id, false);
+    },
     needs: &[Need::On(&eye_site::EYES)],
     needs_channel: true,
     on: |run| On::when(run.shared.head_tracking && run.shared.aim.hand, "aim is not motion controls"),
