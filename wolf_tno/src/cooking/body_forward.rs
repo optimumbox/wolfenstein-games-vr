@@ -42,7 +42,8 @@ pub const MOVE_HEADING: Opt = opt(
     "Head: forward is where you look, so physical turns steer. Body: only the right stick turns.",
     choice(&[("head", "Head"), ("halfway", "Halfway"), ("body", "Body")], "head"),
 )
-.on(Shown::Controls);
+.on(Shown::Controls)
+.turns_off("head", BODY_TURN.id, "Movement follows your head already; room-scale movement is its own setting.");
 
 /// The run's heading as `move_heading` asks, read as the run starts.
 pub const MOVE_HEADING_COMPONENT: Component<Wolf> = Component {
@@ -167,8 +168,10 @@ pub fn pad(pad: &mut Gamepad) {
     crate::cooking::room_scale::pad(pad);
 }
 
-/// A stick past this share of its range is a menu step; under it, at rest.
-const MENU_STEP: f32 = 0.5;
+/// A stick past this share of its range is a menu step, held until it is back under
+/// [`MENU_REST`] (a light push steps as on a pad; the stick's noise at the edge does not).
+const MENU_STEP: f32 = 0.35;
+const MENU_REST: f32 = 0.2;
 
 /// In a menu: the left stick as a steady step along its main axis, full or centred. The VR stick's
 /// own noise and the pad's dither change the state every few reads, and the menu takes a changing
@@ -176,9 +179,9 @@ const MENU_STEP: f32 = 0.5;
 fn menu_stick(pad: &mut Gamepad) {
     static LOGGED: AtomicU32 = AtomicU32::new(0);
     static LAST: Mutex<(i16, i16)> = Mutex::new((0, 0));
-    let step = menu_step(pad.thumb_lx, pad.thumb_ly);
-    (pad.thumb_lx, pad.thumb_ly) = step;
     let mut last = LAST.locked();
+    let step = menu_step(pad.thumb_lx, pad.thumb_ly, *last != (0, 0));
+    (pad.thumb_lx, pad.thumb_ly) = step;
     if *last != step {
         if LOGGED.fetch_add(1, Relaxed) < 200 {
             monaka_producer::log!("menu stick: {:?} -> {:?} handed to the game", *last, step);
@@ -187,10 +190,11 @@ fn menu_stick(pad: &mut Gamepad) {
     }
 }
 
-/// The step a left stick at `x`, `y` is in a menu: its main axis at full, past [`MENU_STEP`].
-pub fn menu_step(x: i16, y: i16) -> (i16, i16) {
+/// The step a left stick at `x`, `y` is in a menu: its main axis at full, past [`MENU_STEP`]
+/// (past [`MENU_REST`] while a step is `held`).
+pub fn menu_step(x: i16, y: i16, held: bool) -> (i16, i16) {
     let (fx, fy) = (f32::from(x) / 32767.0, f32::from(y) / 32767.0);
-    if fx.hypot(fy) < MENU_STEP {
+    if fx.hypot(fy) < if held { MENU_REST } else { MENU_STEP } {
         return (0, 0);
     }
     let full = |v: f32| if v < 0.0 { -32767 } else { 32767 };
