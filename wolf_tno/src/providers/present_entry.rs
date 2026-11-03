@@ -109,9 +109,9 @@ fn warp(start: &Start<'_, Wolf>) -> Option<GlWarp> {
         rules: Rules::WHOLE.every(eye_site::REFRESH).fill_first(false).held_reach(HELD_REACH_CM),
         // Command line only: `afw_sources=1` shows where each warped pixel came from.
         sources: start.options.text("afw_sources").and_then(|t| t.trim().parse().ok()).unwrap_or(0),
-        // Command line only: `afw_snapshots=N` writes N warped pairs beside the log (6 while the
-        // warp's faults around the hands are looked into).
-        snapshots: start.options.text("afw_snapshots").and_then(|t| t.trim().parse().ok()).unwrap_or(6),
+        // Command line only: `afw_snapshots=N` writes N warped pairs beside the log, and the warp's
+        // inputs once (0 by default: each stalls the GPU to read the images back).
+        snapshots: start.options.text("afw_snapshots").and_then(|t| t.trim().parse().ok()).unwrap_or(0),
     })
 }
 
