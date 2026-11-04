@@ -6,8 +6,10 @@
 //! mode's size: the eyes stay the game's own then. The window's style and place go back at the
 //! stop.
 //!
-//! With DLSS ([`arm_dlss`]) the window is made the render size instead: each eye drawn smaller,
-//! DLSS bringing it to the eye size asked for.
+//! With an upscaler ([`arm_render`]: DLSS, or FSR with frame warping) the window is made the render
+//! size instead: each eye drawn smaller, the upscaler bringing it to the eye size asked for. With
+//! frame warping (one eye a frame) the window still holds two render-size eyes side by side: the
+//! warped eye fills its left half, the menus' side-by-side pair the whole.
 //!
 //! The window is the one the render thread presents to (`SwapBuffers`' device context: [`seen`]).
 //! Its owner is the game's main thread, which may be waiting on the render thread: each change is
@@ -39,8 +41,8 @@ static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static SIDE_BY_SIDE: AtomicBool = AtomicBool::new(false);
 /// The build's `r_fullscreen`, with its executable; none where not mapped.
 static FULLSCREEN: Mutex<Option<(Module, &'static Cvar)>> = Mutex::new(None);
-/// DLSS: its quality and the eye size it upscales to ([`arm_dlss`]).
-static DLSS: Mutex<Option<(monaka_dlss11::Quality, (u32, u32))>> = Mutex::new(None);
+/// An upscaler's render size and the eye size it upscales to ([`arm_render`]).
+static RENDER: Mutex<Option<((u32, u32), (u32, u32))>> = Mutex::new(None);
 /// The window's style and place before it was resized, for the stop.
 static BEFORE: Mutex<Option<Before>> = Mutex::new(None);
 
@@ -71,8 +73,8 @@ pub fn seen(dc: HDC) {
 /// eyes in it at the size asked for (with DLSS, at its render size), or the switch given up.
 pub fn ready(width: u32, height: u32) -> bool {
     let eye = eye_of((width, height));
-    let presented = match *DLSS.locked() {
-        Some((quality, display)) if eye == monaka_dlss11::render_size(display, quality) => display,
+    let presented = match *RENDER.locked() {
+        Some((render, display)) if eye == render => display,
         _ => eye,
     };
     let open = eye_size::ready::<Wolf>(presented);
@@ -114,13 +116,18 @@ fn keep_size(eye: (u32, u32)) {
 
 /// DLSS at `quality` for eyes of `display`: the window is made the render size.
 pub fn arm_dlss(quality: monaka_dlss11::Quality, display: (u32, u32)) {
-    *DLSS.locked() = Some((quality, display));
+    arm_render(monaka_dlss11::render_size(display, quality), display);
 }
 
-/// The size each eye is drawn at for eyes of `eye`: with DLSS, its render size.
+/// An upscaler drawing eyes of `render` for eyes of `display`: the window is made the render size.
+pub fn arm_render(render: (u32, u32), display: (u32, u32)) {
+    *RENDER.locked() = Some((render, display));
+}
+
+/// The size each eye is drawn at for eyes of `eye`: with an upscaler, its render size.
 fn drawn_eye(eye: (u32, u32)) -> (u32, u32) {
-    match *DLSS.locked() {
-        Some((quality, display)) if display == eye => monaka_dlss11::render_size(display, quality),
+    match *RENDER.locked() {
+        Some((render, display)) if display == eye => render,
         _ => eye,
     }
 }

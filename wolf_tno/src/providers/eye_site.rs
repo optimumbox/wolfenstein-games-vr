@@ -255,14 +255,9 @@ fn one_eye_layout(exe: &Module, build: &Build) -> Option<usize> {
     let header = record(build.layout_left_right.0 - engine::LAYOUT_HEADER)?;
     let left = record(build.layout_left_right.0)?;
     let unused = record(build.layout_single.0 + engine::LAYOUT_RECORD)?;
-    let mut view = left;
-    if let Some(scale) = SETUP_SCALE.get().copied().flatten() {
-        // The view's width and height fractions (after name, player, x, y): smaller by the scale.
-        for at in [0x14, 0x18] {
-            let fraction = f32::from_le_bytes(view[at..at + 4].try_into().ok()?) / scale;
-            view[at..at + 4].copy_from_slice(&fraction.to_le_bytes());
-        }
-    }
+    // The view fills the window's left half: with an upscaler the window itself is the render size
+    // (`window_size::arm_render`), so no full-size window is drawn around a smaller view.
+    let view = left;
     let records: &'static mut [Record; 4] = Box::leak(Box::new(one_eye_records(header, view, unused)));
     let first_view = records[1].as_ptr() as usize;
     Some(*ONE_EYE.get_or_init(|| first_view))
@@ -302,11 +297,17 @@ pub fn fsr_scale(config: &EyeSettings, shared: &Shared, build: &Build) -> Option
 }
 
 /// Where the eye drawn with frame warping lands in the window (x, y from the top-left, width,
-/// height: fractions), its view at `1 / scale` of a side-by-side eye's size (1: the left half).
-/// A smaller view keeps to the window's bottom-left: GL counts its viewport from the bottom.
-pub fn warp_region(scale: f32) -> [f32; 4] {
-    let (w, h) = (0.5 / scale, 1.0 / scale);
-    [0.0, 1.0 - h, w, h]
+/// height: fractions): its left half. With an upscaler the window is made the render size
+/// (`window_size::arm_render`), so the half is the render size too.
+pub const WARP_REGION: [f32; 4] = [0.0, 0.0, 0.5, 1.0];
+
+/// The eye size an upscaler brings the warped eye to, as fractions of the window (beyond 1 when
+/// larger): `display` over `render` per side, of the left half; else `scale` times the half.
+pub fn warp_display(render_display: Option<((u32, u32), (u32, u32))>, scale: f32) -> [f32; 2] {
+    match render_display {
+        Some((render, display)) if render.0 > 0 && render.1 > 0 => [0.5 * display.0 as f32 / render.0 as f32, display.1 as f32 / render.1 as f32],
+        _ => [0.5 * scale, scale],
+    }
 }
 
 /// Switches the engine to side-by-side stereo with our eye separation, remembering what it had
@@ -1036,7 +1037,7 @@ pub unsafe extern "system" fn projection(fov_x: f32, fov_y: f32, near: f32, far:
             let dlss = DLSS.get().filter(|_| !warping);
             let jitter = match (warping, SETUP_SCALE.get().copied().flatten(), gl_frames::frame_size()) {
                 (true, Some(scale), Some((width, height))) => {
-                    let render = gl_frames::region_size(width, height, warp_region(scale));
+                    let render = gl_frames::region_size(width, height, WARP_REGION);
                     let phases = fsr_phases(scale);
                     let phase = JITTER_PHASE[eye].fetch_add(1, Relaxed) % phases;
                     Some((fsr_jitter(phase), render))

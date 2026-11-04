@@ -56,7 +56,7 @@ fn output(start: &Start<'_, Wolf>) -> Output {
 }
 
 /// With frame warping ([`eye_site::warps`]): the eye in the window's left half (the one-eye layout
-/// draws it there, at a side-by-side eye's size), its shot and the scene's depth from the eye site;
+/// draws it there; with an upscaler the window is two render-size eyes wide), its shot and the scene's depth from the eye site;
 /// gaps filled from each eye's own frame while it is at most [`eye_site::REFRESH`] frames old. FSR
 /// upscaling and frame generation load AMD's DLLs from where the launcher found them (`fsr_dlls`).
 fn warp(start: &Start<'_, Wolf>) -> Option<GlWarp> {
@@ -69,16 +69,31 @@ fn warp(start: &Start<'_, Wolf>) -> Option<GlWarp> {
     // The engine's depth: standard, with an infinite far plane.
     let depth_flags = monaka_stereo::upscaler::fsr11::STANDARD_INFINITE;
     let leak = |p: std::path::PathBuf| -> &'static std::path::Path { Box::leak(p.into_boxed_path()) };
-    // FSR when chosen, else DLSS (as chosen, with its sharpening) upscales each eye.
-    let fsr = eye_site::fsr_scale(&config, start.shared, start.build.build).and_then(|_| match (config.fsr, config.dlss) {
-        (Some(settings), _) => Some(GlFsr { display: [0.5, 1.0], sharpness: settings.sharpness, jitter_sign: settings.jitter_sign, depth_flags, dlls: dlls(), dlss: None }),
+    // FSR when chosen, else DLSS (as chosen, with its sharpening) upscales each eye. The window is
+    // made two render-size eyes wide (`window_size::arm_render`): the eye drawn fills its left half,
+    // the upscaler brings it to the eye size.
+    let scale = eye_site::fsr_scale(&config, start.shared, start.build.build);
+    let eye = start.options.size("eye_size");
+    let render = match (scale, eye, config.fsr, config.dlss) {
+        (Some(_), Some(display), None, Some(settings)) => Some(monaka_dlss11::render_size(display, settings.quality)),
+        (Some(scale), Some(display), _, _) => Some((((display.0 as f32 / scale).round() as u32).max(1), ((display.1 as f32 / scale).round() as u32).max(1))),
+        _ => None,
+    };
+    let render_display = render.zip(eye);
+    if let Some((render, display)) = render_display {
+        crate::providers::window_size::arm_render(render, display);
+        log!("frame warping: each eye drawn at {}x{}, upscaled to {}x{}", render.0, render.1, display.0, display.1);
+    }
+    let display = eye_site::warp_display(render_display, scale.unwrap_or(1.0));
+    let fsr = scale.and_then(|_| match (config.fsr, config.dlss) {
+        (Some(settings), _) => Some(GlFsr { display, sharpness: settings.sharpness, jitter_sign: settings.jitter_sign, depth_flags, dlls: dlls(), dlss: None }),
         (None, Some(settings)) => {
             let found = dlss_folder(start);
             if found.is_none() {
                 log!("DLSS: {DLSS_DLL} was not found beside the pack; each eye is resampled");
             }
             Some(GlFsr {
-                display: [0.5, 1.0],
+                display,
                 sharpness: settings.sharpness,
                 jitter_sign: settings.jitter_sign,
                 depth_flags,
@@ -95,7 +110,7 @@ fn warp(start: &Start<'_, Wolf>) -> Option<GlWarp> {
         depth_flags: FrameGeneration::STANDARD_INFINITE,
         units_per_metre: config.units_per_metre,
     });
-    let region = eye_site::warp_region(eye_site::fsr_scale(&config, start.shared, start.build.build).unwrap_or(1.0));
+    let region = eye_site::WARP_REGION;
     Some(GlWarp {
         shot: eye_site::warp_shot,
         depth: eye_site::scene_depth,

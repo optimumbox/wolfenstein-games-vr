@@ -176,8 +176,11 @@ fn fsr_jitter_runs_amds_halton_points_inside_the_pixel() {
 
 #[test]
 fn a_smaller_eye_keeps_to_the_windows_bottom_left() {
-    assert_eq!(warp_region(1.0), [0.0, 0.0, 0.5, 1.0], "the left half");
-    assert_eq!(warp_region(2.0), [0.0, 0.5, 0.25, 0.5]);
+    assert_eq!(WARP_REGION, [0.0, 0.0, 0.5, 1.0], "the left half");
+    // DLSS Quality at 2560: a 1706 render, the window 3412 wide; the eye brought back to 2560.
+    let display = warp_display(Some(((1706, 1706), (2560, 2560))), 1.5);
+    assert_eq!(gl_frames::region_size(3412, 1706, [0.0, 0.0, display[0], display[1]]), (2560, 2560));
+    assert_eq!(warp_display(None, 2.0), [1.0, 2.0], "no eye size: the scale");
 }
 
 #[test]
