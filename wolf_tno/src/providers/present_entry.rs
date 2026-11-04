@@ -255,6 +255,7 @@ pub unsafe extern "system" fn swap_buffers(dc: HDC) -> BOOL {
         crate::research::gl::frame(gl::frames() + 1);
         crate::research::shaders::frame(gl::frames() + 1);
         crate::research::profile::frame();
+        crate::research::cvars::cycle_frame();
         if let Some(playing) = video_playing() {
             situation::report(Situation::Video, playing, VIDEO_FRESH_MS);
         }

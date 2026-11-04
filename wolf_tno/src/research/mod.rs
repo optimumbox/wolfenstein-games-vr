@@ -48,6 +48,8 @@ pub struct Options {
     pub freeze_at: f32,
     /// `probe_cvars=<name>@<rva>=<value>,...`: integer cvars set for the run ([`cvars`]).
     pub cvars: String,
+    /// `probe_cycle=<name>=<value>[+...],...`: candidates tried in turn in play ([`cvars::prepare_cycle`]).
+    pub cycle: String,
     /// `probe_extra_yaw=<degrees>`: the eyes' views turned this much more (left positive) as they
     /// are written: whether the world is drawn from them or from the game camera.
     pub extra_yaw: f32,
@@ -78,6 +80,7 @@ impl Options {
             fixed_rate: options.switch("probe_fixed_rate", false),
             freeze_at: options.number("probe_freeze_at", 0.0, 3600.0, 0.0),
             cvars: options.text("probe_cvars").unwrap_or_default().to_owned(),
+            cycle: options.text("probe_cycle").unwrap_or_default().to_owned(),
             extra_yaw: options.number("probe_extra_yaw", -90.0, 90.0, 0.0),
             items_on_view: options.switch("probe_items_on_view", false),
             cutting: options.switch("probe_cutting", false),

@@ -56,6 +56,7 @@ fn install_settings(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
         no_screen_shake(start.ledger, &exe, build);
     }
     crate::research::cvars::apply(start.ledger, &exe);
+    crate::research::cvars::prepare_cycle(start.ledger, &exe);
     // Kept at 0 by the ledger (what it holds at the stop goes back), so the world never stays
     // frozen after VR.
     if build.stop_time.present(&exe) && build.stop_time.set_int(&exe, 0) && start.ledger.keep(eng_idt::IntCvar { exe, cvar: &build.stop_time }).is_some() {
