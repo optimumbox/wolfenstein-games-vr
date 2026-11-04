@@ -118,11 +118,14 @@ fn warp(start: &Start<'_, Wolf>) -> Option<GlWarp> {
         region,
         fsr,
         framegen,
-        // The eye's own last real frame only fills gaps: up to a refresh old, it shows the hands
-        // where they were (a ghost hand where it was preferred over the warp), so never within the
-        // hands' reach (the gun's ghost beside it): those gaps show what is behind, not even with
-        // its held things moved with the play space (the hand moved too since that frame).
-        rules: Rules::WHOLE.every(eye_site::REFRESH).fill_first(false).held_reach(HELD_REACH_CM).held_fill(false),
+        // The eye's own last real frame shows a surface both eyes see where its colour agrees
+        // (fill first): the eye's own shading and texture detail on its warped frames too, so a
+        // character's sheen and fine detail do not change every other frame (a flicker on enemies
+        // and corpses). Within the hands' reach it is moved with the play space and taken only
+        // where the other eye does not see it gone (the hand moved since): the side of a gun
+        // raised to aim, which the other eye sees edge-on; never trusted everywhere (a ghost of
+        // the gun where the hand was).
+        rules: Rules::WHOLE.every(eye_site::REFRESH).fill_first(true).held_reach(HELD_REACH_CM).held_fill(false),
         // Command line only: `afw_sources=1` shows where each warped pixel came from.
         sources: start.options.text("afw_sources").and_then(|t| t.trim().parse().ok()).unwrap_or(0),
         // Command line only: `afw_snapshots=N` writes N warped pairs beside the log, and the warp's
