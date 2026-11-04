@@ -55,6 +55,9 @@ const STALE_NS: u64 = 100_000_000;
 const FITS: f64 = 0.005;
 /// How far the landing point moves toward halfway each pair (a share of how far off it is).
 const PHASE_GAIN: f64 = 0.05;
+/// The most a slot follows the grid in one frame (a share of a refresh): a wake's jitter is no
+/// reason to skip a refresh ([`next_slot`]).
+const FOLLOW: f64 = 0.125;
 /// The most refreshes a frame is held for.
 const MOST_REFRESHES: u64 = 4;
 /// The shortest refresh the headset has reported (nanoseconds; `u64::MAX`: none yet), and the
@@ -148,9 +151,14 @@ fn wrapped(value: i64, period: u64) -> i64 {
 }
 
 /// The slot the next frame starts at on the headset's grid (`timing`, its points moved by
-/// `phase`): the grid point nearest `refreshes` refreshes after the `last` slot; or, when that is
-/// past `now` by half a refresh or more (or there is no last slot), the first point from `now` on.
-/// Whether it came late (the frame before ran over).
+/// `phase`): `refreshes` refreshes after the `last` slot, drawn toward the grid by at most
+/// [`FOLLOW`] of a refresh; or, when that is past `now` by half a refresh or more (or there is no
+/// last slot), the first point from `now` on. Whether it came late (the frame before ran over).
+///
+/// The grid is anchored on the viewer's latest wake, which jitters (more so while SteamVR
+/// reprojects): snapped to the nearest grid point, a wake late by half a refresh put the slot a
+/// whole refresh further on, and that frame was shown twice without being counted late. Followed
+/// a little a frame, the slot keeps the headset's beat and still settles onto a grid that slid.
 pub fn next_slot(timing: &DisplayTiming, phase: u64, last: Option<u64>, refreshes: u64, now: u64) -> (u64, bool) {
     let period = timing.period_ns;
     let origin = timing.woke_ns + phase % period;
@@ -160,12 +168,13 @@ pub fn next_slot(timing: &DisplayTiming, phase: u64, last: Option<u64>, refreshe
     };
     let Some(last) = last else { return (point_at_or_after(now), false) };
     let wanted = last + refreshes * period;
-    // The grid point nearest the slot wanted (the grid may have slid a little against it).
-    let nearest = point_at_or_after(wanted.saturating_sub(period / 2));
-    if nearest + period / 2 <= now {
+    let off = wrapped(wanted as i64 - origin as i64, period);
+    let most = (period as f64 * FOLLOW) as i64;
+    let slot = (wanted as i64 - off.clamp(-most, most)) as u64;
+    if slot + period / 2 <= now {
         return (point_at_or_after(now), true);
     }
-    (nearest, false)
+    (slot, false)
 }
 
 /// Where the paced frames' pairs land: an offset of the grid's points, moved each pair so its
@@ -223,11 +232,13 @@ struct Window {
     work_worst_us: u64,
     /// Frames whose own work took longer than a refresh.
     work_over: u64,
+    /// Slots more than half a refresh past their turn (a refresh with no new frame).
+    skipped: u64,
 }
 
 impl Window {
     const fn new(since: u64) -> Self {
-        Self { since, frames: 0, late: 0, missed_slot: 0, worst_us: 0, work_worst_us: 0, work_over: 0 }
+        Self { since, frames: 0, late: 0, missed_slot: 0, worst_us: 0, work_worst_us: 0, work_over: 0, skipped: 0 }
     }
 }
 
@@ -313,6 +324,11 @@ fn pace() {
         state.late += 1;
         state.window.late += 1;
     }
+    if let Some(last) = state.last
+        && slot > last + refreshes * timing.period_ns + timing.period_ns / 2
+    {
+        state.window.skipped += 1;
+    }
     // The frame before's own work: from its start to now.
     if state.last_started != 0 && state.last.is_some() {
         let work_us = now.saturating_sub(state.last_started) / 1000;
@@ -358,9 +374,10 @@ fn log_window(state: &mut State, now: u64, period: u64, ending: bool) {
     if state.windows_logged < WINDOWS_LOGGED {
         state.windows_logged += 1;
         log!(
-            "frame pacing over {seconds:.0} s: {:.1} frames a second on a {:.1} Hz grid; {} late, {} over 0.1 ms off their slot (the most {} us); the game thread's own work over a refresh {} times, at most {:.2} ms",
+            "frame pacing over {seconds:.0} s: {:.1} frames a second on a {:.1} Hz grid; {} refreshes skipped, {} late, {} over 0.1 ms off their slot (the most {} us); the game thread's own work over a refresh {} times, at most {:.2} ms",
             w.frames as f64 / seconds,
             1e9 / period.max(1) as f64,
+            w.skipped,
             w.late,
             w.missed_slot,
             w.worst_us,

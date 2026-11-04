@@ -36,6 +36,19 @@ fn a_grid_that_slid_a_little_is_followed() {
 }
 
 #[test]
+fn a_late_wake_does_not_skip_a_refresh() {
+    // The viewer's latest wake came 4.5 ms late (over half a refresh): the slot stays on the beat,
+    // drawn toward that grid by an eighth of a refresh at most.
+    let last = 1_000_000_000;
+    for late in [4_500_000, P - 4_500_000] {
+        let timing = grid(last + P + late);
+        let (slot, skipped) = next_slot(&timing, 0, Some(last), 2, last + P);
+        assert!(!skipped);
+        assert!(slot.abs_diff(last + 2 * P) <= P / 8, "{late}: {}", slot as i64 - (last + 2 * P) as i64);
+    }
+}
+
+#[test]
 fn a_frame_that_ran_over_starts_on_the_next_point() {
     let last = 1_000_000_000;
     let timing = grid(last);
