@@ -904,8 +904,26 @@ pub fn warp_shot() -> Option<GlShot> {
     };
     let setup = SETUP.get()?;
     let separation = setup.shared.separation_for(&ticket.pose);
-    let other = <Wolf as EyeGeometry>::frustum(&ticket.pose, 1 - eye);
-    Some(GlShot { shot: Shot::labelled(Pending { eye, pose: ticket.pose }, rendered, separation, other), jitter })
+    let pose = warp_pose(ticket.pose);
+    let other = <Wolf as EyeGeometry>::frustum(&pose, 1 - eye);
+    Some(GlShot { shot: Shot::labelled(Pending { eye, pose }, rendered, separation, other), jitter })
+}
+
+/// The frustum each eye is drawn with under frame warping: the one holding both eyes' own. Each eye
+/// drawn with only its own leaves the other eye's outer side unseen (the headset's eyes look apart):
+/// warped from it, that side came from the eye's own older frame or stayed black (flicker and
+/// smearing at the view's edges, things there gone every other frame).
+pub fn warp_frustum(pose: &HeadPose) -> Option<Frustum> {
+    Frustum::both_eyes(&pose.fov)
+}
+
+/// `pose` as a warped pair goes out: both eyes' field of view [`warp_frustum`], as they were drawn
+/// and warped (the viewer gives the headset each eye's image with it, which shows the eye's part).
+pub fn warp_pose(mut pose: HeadPose) -> HeadPose {
+    if let Some(frustum) = warp_frustum(&pose) {
+        pose.fov = [frustum.fov(); 2];
+    }
+    pose
 }
 
 /// At each `SwapBuffers` with frame warping: whether the frame being presented was drawn with both
@@ -1027,7 +1045,7 @@ pub unsafe extern "system" fn projection(fov_x: f32, fov_y: f32, near: f32, far:
         let pose = *FRAME_POSE.locked();
         if eye < 2
             && (!warping || call == 0)
-            && let Some(frustum) = pose.and_then(|p| Frustum::from_fov(p.fov[eye]))
+            && let Some(frustum) = pose.and_then(|p| if warping { warp_frustum(&p) } else { Frustum::from_fov(p.fov[eye]) })
             && near.is_finite()
             && near > 0.0
         {
