@@ -55,10 +55,6 @@ fn install_settings(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
     if start.options.switch(DISABLE_SCREEN_SHAKE.id, false) {
         no_screen_shake(start.ledger, &exe, build);
     }
-    let config = crate::eyes(start);
-    if crate::providers::eye_site::warps(&config, start.shared, build) && !start.options.switch("afw_gpu_culling", false) {
-        no_gpu_culling(start.ledger, &exe, build);
-    }
     crate::research::cvars::apply(start.ledger, &exe);
     // Kept at 0 by the ledger (what it holds at the stop goes back), so the world never stays
     // frozen after VR.
@@ -98,33 +94,6 @@ fn no_screen_shake(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module, b
             eng_idt::set_int(ledger, exe, cvar, 0, "the view shakes");
         }
     }
-}
-
-/// The engine's GPU culling: what its occlusion tests found hidden in one frame is skipped in the
-/// next. With frame warping the frames alternate eyes, so each eye is culled by what the other eye
-/// saw: things past the other eye's edge, or behind something only from there, vanish every other
-/// frame (flicker at the view's edges and on characters). Frustum culling (on the CPU, with the
-/// view that holds both eyes) stays.
-const GPU_CULLING: &[&str] = &["r_skipModelGPUCulling", "r_skipNodeGPUCulling", "r_skipAreaGPUCulling", "r_skipLightGPUCulling"];
-
-/// The GPU culling off with frame warping ([`GPU_CULLING`]; `afw_gpu_culling=1`, command line only,
-/// keeps it): each set to 1, put back at the stop. Looked up by name as [`no_screen_shake`] does.
-fn no_gpu_culling(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module, build: &engine::Build) {
-    if let Some(bob) = Cvar::find(exe, build.no_bob.name, eng_idt::Layout::ID_TECH_5)
-        && bob.name_pointer != build.no_bob.name_pointer
-    {
-        log!("cvar lookup: {} found at {:#x}, the table has {:#x}; the GPU culling stays", bob.name, bob.name_pointer, build.no_bob.name_pointer);
-        return;
-    }
-    let mut set = Vec::new();
-    for &name in GPU_CULLING {
-        match Cvar::find(exe, name, eng_idt::Layout::ID_TECH_5) {
-            Some(cvar) if eng_idt::set_int(ledger, exe, cvar, 1, "the eyes are culled by each other's frames") => set.push(name),
-            Some(_) => log!("frame warping: {name} could not be set"),
-            None => log!("frame warping: {name} was not found"),
-        }
-    }
-    log!("frame warping: the GPU culling off (each eye culled by the other's frame otherwise): {}", set.join(", "));
 }
 
 /// The executable and `g_stopTime`, once the ledger holds it.
