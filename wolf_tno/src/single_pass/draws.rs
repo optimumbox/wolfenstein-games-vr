@@ -134,6 +134,9 @@ struct Counts {
     unwritten_depth_test: u64,
     /// The right eye's queries answered by the left eye's.
     queries_shared: u64,
+    /// The right eye's queries only another thing's left query had the rows of: made by the right
+    /// eye's pass.
+    queries_rows_only: u64,
     /// Checked ones (on the shadow's check frames) writing colour to a draw buffer past the first.
     unwritten_checked: u64,
     unwritten_other_buffers: u64,
@@ -389,9 +392,9 @@ struct State {
     /// The right eye's stretch draws each eye draws itself (its own projection, or a misfit), by
     /// program.
     own_by: HashMap<u32, u64>,
-    /// The left eye's queries made around stretch draws for both eyes this frame (id and rows), and
-    /// where the right eye's pass looks next.
-    left_queries: Vec<(u32, Rows)>,
+    /// The left eye's queries made around stretch draws for both eyes this frame (id, rows, the
+    /// draw's geometry, answered for the right eye yet), and where the right eye's pass looks next.
+    left_queries: Vec<LeftQuery>,
     query_cursor: usize,
     /// This frame's left-eye stretch draws made for both eyes ([`Carried`]).
     carried: Carried,
@@ -698,7 +701,7 @@ pub fn frame(on: bool) {
             format!("{target:#x} {}", by_pass.join("/"))
         });
         log!(
-            "single pass: of the right eye's draws writing neither colour nor depth: {} in a query, {} with the stencil test on, {} discarding, {} with the depth test on, {} of {} checked writing colour past the first draw buffer; by program: {}; conditional renders per frame {:.1}; the right eye's queries answered by the left eye's {:.1}; queries begun per frame (before/left/right pass): {}",
+            "single pass: of the right eye's draws writing neither colour nor depth: {} in a query, {} with the stencil test on, {} discarding, {} with the depth test on, {} of {} checked writing colour past the first draw buffer; by program: {}; conditional renders per frame {:.1}; the right eye's queries answered by the left eye's {:.1}, made by its own pass as only another thing's left query had their rows {:.1}; queries begun per frame (before/left/right pass): {}",
             c.unwritten_query,
             c.unwritten_stencil,
             c.unwritten_discard,
@@ -712,6 +715,7 @@ pub fn frame(on: bool) {
             },
             CONDITIONAL.load(Relaxed) as f64 / frames,
             c.queries_shared as f64 / frames,
+            c.queries_rows_only as f64 / frames,
             queries.collect::<Vec<_>>().join(", ")
         );
         log!("single pass: the right eye's stretch draws the left eye's pass did not make (culled for the left eye), drawn by the right eye's: {} ({:.1} a frame; by program: {}); the eye matrix paired by the last one in {} frames", c.right_only, c.right_only as f64 / frames, {
@@ -1244,13 +1248,49 @@ fn draw(geometry: u64, shape: u64) -> bool {
     }
 }
 
-/// The left eye's query whose draw the right eye's draw with `rows` copies, looked for from
-/// `cursor` on (the passes make their queries in much the same order), then from the start.
-fn left_query(left: &[(u32, Rows)], cursor: &mut usize, matrix: &Rows, rows: &Rows) -> Option<u32> {
+/// A left eye's query made around a stretch draw for both eyes.
+#[derive(Clone, Copy, Debug)]
+struct LeftQuery {
+    id: u32,
+    rows: Rows,
+    geometry: u64,
+    /// Already the answer to one of the right eye's queries.
+    taken: bool,
+}
+
+/// What the right eye's query was matched to among the left eye's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QueryMatch {
+    /// The left eye's query of the same thing: its answer is the right eye's.
+    Same(u32),
+    /// Only a left query of something else with the same rows (the world's bounding boxes share the
+    /// view's rows, each box its own geometry): not answered by it.
+    RowsOnly,
+    None,
+}
+
+/// The left eye's query whose draw the right eye's draw with `rows` and `geometry` copies, looked
+/// for from `cursor` on (the passes make their queries in much the same order), then from the
+/// start; each left query answers one right query. Rows alone do not tell the queries apart (the
+/// world's bounding boxes all share the view's rows): answered by another box's query, the right
+/// eye's pass culled what it sees and drew what it does not, a wall here and a floor there.
+fn left_query(left: &mut [LeftQuery], cursor: &mut usize, matrix: &Rows, rows: &Rows, geometry: u64) -> QueryMatch {
     let start = (*cursor).min(left.len());
-    let at = (start..left.len()).chain(0..start).find(|&i| eye_matrix::misfit(matrix, &left[i].1, rows) <= eye_matrix::AGREES * 10.0)?;
-    *cursor = at + 1;
-    Some(left[at].0)
+    let mut rows_only = false;
+    for i in (start..left.len()).chain(0..start) {
+        let query = &mut left[i];
+        if query.taken || eye_matrix::misfit(matrix, &query.rows, rows) > eye_matrix::AGREES * 10.0 {
+            continue;
+        }
+        if query.geometry != geometry {
+            rows_only = true;
+            continue;
+        }
+        query.taken = true;
+        *cursor = i + 1;
+        return QueryMatch::Same(query.id);
+    }
+    if rows_only { QueryMatch::RowsOnly } else { QueryMatch::None }
 }
 
 fn draw_locked(geometry: u64, shape: u64) -> bool {
@@ -1319,7 +1359,9 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
     let misfit = stretch && (state.misfits.misfits.contains(&current) || state.programs.get(&current).is_some_and(|p| p.converted.reads_screen) && screen_arrays.is_none());
     let own_projection = misfit || stretch && state.world_depth.zip(ratio).is_some_and(|(world, ratio)| (ratio - world).abs() > 1e-3 * world.abs().max(1e-6));
     if PENDING.load(Relaxed) == PENDING_OPEN && stretch && state.pass == 2 && !own_projection && let Some(matrix) = state.matrix.as_ref() {
-        if let Some(left) = left_query(&state.left_queries, &mut state.query_cursor, matrix, &rows) {
+        let matched = left_query(&mut state.left_queries, &mut state.query_cursor, matrix, &rows, geometry);
+        state.counts.queries_rows_only += u64::from(matched == QueryMatch::RowsOnly);
+        if let QueryMatch::Same(left) = matched {
             // Found: counted for the program's judgment too, or only the draws not found would be.
             if checking {
                 let name = state.programs.get(&current).map_or("?", |p| p.converted.name);
@@ -1371,8 +1413,8 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
             state.counts.stereo += 1;
             state.carried.keep(current, geometry, shape, eye_matrix::carry(&matrix, &rows));
             let query = ACTIVE_QUERY_ID.load(Relaxed);
-            if query != 0 && state.left_queries.last().is_none_or(|(id, _)| *id != query) {
-                state.left_queries.push((query, rows));
+            if query != 0 && state.left_queries.last().is_none_or(|q| q.id != query) {
+                state.left_queries.push(LeftQuery { id: query, rows, geometry, taken: false });
             }
             true
         }
@@ -2142,5 +2184,26 @@ mod tests {
         // The same mesh repeated metres away, or other geometry: not taken for it.
         assert!(carried.nearest(7, 100, &rows(3.0)).unwrap() > MOVED_BETWEEN);
         assert_eq!(carried.nearest(7, 101, &rows(0.205)), None);
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    const IDENTITY: Rows = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+
+    #[test]
+    fn a_right_query_is_answered_only_by_the_left_query_of_the_same_box() {
+        // Three world boxes sharing the view's rows, each its own geometry.
+        let mut left: Vec<LeftQuery> = [(10, 1), (11, 2), (12, 3)].map(|(id, geometry)| LeftQuery { id, rows: IDENTITY, geometry, taken: false }).to_vec();
+        let mut cursor = 0;
+        // The right eye's pass skips box 1 (culled for it): box 2 is answered by box 2's query.
+        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, &IDENTITY, 2), QueryMatch::Same(11));
+        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, &IDENTITY, 3), QueryMatch::Same(12));
+        // A box the left eye's pass made no query for: rows alike, not answered.
+        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, &IDENTITY, 4), QueryMatch::RowsOnly);
+        // Each left query answers once.
+        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, &IDENTITY, 2), QueryMatch::RowsOnly);
     }
 }
