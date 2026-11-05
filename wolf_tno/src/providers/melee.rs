@@ -150,7 +150,30 @@ fn quick_melee(setup: &Setup, hands: usize) -> bool {
 /// and the game's own attack (a scene's "fight back" prompt) must reach it; while hotwiring the
 /// controllers move the wires.
 fn swung(setup: &Setup, hands: usize) -> Kind {
-    if quick_melee(setup, hands) || crate::providers::camera_taken::controlled() || crate::extras::hotwire::active() { Kind::Gun } else { held_item::right_kind(setup.layout, hands) }
+    let kind = if quick_melee(setup, hands) || crate::providers::camera_taken::controlled() || crate::extras::hotwire::active() { Kind::Gun } else { held_item::right_kind(setup.layout, hands) };
+    note_change(kind);
+    kind
+}
+
+/// The kind last swung with, and how many changes were logged.
+static LAST_KIND: AtomicU64 = AtomicU64::new(u64::MAX);
+static CHANGES_LOGGED: AtomicU64 = AtomicU64::new(0);
+const CHANGES_LOG_MOST: u64 = 300;
+
+/// At a change of what the right hand holds (the knife put away for a ladder, taken out again in
+/// the water), the view's pitch and height, and the head's share of the pitch: what the game's
+/// ladder and swimming read to go up or down.
+fn note_change(kind: Kind) {
+    let code = kind as u64;
+    if LAST_KIND.swap(code, Relaxed) == code || CHANGES_LOGGED.fetch_add(1, Relaxed) >= CHANGES_LOG_MOST {
+        return;
+    }
+    let Some(view) = crate::providers::eye_site::render_view() else { return };
+    let forward = [view[3], view[4], view[5]];
+    let length = (forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2]).sqrt().max(f32::EPSILON);
+    let up = (forward[2] / length).clamp(-1.0, 1.0).asin().to_degrees();
+    let head = monaka_body::look::baked::<Wolf>(None).map_or(f32::NAN, |share| share.pitch.to_degrees());
+    log!("melee: now {kind:?}; the view pitched {up:.1} degrees up (the head's share {head:.1}), at height {:.1}", view[2]);
 }
 
 /// The right hand's weapon where its controller holds it now: the hand, and the blade's tip
