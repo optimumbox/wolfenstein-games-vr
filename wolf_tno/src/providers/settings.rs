@@ -111,8 +111,6 @@ struct Watched {
 static WATCHED: OnceLock<Watched> = OnceLock::new();
 /// `vt_useCudaTranscode`, held on ([`gpu_decoding`]).
 static GPU_DECODING: OnceLock<(Module, &'static Cvar)> = OnceLock::new();
-/// `vt_uncompressedPhysicalImages`, held at 0 ([`compressed_pages`]).
-static COMPRESSED: OnceLock<(Module, &'static Cvar)> = OnceLock::new();
 static WATCH_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The texture pages decoded on the GPU (`vt_useCudaTranscode` 1, the game's own CUDA decoder)
@@ -124,35 +122,11 @@ fn gpu_decoding(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
     eng_idt::set_int(ledger, exe, cvar, 1, "texture pages are decoded on the CPU");
     let _ = GPU_DECODING.set((*exe, cvar));
     log!("texture streaming: pages decoded on the GPU (vt_useCudaTranscode 1), held on while VR runs");
-    compressed_pages(ledger, exe);
-}
-
-/// The texture cache's pages kept block-compressed (`vt_uncompressedPhysicalImages` 0) rather than
-/// as plain RGBA8: the game's GPU decoder writes them compressed, the cache's images take a quarter
-/// of the memory, and every texture read of the scene (both eyes at the headset's size) reads a
-/// quarter of the bytes. The game keeps them uncompressed for the CPU decoder's sake; the cost of
-/// that grows with the VT cache setting, which is what made any cache above low too heavy for VR.
-/// The game reads it when it rebuilds the cache (a level load, or its video settings applied), and
-/// puts its archived value back at each level load: held at 0 ([`watch_streaming`]), as is the
-/// archived value in wolfConfig.cfg.
-fn compressed_pages(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
-    let Some(cvar) = Cvar::find(exe, "vt_uncompressedPhysicalImages", eng_idt::Layout::ID_TECH_5) else { return };
-    eng_idt::set_int(ledger, exe, cvar, 0, "texture cache pages are stored uncompressed (RGBA8)");
-    let _ = COMPRESSED.set((*exe, cvar));
-    log!("texture streaming: the texture cache's pages stored compressed (vt_uncompressedPhysicalImages 0)");
 }
 
 /// On the render thread, every 45th frame: a streaming setting changed (the options menu) is logged,
 /// and GPU decoding turned off is turned on again before the engine rebuilds its texture cache.
 pub fn watch_streaming() {
-    // Every frame: the game's options code sets it back to 1 when it starts and whenever its video
-    // settings are applied, and rebuilds the texture cache soon after; it has to be 0 by then.
-    if let Some((exe, cvar)) = COMPRESSED.get()
-        && cvar.int(exe) == Some(1)
-    {
-        cvar.set_int(exe, 0);
-        log!("texture streaming: the game set the texture cache's pages uncompressed (vt_uncompressedPhysicalImages 1); compressed again");
-    }
     if WATCH_FRAMES.fetch_add(1, Relaxed) % 45 != 0 {
         return;
     }
