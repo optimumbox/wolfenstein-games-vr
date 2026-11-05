@@ -10,7 +10,7 @@ fn hand_tags_are_sides() {
 #[test]
 fn a_placed_gun_is_held_along_its_forward_axis() {
     // A gun 2 units up from the origin, turned to face id +Y (left): forward +Y, left -X, up +Z.
-    let gun = Placed { weapon: 1, origin: [10.0, 20.0, 2.0], axis: [0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0], at: 5 };
+    let gun = Placed { weapon: 1, origin: [10.0, 20.0, 2.0], axis: [0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0], at: 5, build: 0 };
     *PLACED.locked() = [None, Some(gun)];
     let placed = <Wolf as HeldItems>::placed(RIGHT_HAND).unwrap();
     let line = placed.line.unwrap();
@@ -94,4 +94,14 @@ fn a_turn_between_two_directions_takes_one_onto_the_other() {
         assert!(near(unit(apply3(&turn, from)).unwrap(), unit(to).unwrap(), 1e-4), "{from:?} -> {to:?}");
     }
     assert!(turn_between([0.0; 3], [1.0, 0.0, 0.0]).is_none());
+}
+
+/// An item placed during the view build before the eyes' (or during theirs) is where those eyes see
+/// it; one placed two builds before is stale (the game stopped placing it).
+#[test]
+fn an_item_is_fresh_for_the_build_after_its_placement_only() {
+    assert!(fresh_for(5, 5) && fresh_for(5, 6));
+    assert!(!fresh_for(5, 7));
+    let gun = Placed { weapon: 1, origin: [1.0, 2.0, 3.0], axis: [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0], at: 0, build: 0 };
+    assert_eq!(origin_axis(&gun), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
 }

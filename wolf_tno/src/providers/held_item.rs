@@ -223,6 +223,8 @@ pub struct Placed {
     pub origin: [f32; 3],
     pub axis: [f32; 9],
     pub at: u64,
+    /// The view build under way when it was placed (`eye_site::builds`).
+    pub build: u64,
 }
 
 /// By side (`LEFT_HAND`, `RIGHT_HAND`).
@@ -264,6 +266,24 @@ pub fn summary() -> String {
 /// Each hand's gun as last placed, by side.
 pub fn placed() -> [Option<Placed>; 2] {
     *PLACED.locked()
+}
+
+/// Each hand's item (by side) as origin and axis rows, where the controllers placed it for the view
+/// build `build` (placed since the build before it): what the eyes of that build see it at, for the
+/// upscaler's motion vectors. None for a hand whose item the game no longer places.
+pub fn placed_for(build: u64) -> [Option<[f32; 12]>; 2] {
+    PLACED.locked().map(|p| p.filter(|p| fresh_for(p.build, build)).map(|p| origin_axis(&p)))
+}
+
+fn fresh_for(placed: u64, build: u64) -> bool {
+    build.saturating_sub(placed) <= 1
+}
+
+fn origin_axis(p: &Placed) -> [f32; 12] {
+    let mut out = [0.0; 12];
+    out[..3].copy_from_slice(&p.origin);
+    out[3..].copy_from_slice(&p.axis);
+    out
 }
 
 /// Where the item of `side` was last placed (world units), while the controllers place them.
@@ -503,7 +523,7 @@ pub unsafe extern "system" fn place_item(item: usize, hands: usize) {
         if count < 2 {
             log!("guns: {} gun (weapon {weapon:#x}) placed at {origin:?}, forward {:?}", if side == RIGHT_HAND { "right" } else { "left" }, &axis[..3]);
         }
-        PLACED.locked()[side] = Some(Placed { weapon, origin, axis, at: monaka_channel::tick() });
+        PLACED.locked()[side] = Some(Placed { weapon, origin, axis, at: monaka_channel::tick(), build: frame });
         if side == RIGHT_HAND && right_throws_knives() {
             crate::cooking::knife_throw::note_knife(origin);
         }

@@ -65,16 +65,26 @@ impl Cvar {
         let code = exe.kept_code()?;
         let data = || code.sections().iter().filter(|s| !s.executable);
         let needle = [&[0u8][..], name.as_bytes(), &[0]].concat();
-        let string = data().find_map(|s| s.bytes.windows(needle.len()).position(|w| w == needle).map(|at| s.rva as usize + at + 1))?;
-        let target = (exe.base() + string) as u64;
-        let mut found = data().flat_map(|s| {
-            let rva = s.rva as usize;
-            s.bytes.as_chunks::<8>().0.iter().enumerate().filter(move |(_, b)| u64::from_le_bytes(**b) == target).map(move |(i, _)| rva + i * 8)
-        });
-        let cvar = found.find_map(|at| {
-            let cvar = Cvar::new(at, name, layout);
-            cvar.int(exe).zip(cvar.float(exe)).is_some_and(|(i, f)| f.is_finite() && f as i32 == i).then_some(cvar)
-        });
+        // The name may be in the data more than once (a format string, a menu's binding): each copy
+        // is tried, the cvar's own being the one a cvar points at.
+        let strings: Vec<u64> = data()
+            .flat_map(|s| {
+                let rva = s.rva as usize;
+                s.bytes.windows(needle.len()).enumerate().filter(|(_, w)| *w == needle.as_slice()).map(move |(at, _)| (exe.base() + rva + at + 1) as u64).collect::<Vec<_>>()
+            })
+            .collect();
+        let found = |target: u64| {
+            data()
+                .flat_map(move |s| {
+                    let rva = s.rva as usize;
+                    s.bytes.as_chunks::<8>().0.iter().enumerate().filter(move |(_, b)| u64::from_le_bytes(**b) == target).map(move |(i, _)| rva + i * 8)
+                })
+                .find_map(|at| {
+                    let cvar = Cvar::new(at, name, layout);
+                    cvar.int(exe).zip(cvar.float(exe)).is_some_and(|(i, f)| f.is_finite() && f as i32 == i).then_some(cvar)
+                })
+        };
+        let cvar = strings.into_iter().find_map(found);
         match cvar {
             Some(cvar) => log!("{name}: found at {:#x}", cvar.name_pointer),
             None => log!("{name}: not found in the running game"),

@@ -789,7 +789,12 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
                 if dlss.is_some() {
                     let units = setup.map_or(1.0, |s| s.config.units_per_metre);
                     let projections = *DLSS_PROJECTIONS.locked();
-                    let frame = dlss_frame_of(dlss_eyes, projections, units);
+                    let items = crate::providers::held_item::placed_for(builds());
+                    static ITEMS_SEEN: AtomicBool = AtomicBool::new(false);
+                    if items.iter().any(Option::is_some) && !ITEMS_SEEN.swap(true, Relaxed) {
+                        log!("DLSS: within the hands' reach the motion follows the hands' items (the gun's sights keep their history)");
+                    }
+                    let frame = dlss_frame_of(dlss_eyes, projections, items, units);
                     DLSS_TICKETS.locked().issue(Ticket::Both, pose, frame);
                 }
                 PAIRS.built(Ticket::Both, pose)
@@ -800,8 +805,10 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
 }
 
 /// Both eyes as drawn for DLSS: each eye's place (`origins`, the engine's origin and axis rows) and
-/// the projection the engine made for it; none unless both are there with the same jitter.
-fn dlss_frame_of(origins: [Option<[f32; 12]>; 2], projections: [Option<EyeProjection>; 2], units: f32) -> Option<GlDlssFrame> {
+/// the projection the engine made for it; none unless both are there with the same jitter. With
+/// each hand's item where the controllers placed it for the frame (origin and axis rows), the
+/// upscaler moves what is within the hands' reach with it.
+fn dlss_frame_of(origins: [Option<[f32; 12]>; 2], projections: [Option<EyeProjection>; 2], items: [Option<[f32; 12]>; 2], units: f32) -> Option<GlDlssFrame> {
     let convention = eng_idt::camera_convention(units);
     let mut jitter = None;
     let mut views = [None; 2];
@@ -816,7 +823,8 @@ fn dlss_frame_of(origins: [Option<[f32; 12]>; 2], projections: [Option<EyeProjec
         frustum.apply_to_projection(&mut rendered.projection);
         views[eye] = Some(monaka_warp::EyeView { camera: rendered.camera, projection: rendered.projection });
     }
-    Some(GlDlssFrame { views: [views[0]?, views[1]?], jitter: jitter? })
+    let items = items.map(|item| camera_of(&item?, &convention));
+    Some(GlDlssFrame { views: [views[0]?, views[1]?], jitter: jitter?, items })
 }
 
 /// DLSS for this run, with both eyes drawn each frame: each eye's projection jittered, and how both

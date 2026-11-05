@@ -168,6 +168,7 @@ fn dlss(start: &Start<'_, Wolf>) -> Option<GlDlss> {
         data: leak(start.session.dir().join("ngx")),
         jitter_sign: settings.jitter_sign,
         sharpness: settings.sharpness,
+        held_reach: f32::from(HELD_REACH_CM) / 100.0,
     })
 }
 
@@ -278,12 +279,132 @@ pub unsafe extern "system" fn swap_buffers(dc: HDC) -> BOOL {
     }
     let swapping = std::time::Instant::now();
     crate::research::profile::phase(crate::research::profile::Phase::Swap);
-    // SAFETY: forwards the game's own call.
-    let result = unsafe { SWAP_BUFFERS_ORIGINAL.get(&flight)(dc) };
+    let publishing = PAIRS.publishing();
+    let result = match desktop::skips(publishing) {
+        true => {
+            // SAFETY: flushes the game's current context on its own thread.
+            unsafe { windows::Win32::Graphics::OpenGL::glFlush() };
+            BOOL::from(true)
+        }
+        // SAFETY: forwards the game's own call.
+        false => unsafe { SWAP_BUFFERS_ORIGINAL.get(&flight)(dc) },
+    };
     crate::research::profile::phase(crate::research::profile::Phase::Game);
-    PAIRS.time(Stage::GameSwap, swapping.elapsed());
+    let took = swapping.elapsed();
+    desktop::swapped(publishing, took);
+    PAIRS.time(Stage::GameSwap, took);
     *LAST_SWAP.locked() = Some(std::time::Instant::now());
     result
+}
+
+/// The game's own present to its desktop window while the headset shows pairs. The window is larger
+/// than the monitor (the eyes side by side), so it never gets a flip of its own: the desktop
+/// compositor presents it, and some runs it holds every `SwapBuffers` until its own refresh, about
+/// 10 ms each (the render thread at 50 fps where another run of the same build stays at 90). When
+/// most swaps of a stretch wait like that, the game's frames are flushed rather than swapped while
+/// pairs are published: the headset takes them from Monaka's copy, not from the window, whose
+/// picture holds. The game's swaps come back once the pairs stop.
+mod desktop {
+    use monaka_producer::log;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// A swap this long or longer waited on the compositor (an unblocked one takes a fraction of a ms).
+    const WAITED: Duration = Duration::from_millis(3);
+    /// Swaps looked at together, and how many of them waiting turn the window's present off.
+    const STRETCH: u32 = 45;
+    const WAITING: u32 = 30;
+
+    #[derive(Default)]
+    pub(super) struct Watch {
+        swaps: u32,
+        waited: u32,
+        waited_for: Duration,
+        pub(super) skipping: bool,
+        pub(super) times: u32,
+    }
+
+    impl Watch {
+        /// Whether this present skips the window.
+        pub(super) fn skips(&mut self, publishing: bool) -> bool {
+            if !publishing {
+                if self.skipping {
+                    log!("desktop window: the game's own presents again (no pairs published)");
+                }
+                self.skipping = false;
+                self.swaps = 0;
+                self.waited = 0;
+                self.waited_for = Duration::ZERO;
+            }
+            self.skipping
+        }
+
+        /// A present that took `took`; true when the window's present turns off with it.
+        pub(super) fn swapped(&mut self, publishing: bool, took: Duration) -> bool {
+            if !publishing || self.skipping {
+                return false;
+            }
+            self.swaps += 1;
+            if took >= WAITED {
+                self.waited += 1;
+                self.waited_for += took;
+            }
+            if self.swaps < STRETCH {
+                return false;
+            }
+            let turn_off = self.waited >= WAITING;
+            if turn_off {
+                self.skipping = true;
+                self.times += 1;
+                if self.times <= 5 {
+                    log!(
+                        "desktop window: {} of the last {} SwapBuffers waited on the desktop compositor ({:.1} ms each on average): the game's frames are flushed instead of swapped while pairs are published; the window's picture holds",
+                        self.waited,
+                        self.swaps,
+                        self.waited_for.as_secs_f64() * 1000.0 / f64::from(self.waited.max(1))
+                    );
+                }
+            }
+            self.swaps = 0;
+            self.waited = 0;
+            self.waited_for = Duration::ZERO;
+            turn_off
+        }
+    }
+
+    static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
+
+    pub fn skips(publishing: bool) -> bool {
+        WATCH.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Watch::default).skips(publishing)
+    }
+
+    pub fn swapped(publishing: bool, took: Duration) {
+        WATCH.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Watch::default).swapped(publishing, took);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Quick swaps keep the window's present; a stretch of swaps mostly waiting turns it off
+        /// until the pairs stop.
+        #[test]
+        fn the_window_present_stops_once_most_swaps_wait() {
+            let mut watch = Watch::default();
+            for _ in 0..STRETCH * 4 {
+                assert!(!watch.skips(true));
+                assert!(!watch.swapped(true, Duration::from_micros(130)));
+            }
+            let mut off = false;
+            for n in 0..STRETCH {
+                assert!(!watch.skips(true));
+                off = watch.swapped(true, if n % 4 == 0 { Duration::from_micros(200) } else { Duration::from_micros(9600) });
+            }
+            assert!(off && watch.skips(true) && watch.times == 1);
+            assert!(!watch.skips(false), "back once the pairs stop");
+            assert!(!watch.swapped(false, Duration::from_millis(10)));
+        }
+    }
 }
 
 /// The render thread's CPU time at the last `SwapBuffers`.
