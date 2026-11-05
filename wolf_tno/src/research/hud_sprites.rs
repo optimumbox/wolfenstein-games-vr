@@ -32,7 +32,7 @@ pub fn drawn(sprite: usize, bounds: [f32; 4], layout: (f32, f32)) {
 }
 
 /// `sprite`'s path: its parents' names, then its own.
-fn path(sprite: usize) -> String {
+pub fn path(sprite: usize) -> String {
     let mut names = Vec::new();
     let mut at = sprite;
     while at != 0 && names.len() < 10 {

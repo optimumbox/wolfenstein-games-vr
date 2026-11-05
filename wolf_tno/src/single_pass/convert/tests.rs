@@ -197,3 +197,59 @@ fn the_other_eyes_copy_moves_the_ray_where_it_is_a_direction_only() {
     assert!(fragment.contains("GL_ARB_fragment_layer_viewport"));
     assert_eq!(eye_rays(RAY_VERTEX, &stereo, "#version 150\nin vec4 vofi_TexCoord4;\nvoid main() {}\n"), None);
 }
+
+#[test]
+fn the_self_shadow_is_read_at_the_drawn_layer_with_the_rows_as_they_are() {
+    let character = "#version 150\n\
+vec4 tex2D( sampler2D sampler, vec2 texcoord ) { return texture( sampler, texcoord.xy ); }\n\
+vec2 screenPosToTexcoord( vec2 pos, vec4 scale ) { return pos * scale.xy + scale.zw; }\n\
+uniform vec4 _fa_ [20];\n\
+uniform sampler2D samp_selfshadowmap;\n\
+in vec4 gl_FragCoord;\n\
+out vec4 out_FragColor0;\n\
+void main() {\n\
+\tvec2 texcoord = screenPosToTexcoord( gl_FragCoord.xy, _fa_[17 ] );\n\
+\tvec4 encoded = tex2D( samp_selfshadowmap, texcoord );\n\
+\tout_FragColor0 = encoded;\n\
+}\n";
+    assert!(!reads_screen(character));
+    let layered = eye_maps_fragment(character).expect("converts");
+    assert_eq!(layered.maps, vec!["samp_selfshadowmap"]);
+    assert_eq!(layered.rows, 0);
+    let s = &layered.source;
+    assert!(s.contains("vec4 encoded = ( gl_Layer != 0 ? tex2D( monaka_l_samp_selfshadowmap, texcoord ) : tex2D( samp_selfshadowmap, texcoord ) );"), "{s}");
+    assert!(s.contains("uniform sampler2DArray monaka_l_samp_selfshadowmap;"), "{s}");
+    // The rows as they were: the same for both eyes.
+    assert!(s.contains("screenPosToTexcoord( gl_FragCoord.xy, _fa_[17 ] )") && !s.contains("monaka_fr") && !s.contains("monaka_fmain"), "{s}");
+    // The scene's maps' conversion leaves it alone, and this one theirs.
+    assert_eq!(layered_fragment(character), None);
+    assert_eq!(eye_maps_fragment(LIGHT), None);
+}
+
+#[test]
+fn every_shader_reading_the_self_shadow_converts() {
+    let Ok(dir) = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../research/renderprogs/converted")) else { return };
+    let mut failed = Vec::new();
+    let mut converted = 0;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "frag") {
+            continue;
+        }
+        // As the engine has them: without the locations the research copies were given.
+        let text: String = std::fs::read_to_string(&path).expect("reads").lines().map(|line| match line.strip_prefix("layout(location = ") {
+            Some(rest) => format!("{}
+", rest.split_once(") ").map_or(rest, |(_, after)| after)),
+            None => format!("{line}
+"),
+        }).collect();
+        if !text.contains("samp_selfshadowmap") || reads_screen(&text) {
+            continue;
+        }
+        match eye_maps_fragment(&text) {
+            Some(_) => converted += 1,
+            None => failed.push(path.file_name().unwrap().to_string_lossy().into_owned()),
+        }
+    }
+    assert!(failed.is_empty(), "{converted} converted; not: {failed:?}");
+}

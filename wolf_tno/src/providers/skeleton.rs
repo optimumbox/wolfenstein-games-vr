@@ -209,6 +209,7 @@ fn animated_off(layout: &HandsLayout, hands: usize, actual: &Model) -> Option<([
 pub fn onto_arms_as_drawn(layout: &HandsLayout, hands: usize, placed: (Vec3, [f32; 9])) -> (Vec3, [f32; 9]) {
     let (Some(live), Some(view)) = (live(layout, hands), hands_view(layout, hands)) else { return placed };
     let Some(actual) = model(live.entity) else { return placed };
+    note_takeover(&actual, view);
     if let Some((view, eyes)) = animated_off(layout, hands, &actual) {
         let (view, eyes) = (placement(view), placement(eyes));
         let n = ANIMATED.fetch_add(1, Relaxed) + 1;
@@ -237,6 +238,40 @@ pub fn onto_arms_as_drawn(layout: &HandsLayout, hands: usize, placed: (Vec3, [f3
         }
     }
     (origin, axis)
+}
+
+/// While another camera has the view: the farthest the arms model was drawn from the camera the
+/// eyes are built on (units), that offset in the camera's frame (forward, left, up), and from the
+/// player's view; logged as the camera gives the view back.
+struct Takeover {
+    most: f32,
+    in_camera: Vec3,
+    from_view: f32,
+}
+
+static TAKEOVER: Mutex<Option<Takeover>> = Mutex::new(None);
+
+fn note_takeover(actual: &Model, view: [f32; 12]) {
+    let Ok(mut takeover) = TAKEOVER.try_lock() else { return };
+    let camera = crate::providers::camera_taken::controlled().then(crate::providers::eye_site::render_view).flatten();
+    let Some(camera) = camera else {
+        if let Some(t) = takeover.take() {
+            let [f, l, u] = t.in_camera;
+            log!(
+                "arms: while another camera had the view the arms model was drawn at most {:.1} units from the eyes' camera ({f:.1} ahead, {l:.1} left, {u:.1} up of it), {:.1} from the player's view",
+                t.most,
+                t.from_view
+            );
+        }
+        return;
+    };
+    let off = sub(actual.origin, [camera[0], camera[1], camera[2]]);
+    let distance = length(off);
+    let t = takeover.get_or_insert(Takeover { most: -1.0, in_camera: [0.0; 3], from_view: 0.0 });
+    if distance > t.most {
+        let row = |k: usize| off[0] * camera[3 + 3 * k] + off[1] * camera[4 + 3 * k] + off[2] * camera[5 + 3 * k];
+        *t = Takeover { most: distance, in_camera: [row(0), row(1), row(2)], from_view: length(sub(actual.origin, [view[0], view[1], view[2]])) };
+    }
 }
 
 /// The arms model's animated entity, its joint animator, its joint matrices, its skeleton header

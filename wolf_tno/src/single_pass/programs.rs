@@ -72,7 +72,9 @@ pub struct Screen {
     /// and the right rows' first location (each array's locations in a row).
     pub vertex_rows: (i32, usize),
     pub fragment_rows: (i32, usize),
-    pub right_rows: i32,
+    /// None for maps of each eye's own ([`convert::eye_maps_fragment`]): the rows are the same for
+    /// both eyes, none learnt or given (the vertex and fragment rows then (0, 0)).
+    pub right_rows: Option<i32>,
 }
 
 /// The engine's program names swept.
@@ -304,7 +306,8 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         if let Some((converted, source)) = converted_before(gl, engine, sources, &names) {
             // Converted before its fragment shader read the scene's maps layered: converted again.
             let layered = gl.uniforms(engine).iter().any(|u| u.name.starts_with(convert::LAYERED_PREFIX));
-            let wanted = LAYERED_SCREEN && converted.reads_screen && convert::layered_fragment(&sources[source].fragment).is_some();
+            let fragment = &sources[source].fragment;
+            let wanted = layered_maps(fragment, fragment).is_some();
             if layered == wanted {
                 already.push(converted);
             } else if let Some(job) = job(gl, engine, &gl.uniforms(engine), source, &sources[source]) {
@@ -359,7 +362,7 @@ fn job(gl: &Gl, engine: u32, uniforms: &[ActiveUniform], source: usize, program:
     let located = |u: &convert::Uniform| uniforms.iter().find(|a| a.name == u.name).and_then(|a| a.locations.first().copied()).filter(|&l| l >= 0);
     let vertex = convert::with_locations(&vertex, &located);
     let plain = convert::with_locations(fragment_source, &located);
-    let layered = (LAYERED_SCREEN && convert::reads_screen(&program.fragment)).then(|| convert::layered_fragment(fragment_source)).flatten();
+    let layered = layered_maps(&program.fragment, fragment_source);
     // SAFETY: plain queries with NUL-terminated names.
     let outputs = outputs(program, |name| u32::try_from(unsafe { (gl.get_frag_data_location)(engine, gl_api::c_name(name).as_ptr()) }).ok());
     let attributes = gl.attributes(engine);
@@ -394,7 +397,7 @@ fn converted_before(gl: &Gl, engine: u32, sources: &[Renderprog], names: &[Vec<S
     let (rows, index) = (0..sources.len()).filter(|&i| names[i] == own).find_map(|i| Some((convert::position_rows(&sources[i].vertex)?, i)))?;
     let source = &sources[index];
     let rows = locations(gl, engine, &rows.map(|r| format!("_va_[{r}]")).iter().map(String::as_str).collect::<Vec<_>>(), 0)?;
-    let maps = convert::layered_fragment(&source.fragment).filter(|_| LAYERED_SCREEN).map(|l| l.maps).unwrap_or_default();
+    let maps = layered_maps(&source.fragment, &source.fragment).map(|l| l.maps).unwrap_or_default();
     let converted = Converted {
         program: engine,
         rows: rows.try_into().ok()?,
@@ -405,6 +408,18 @@ fn converted_before(gl: &Gl, engine: u32, sources: &[Renderprog], names: &[Vec<S
         unproject: unproject(gl, engine, source),
     };
     Some((converted, index))
+}
+
+/// A fragment shader reading maps at the layer it draws into: the scene's maps with the other
+/// eye's rows ([`convert::layered_fragment`], with [`LAYERED_SCREEN`]); otherwise the maps each
+/// eye draws its own of ([`convert::eye_maps_fragment`]), its rows the same for both eyes. Made
+/// from `source` (the render program's fragment shader, or a version of it lit per eye).
+fn layered_maps(engine: &str, source: &str) -> Option<convert::LayeredFragment> {
+    if convert::reads_screen(engine) {
+        LAYERED_SCREEN.then(|| convert::layered_fragment(source)).flatten()
+    } else {
+        convert::eye_maps_fragment(source)
+    }
 }
 
 /// The layered maps' array samplers given units of their own (the last ones, which the engine's
@@ -420,12 +435,13 @@ fn screen(gl: &Gl, program: u32, maps: &[String]) -> Option<&'static Screen> {
         let first = *uniform.locations.first()?;
         uniform.locations.iter().enumerate().all(|(i, &l)| l == first + i as i32).then_some((first, uniform.locations.len()))
     };
-    let vertex_rows = in_a_row("_va_")?;
-    let fragment_rows = in_a_row(convert::FRAGMENT_ROWS)?;
-    let (right_rows, count) = in_a_row(convert::RIGHT_ROWS)?;
-    if count != fragment_rows.1 {
+    // Without the other eye's rows (maps of each eye's own), no rows are learnt or given.
+    let right = in_a_row(convert::RIGHT_ROWS);
+    let (vertex_rows, fragment_rows) = if right.is_some() { (in_a_row("_va_")?, in_a_row(convert::FRAGMENT_ROWS)?) } else { ((0, 0), (0, 0)) };
+    if right.is_some_and(|(_, count)| count != fragment_rows.1) {
         return None;
     }
+    let right_rows = right.map(|(first, _)| first);
     let mut most = 0;
     // SAFETY: a state query into a local (GL_MAX_TEXTURE_IMAGE_UNITS).
     unsafe { windows::Win32::Graphics::OpenGL::glGetIntegerv(0x8872, &mut most) };

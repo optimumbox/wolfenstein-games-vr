@@ -174,6 +174,11 @@ struct Counts {
     misfit_draws: u64,
     /// Draws of programs reading the scene's maps made for both eyes.
     screen_shared: u64,
+    /// The left eye's carried draws of programs reading maps of each eye's own (the self-shadow),
+    /// the right eye's copy given the maps' arrays; and those whose map was no eye texture (the
+    /// copy reading whatever array its unit last had).
+    eye_maps: u64,
+    eye_maps_missing: u64,
     /// The engine's copies between textures (`glCopyImageSubData`) of an eye texture, made from or
     /// into the pass's layer.
     copies_layered: u64,
@@ -860,6 +865,7 @@ pub fn frame(on: bool) {
         });
         let (shared, own) = state.screen.counts();
         log!("single pass: programs reading the scene's maps: {shared} drawn for both eyes, {own} by each eye, the rest being learnt");
+        log!("single pass: carried draws reading maps of each eye's own (the self-shadow), the right eye's copy reading the right eye's: {} ({} whose map was no eye texture)", c.eye_maps, c.eye_maps_missing);
         log!("single pass: the right eye's stretch draws each eye draws itself, per frame by program: {}", {
             let mut by: Vec<_> = state.own_by.iter().map(|(p, n)| (*n, state.programs.get(p).map_or("?", |p| p.converted.name), *p)).collect();
             by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
@@ -1391,6 +1397,14 @@ fn screen_draw(state: &mut State, current: u32, screen: &Screen, rows: &Rows, ch
     if !shared {
         return None;
     }
+    map_arrays(state, current, screen, checking)
+}
+
+/// The arrays standing in for the textures a layered program's maps read (its units, ours), none
+/// when one is no eye texture.
+fn map_arrays(state: &mut State, current: u32, screen: &Screen, checking: bool) -> Option<Vec<(u32, u32)>> {
+    let gl = state.gl.as_ref()?;
+    let program = state.programs.get_mut(&current)?;
     if program.map_units.len() != screen.maps.len() || checking {
         program.map_units = screen
             .maps
@@ -1419,10 +1433,11 @@ fn give_right_eye(gl: &Gl, program: &mut Program, learner: &Learner, map_arrays:
         }
     }
     let (Some(screen), Some((carried, k))) = (program.converted.screen, learner.shared(program.converted.program)) else { return };
+    let Some(right_rows) = screen.right_rows else { return };
     let right: Vec<Row> = program.fragment.iter().zip(carried).map(|(row, &carried)| if carried { screen::carry(row, k) } else { *row }).collect();
     if right != program.right_given {
         // SAFETY: a plain GL call on the engine's program, with as many vec4s as its right rows.
-        unsafe { (gl.program_uniform_4fv)(program.converted.program, screen.right_rows, right.len() as i32, right.as_ptr().cast()) };
+        unsafe { (gl.program_uniform_4fv)(program.converted.program, right_rows, right.len() as i32, right.as_ptr().cast()) };
         program.right_given = right;
     }
 }
@@ -1652,7 +1667,13 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
     }
     let checking = state.live_frames % CHECK_EVERY == 0;
     let screen = state.programs.get(&current).and_then(|p| p.converted.screen);
-    let screen_arrays = screen.filter(|_| stretch).and_then(|screen| screen_draw(state, current, screen, &rows, checking));
+    // Maps of each eye's own (no other eye's rows): their arrays given to the left eye's draws.
+    let eye_maps = screen.filter(|s| stretch && s.right_rows.is_none());
+    let screen_arrays = match eye_maps {
+        Some(screen) if state.pass == 1 => map_arrays(state, current, screen, checking),
+        Some(_) => None,
+        None => screen.filter(|_| stretch).and_then(|screen| screen_draw(state, current, screen, &rows, checking)),
+    };
     let Some(gl) = state.gl.as_ref() else { return true };
     let misfit = stretch && (state.misfits.misfits.contains(&current) || state.programs.get(&current).is_some_and(|p| p.converted.reads_screen) && screen_arrays.is_none());
     let own_projection = misfit || stretch && state.world_depth.zip(ratio).is_some_and(|(world, ratio)| (ratio - world).abs() > 1e-3 * world.abs().max(1e-6));
@@ -1708,7 +1729,13 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
             }
             if let Some(arrays) = &screen_arrays {
                 give_right_eye(gl, program, &state.screen, &mut state.map_arrays, arrays);
-                state.counts.screen_shared += 1;
+                if eye_maps.is_some() {
+                    state.counts.eye_maps += 1;
+                } else {
+                    state.counts.screen_shared += 1;
+                }
+            } else if eye_maps.is_some() {
+                state.counts.eye_maps_missing += 1;
             }
             set_switch(gl, program, true);
             if scissor_clips(state) {

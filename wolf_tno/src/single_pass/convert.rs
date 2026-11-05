@@ -338,6 +338,22 @@ fn screen_map(name: &str) -> bool {
     name.starts_with("samp_view") || name.starts_with("samp_targetdepth")
 }
 
+/// The maps each eye's pass draws its own of, read at the pixel by programs whose rows are the
+/// same for both eyes: the characters' self-shadow (`selfshadowsample` draws it at each pixel of
+/// the eye, the characters' and the world's programs read it at theirs). The other eye's copy
+/// reading the first eye's map at its own pixels shades it with shadows from other places.
+fn eye_map(name: &str) -> bool {
+    name == "samp_selfshadowmap"
+}
+
+/// A fragment shader reading maps of each eye's own ([`eye_map`]) made to read them at the layer
+/// its fragment is drawn into, its rows left as they are (the same for both eyes): as
+/// [`layered_fragment`] without the other eye's rows. None when it reads none, or reads one
+/// other than through a helper.
+pub fn eye_maps_fragment(fragment: &str) -> Option<LayeredFragment> {
+    layered(fragment, eye_map, false)
+}
+
 /// A fragment shader reading the scene's 2D maps ([`reads_screen`]) made to read them at the
 /// layer its fragment is drawn into, for the copy of the other eye: each map is also declared as a
 /// `sampler2DArray` (to be given the stand-in's array), each helper taking a `sampler2D` gets an
@@ -348,8 +364,14 @@ fn screen_map(name: &str) -> bool {
 /// None when a map is used other than as a helper's first argument, or a helper given one
 /// samples it some other way.
 pub fn layered_fragment(fragment: &str) -> Option<LayeredFragment> {
+    layered(fragment, screen_map, true)
+}
+
+/// `fragment` made to read the maps `is_map` names at the layer it draws into, and with `rows`
+/// its rows from [`RIGHT_ROWS`] in layer 1.
+fn layered(fragment: &str, is_map: fn(&str) -> bool, rows: bool) -> Option<LayeredFragment> {
     let declared = uniforms(fragment);
-    let maps: Vec<String> = declared.iter().filter(|(_, u)| u.kind == "sampler2D" && u.count == 1 && screen_map(&u.name)).map(|(_, u)| u.name.clone()).collect();
+    let maps: Vec<String> = declared.iter().filter(|(_, u)| u.kind == "sampler2D" && u.count == 1 && is_map(&u.name)).map(|(_, u)| u.name.clone()).collect();
     if maps.is_empty() {
         return None;
     }
@@ -385,7 +407,7 @@ pub fn layered_fragment(fragment: &str) -> Option<LayeredFragment> {
         out.replace_range(start..=close, &text);
     }
     // The rows: the other eye's in layer 1.
-    let rows = declared.iter().find(|(_, u)| u.kind == "vec4" && u.name == FRAGMENT_ROWS).map_or(0, |(_, u)| u.count);
+    let rows = if rows { declared.iter().find(|(_, u)| u.kind == "vec4" && u.name == FRAGMENT_ROWS).map_or(0, |(_, u)| u.count) } else { 0 };
     if rows > 0 {
         let mut renamed = String::with_capacity(out.len() + 64);
         let mut from = 0;
