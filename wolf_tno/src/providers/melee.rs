@@ -120,6 +120,66 @@ pub(crate) fn let_go_of_trigger(pad: &mut Gamepad) {
     if SWINGS_ATTACK.load(Relaxed) {
         pad.right_trigger = 0;
     }
+    note_press(pad);
+}
+
+/// The melee button (the right stick's click) and the right trigger as the game gets them.
+const MELEE_BUTTON: u16 = 0x0080;
+static PAD_HELD: AtomicU64 = AtomicU64::new(0);
+/// Presses logged, and the view build of the last (watched for the quick melee after it).
+static PRESSES: AtomicU64 = AtomicU64::new(0);
+static PRESS_BUILD: AtomicU64 = AtomicU64::new(u64::MAX);
+static PRESS_SWUNG: AtomicBool = AtomicBool::new(false);
+static LAST_HANDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const PRESS_LOG_MOST: u64 = 30;
+
+/// A press of the melee button or the right trigger: what the hands and the view are doing as the
+/// game gets it (a takedown's prompt answered or not).
+fn note_press(pad: &Gamepad) {
+    let now = (pad.buttons & MELEE_BUTTON != 0) as u64 | ((pad.right_trigger > 128) as u64) << 1;
+    let before = PAD_HELD.swap(now, Relaxed);
+    let pressed = now & !before;
+    if pressed == 0 || PRESSES.fetch_add(1, Relaxed) >= PRESS_LOG_MOST {
+        return;
+    }
+    let hands = LAST_HANDS.load(Relaxed);
+    let (quick, right) = match SETUP.get().filter(|_| hands != 0) {
+        Some(setup) => (quick_melee(setup, hands), held_item::right_decl(setup.layout, hands).and_then(held_item::decl_name)),
+        None => (false, None),
+    };
+    PRESS_BUILD.store(crate::providers::eye_site::builds(), Relaxed);
+    PRESS_SWUNG.store(false, Relaxed);
+    log!(
+        "melee press: {} handed to the game; left hand's own item {:?}, right hand {:?}; swings attack {}, quick melee under way {quick}; another camera {}, a grab {}; the game's melee starts passed {}, held back {}",
+        match pressed { 1 => "the melee button", 2 => "the right trigger", _ => "the melee button and the right trigger" },
+        held_item::dual().then(held_item::left_item_name).flatten(),
+        right,
+        SWINGS_ATTACK.load(Relaxed),
+        crate::providers::camera_taken::controlled(),
+        crate::providers::camera_taken::grabbed(),
+        PASSED[0].load(Relaxed),
+        HELD_BACK[0].load(Relaxed)
+    );
+}
+
+/// The game's own starts and ends of the trace let through.
+static PASSED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static EVENTS_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+/// After a press (for 90 view builds): whether the game's quick melee began.
+fn watch_press(setup: &Setup, hands: usize) {
+    LAST_HANDS.store(hands, Relaxed);
+    let at = PRESS_BUILD.load(Relaxed);
+    if at == u64::MAX {
+        return;
+    }
+    let since = crate::providers::eye_site::builds().saturating_sub(at);
+    if quick_melee(setup, hands) && !PRESS_SWUNG.swap(true, Relaxed) {
+        log!("melee press: the game's quick melee began {since} view builds after it");
+    }
+    if since >= 90 && PRESS_BUILD.compare_exchange(at, u64::MAX, Relaxed, Relaxed).is_ok() && !PRESS_SWUNG.load(Relaxed) {
+        log!("melee press: no quick melee in the 90 view builds after it (another camera {}, starts passed {}, held back {})", crate::providers::camera_taken::controlled(), PASSED[0].load(Relaxed), HELD_BACK[0].load(Relaxed));
+    }
 }
 
 /// Whether the hooks are in, the last of them too (the melee probe then leaves the animation
@@ -310,6 +370,7 @@ fn swept(setup: &Setup, hands: usize) -> bool {
 unsafe extern "system" fn update(hands: usize) {
     let flight = InFlight::enter();
     if let Some(setup) = SETUP.get() {
+        watch_press(setup, hands);
         if !crate::on(crate::MELEE_AT) {
             shut(setup, hands + setup.melee.trace);
         } else if swept(setup, hands) {
@@ -330,10 +391,16 @@ fn held_back(hands: usize, ends: bool) -> bool {
 
 fn event(original: &Original<AnimEventFn>, ends: bool, hands: usize, args: [usize; 5]) -> usize {
     let flight = InFlight::enter();
-    if held_back(hands, ends) {
+    let back = held_back(hands, ends);
+    if EVENTS_LOGGED.fetch_add(1, Relaxed) < 40 {
+        let which = if std::ptr::eq(original, &START_JOINT_ORIGINAL) { "start (joint)" } else if std::ptr::eq(original, &START_TAG_ORIGINAL) { "start (tag)" } else if std::ptr::eq(original, &START_SIMPLE_ORIGINAL) { "start (eye)" } else { "end" };
+        log!("melee: the game's own trace {which} {}; another camera {}, left hand's own item {}", if back { "held back" } else { "let through" }, crate::providers::camera_taken::controlled(), held_item::dual());
+    }
+    if back {
         HELD_BACK[ends as usize].fetch_add(1, Relaxed);
         return 0;
     }
+    PASSED[ends as usize].fetch_add(1, Relaxed);
     // SAFETY: forwards the game's own call.
     unsafe { original.get(&flight)(hands, args[0], args[1], args[2], args[3], args[4]) }
 }
