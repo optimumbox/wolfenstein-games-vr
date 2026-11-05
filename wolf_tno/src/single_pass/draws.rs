@@ -149,20 +149,52 @@ struct Counts {
     right_only: u64,
     /// Frames whose matrix came from pairing the passes' draws by the last matrix.
     rematched: u64,
+    /// The right eye's stretch draws found among the left eye's by shape alone ([`Carried`]).
+    by_shape: u64,
 }
 
 /// The left eye's stretch draws of a frame made for both eyes, by program and geometry (a key of
 /// the draw call's arguments: the same mesh drawn by both passes makes the same call), with their
 /// rows carried into the right eye.
+///
+/// A mesh streamed each pass (skinned characters' decals, among them) lands at another offset of
+/// the engine's buffers in each pass: its call differs only there. So each is kept by its shape
+/// too (the call and its counts, not its offsets), and a right eye's draw not found by geometry is
+/// looked for by shape, each of the left eye's draws standing for one such.
 #[derive(Default)]
 struct Carried {
     by: HashMap<(u32, u64), Vec<Rows>>,
+    by_shape: HashMap<(u32, u64), Vec<Rows>>,
+}
+
+/// How a right eye's draw was found among the left eye's carried draws.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Found {
+    Geometry,
+    Shape,
 }
 
 impl Carried {
-    /// Whether the right eye's draw of `program` with `geometry` and `rows` is one of them.
-    fn has(&self, program: u32, geometry: u64, rows: &Rows) -> bool {
-        self.by.get(&(program, geometry)).is_some_and(|carried| carried.iter().any(|c| eye_matrix::apart(c, rows) <= eye_matrix::AGREES * 10.0))
+    fn keep(&mut self, program: u32, geometry: u64, shape: u64, carried: Rows) {
+        self.by.entry((program, geometry)).or_default().push(carried);
+        self.by_shape.entry((program, shape)).or_default().push(carried);
+    }
+
+    /// Whether the right eye's draw of `program` with `geometry`, `shape` and `rows` is one of them.
+    fn find(&mut self, program: u32, geometry: u64, shape: u64, rows: &Rows) -> Option<Found> {
+        let agrees = |c: &Rows| eye_matrix::apart(c, rows) <= eye_matrix::AGREES * 10.0;
+        if self.by.get(&(program, geometry)).is_some_and(|carried| carried.iter().any(agrees)) {
+            return Some(Found::Geometry);
+        }
+        let shaped = self.by_shape.get_mut(&(program, shape))?;
+        let at = shaped.iter().position(agrees)?;
+        shaped.swap_remove(at);
+        Some(Found::Shape)
+    }
+
+    fn clear(&mut self) {
+        self.by.clear();
+        self.by_shape.clear();
     }
 }
 
@@ -339,6 +371,8 @@ struct State {
     carried: Carried,
     /// The right eye's stretch draws the left eye's did not make, by program.
     right_only_by: HashMap<u32, u64>,
+    /// The right eye's stretch draws found by shape alone, by program.
+    by_shape_by: HashMap<u32, u64>,
     /// The last matrix measured, to pair the passes' draws by when their order does not.
     last_matrix: Option<Rows>,
     misfits: Misfits,
@@ -393,6 +427,7 @@ fn state() -> State {
         query_cursor: 0,
         carried: Carried::default(),
         right_only_by: HashMap::new(),
+        by_shape_by: HashMap::new(),
         last_matrix: None,
         misfits: Misfits::default(),
         screen: Learner::default(),
@@ -552,7 +587,7 @@ pub fn frame(on: bool) {
     state.misfits.left.clear();
     state.left_queries.clear();
     state.query_cursor = 0;
-    state.carried.by.clear();
+    state.carried.clear();
     SHARING.store(false, Relaxed);
     state.world_depth = median(&mut state.depth_ratios);
     state.depth_ratios.clear();
@@ -627,6 +662,11 @@ pub fn frame(on: bool) {
             by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
             by.iter().take(12).map(|(n, name, p)| format!("{name} ({p}) {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
         }, c.rematched);
+        log!("single pass: the right eye's stretch draws found among the left eye's by shape alone (streamed at another offset), skipped: {} ({:.1} a frame; by program: {})", c.by_shape, c.by_shape as f64 / frames, {
+            let mut by: Vec<_> = state.by_shape_by.iter().map(|(p, n)| (*n, state.programs.get(p).map_or("?", |p| p.converted.name), *p)).collect();
+            by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            by.iter().take(12).map(|(n, name, p)| format!("{name} ({p}) {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
+        });
         let (shared, own) = state.screen.counts();
         log!("single pass: programs reading the scene's maps: {shared} drawn for both eyes, {own} by each eye, the rest being learnt");
         log!("single pass: the right eye's stretch draws each eye draws itself, per frame by program: {}", {
@@ -1120,8 +1160,8 @@ fn give_right_eye(gl: &Gl, program: &mut Program, learner: &Learner, map_arrays:
 
 /// Whether the draw about to be made goes ahead (one of the right eye's pass already drawn is
 /// skipped).
-fn draw(geometry: u64) -> bool {
-    let goes_ahead = draw_locked(geometry);
+fn draw(geometry: u64, shape: u64) -> bool {
+    let goes_ahead = draw_locked(geometry, shape);
     match PENDING.load(Relaxed) {
         // A query of the right eye answered by the left eye's: nothing in it is drawn.
         PENDING_SHARED => false,
@@ -1142,14 +1182,14 @@ fn left_query(left: &[(u32, Rows)], cursor: &mut usize, matrix: &Rows, rows: &Ro
     Some(left[at].0)
 }
 
-fn draw_locked(geometry: u64) -> bool {
+fn draw_locked(geometry: u64, shape: u64) -> bool {
     let mut guard = STATE.locked();
     let Some(state) = guard.as_mut() else { return true };
     if !state.live {
         return true;
     }
     if !PROFILING {
-        return draw_in(state, geometry);
+        return draw_in(state, geometry, shape);
     }
     let started = Instant::now();
     if matches!(state.profile.part, 2 | 4) {
@@ -1161,7 +1201,7 @@ fn draw_locked(geometry: u64) -> bool {
             entry.1 += 1;
         }
     }
-    let goes_ahead = draw_in(state, geometry);
+    let goes_ahead = draw_in(state, geometry, shape);
     state.profile.draws[state.profile.part] += 1;
     let now = Instant::now();
     state.profile.ours += now - started;
@@ -1169,7 +1209,7 @@ fn draw_locked(geometry: u64) -> bool {
     goes_ahead
 }
 
-fn draw_in(state: &mut State, geometry: u64) -> bool {
+fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
     state.counts.draws += 1;
     let current = state.current;
     let rows = state.programs.get(&current).map(|p| p.rows);
@@ -1258,7 +1298,7 @@ fn draw_in(state: &mut State, geometry: u64) -> bool {
             }
             set_switch(gl, program, true);
             state.counts.stereo += 1;
-            state.carried.by.entry((current, geometry)).or_default().push(eye_matrix::carry(&matrix, &rows));
+            state.carried.keep(current, geometry, shape, eye_matrix::carry(&matrix, &rows));
             let query = ACTIVE_QUERY_ID.load(Relaxed);
             if query != 0 && state.left_queries.last().is_none_or(|(id, _)| *id != query) {
                 state.left_queries.push((query, rows));
@@ -1291,10 +1331,14 @@ fn draw_in(state: &mut State, geometry: u64) -> bool {
                 return true;
             }
             if state.matrix.is_some() {
-                let found = state.carried.has(current, geometry, &rows);
+                let found = state.carried.find(current, geometry, shape, &rows);
                 let name = state.programs.get(&current).map_or("?", |p| p.converted.name);
-                state.misfits.carried(current, name, found);
-                if found {
+                state.misfits.carried(current, name, found.is_some());
+                if found == Some(Found::Shape) {
+                    state.counts.by_shape += 1;
+                    *state.by_shape_by.entry(current).or_default() += 1;
+                }
+                if found.is_some() {
                     state.counts.skipped += 1;
                     return false;
                 }
@@ -1936,13 +1980,17 @@ unsafe extern "system" fn bind_textures(first: u32, count: i32, textures: *const
 }
 
 macro_rules! draw_detour {
-    ($name:ident, $original:ident, $type:ty, ($($arg:ident: $ty:ty),*)) => {
+    ($name:ident, $original:ident, $type:ty, ($($arg:ident: $ty:ty),*), [$($counted:ident),*]) => {
         unsafe extern "system" fn $name($($arg: $ty),*) {
             let flight = InFlight::enter();
-            // The draw's geometry: its call and arguments, the same for a mesh in both passes.
-            let mut geometry = stringify!($name).bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
+            // The draw's geometry: its call and arguments, the same for a mesh in both passes; and
+            // its shape: the call and its counts, the same for a mesh streamed each pass.
+            let call = stringify!($name).bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
+            let mut geometry = call;
             $(geometry = (geometry ^ $arg as usize as u64).wrapping_mul(0x0000_0100_0000_01b3);)*
-            if draw(geometry) {
+            let mut shape = call;
+            $(shape = (shape ^ $counted as usize as u64).wrapping_mul(0x0000_0100_0000_01b3);)*
+            if draw(geometry, shape) {
                 // SAFETY: forwards the game's own call.
                 unsafe { $original.get(&flight)($($arg),*) }
             }
@@ -1950,31 +1998,55 @@ macro_rules! draw_detour {
     };
 }
 
-draw_detour!(draw_arrays, DRAW_ARRAYS, DrawArraysFn, (mode: u32, first: i32, count: i32));
-draw_detour!(draw_elements, DRAW_ELEMENTS, DrawElementsFn, (mode: u32, count: i32, kind: u32, indices: *const c_void));
-draw_detour!(draw_elements_base_vertex, DRAW_ELEMENTS_BASE_VERTEX, DrawElementsBaseVertexFn, (mode: u32, count: i32, kind: u32, indices: *const c_void, base: i32));
-draw_detour!(draw_range_elements, DRAW_RANGE_ELEMENTS, DrawRangeElementsFn, (mode: u32, start: u32, end: u32, count: i32, kind: u32, indices: *const c_void));
+draw_detour!(draw_arrays, DRAW_ARRAYS, DrawArraysFn, (mode: u32, first: i32, count: i32), [mode, count]);
+draw_detour!(draw_elements, DRAW_ELEMENTS, DrawElementsFn, (mode: u32, count: i32, kind: u32, indices: *const c_void), [mode, count, kind]);
+draw_detour!(draw_elements_base_vertex, DRAW_ELEMENTS_BASE_VERTEX, DrawElementsBaseVertexFn, (mode: u32, count: i32, kind: u32, indices: *const c_void, base: i32), [mode, count, kind]);
+draw_detour!(draw_range_elements, DRAW_RANGE_ELEMENTS, DrawRangeElementsFn, (mode: u32, start: u32, end: u32, count: i32, kind: u32, indices: *const c_void), [mode, count, kind]);
 draw_detour!(
     draw_range_elements_base_vertex,
     DRAW_RANGE_ELEMENTS_BASE_VERTEX,
     DrawRangeElementsBaseVertexFn,
-    (mode: u32, start: u32, end: u32, count: i32, kind: u32, indices: *const c_void, base: i32)
+    (mode: u32, start: u32, end: u32, count: i32, kind: u32, indices: *const c_void, base: i32), [mode, count, kind]
 );
-draw_detour!(draw_elements_instanced, DRAW_ELEMENTS_INSTANCED, DrawElementsInstancedFn, (mode: u32, count: i32, kind: u32, indices: *const c_void, instances: i32));
+draw_detour!(draw_elements_instanced, DRAW_ELEMENTS_INSTANCED, DrawElementsInstancedFn, (mode: u32, count: i32, kind: u32, indices: *const c_void, instances: i32), [mode, count, kind, instances]);
 draw_detour!(
     draw_elements_instanced_base_vertex,
     DRAW_ELEMENTS_INSTANCED_BASE_VERTEX,
     DrawElementsInstancedBaseVertexFn,
-    (mode: u32, count: i32, kind: u32, indices: *const c_void, instances: i32, base: i32)
+    (mode: u32, count: i32, kind: u32, indices: *const c_void, instances: i32, base: i32), [mode, count, kind, instances]
 );
-draw_detour!(draw_arrays_instanced, DRAW_ARRAYS_INSTANCED, DrawArraysInstancedFn, (mode: u32, first: i32, count: i32, instances: i32));
-draw_detour!(draw_elements_indirect, DRAW_ELEMENTS_INDIRECT, DrawElementsIndirectFn, (mode: u32, kind: u32, indirect: *const c_void));
-draw_detour!(multi_draw_elements_indirect, MULTI_DRAW_ELEMENTS_INDIRECT, MultiDrawElementsIndirectFn, (mode: u32, kind: u32, indirect: *const c_void, draws: i32, stride: i32));
-draw_detour!(draw_arrays_indirect, DRAW_ARRAYS_INDIRECT, DrawArraysIndirectFn, (mode: u32, indirect: *const c_void));
-draw_detour!(multi_draw_arrays_indirect, MULTI_DRAW_ARRAYS_INDIRECT, MultiDrawArraysIndirectFn, (mode: u32, indirect: *const c_void, draws: i32, stride: i32));
-draw_detour!(multi_draw_elements, MULTI_DRAW_ELEMENTS, MultiDrawElementsFn, (mode: u32, counts: *const i32, kind: u32, indices: *const *const c_void, draws: i32));
-draw_detour!(multi_draw_elements_base_vertex, MULTI_DRAW_ELEMENTS_BASE_VERTEX, MultiDrawElementsBaseVertexFn, (mode: u32, counts: *const i32, kind: u32, indices: *const *const c_void, draws: i32, bases: *const i32));
-draw_detour!(draw_elements_instanced_base_instance, DRAW_ELEMENTS_INSTANCED_BASE_INSTANCE, DrawElementsInstancedBaseInstanceFn, (mode: u32, count: i32, kind: u32, indices: *const c_void, instances: i32, first: u32));
-draw_detour!(draw_elements_instanced_base_vertex_base_instance, DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE, DrawElementsInstancedBaseVertexBaseInstanceFn, (mode: u32, count: i32, kind: u32, indices: *const c_void, instances: i32, base: i32, first: u32));
-draw_detour!(draw_arrays_instanced_base_instance, DRAW_ARRAYS_INSTANCED_BASE_INSTANCE, DrawArraysInstancedBaseInstanceFn, (mode: u32, first: i32, count: i32, instances: i32, base: u32));
-draw_detour!(multi_draw_elements_indirect_bindless, MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS, MultiDrawElementsIndirectBindlessFn, (mode: u32, kind: u32, indirect: *const c_void, draws: i32, stride: i32, buffers: i32));
+draw_detour!(draw_arrays_instanced, DRAW_ARRAYS_INSTANCED, DrawArraysInstancedFn, (mode: u32, first: i32, count: i32, instances: i32), [mode, count, instances]);
+draw_detour!(draw_elements_indirect, DRAW_ELEMENTS_INDIRECT, DrawElementsIndirectFn, (mode: u32, kind: u32, indirect: *const c_void), [mode, kind, indirect]);
+draw_detour!(multi_draw_elements_indirect, MULTI_DRAW_ELEMENTS_INDIRECT, MultiDrawElementsIndirectFn, (mode: u32, kind: u32, indirect: *const c_void, draws: i32, stride: i32), [mode, kind, indirect, draws, stride]);
+draw_detour!(draw_arrays_indirect, DRAW_ARRAYS_INDIRECT, DrawArraysIndirectFn, (mode: u32, indirect: *const c_void), [mode, indirect]);
+draw_detour!(multi_draw_arrays_indirect, MULTI_DRAW_ARRAYS_INDIRECT, MultiDrawArraysIndirectFn, (mode: u32, indirect: *const c_void, draws: i32, stride: i32), [mode, indirect, draws, stride]);
+draw_detour!(multi_draw_elements, MULTI_DRAW_ELEMENTS, MultiDrawElementsFn, (mode: u32, counts: *const i32, kind: u32, indices: *const *const c_void, draws: i32), [mode, counts, kind, indices, draws]);
+draw_detour!(multi_draw_elements_base_vertex, MULTI_DRAW_ELEMENTS_BASE_VERTEX, MultiDrawElementsBaseVertexFn, (mode: u32, counts: *const i32, kind: u32, indices: *const *const c_void, draws: i32, bases: *const i32), [mode, counts, kind, indices, draws, bases]);
+draw_detour!(draw_elements_instanced_base_instance, DRAW_ELEMENTS_INSTANCED_BASE_INSTANCE, DrawElementsInstancedBaseInstanceFn, (mode: u32, count: i32, kind: u32, indices: *const c_void, instances: i32, first: u32), [mode, count, kind, instances]);
+draw_detour!(draw_elements_instanced_base_vertex_base_instance, DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE, DrawElementsInstancedBaseVertexBaseInstanceFn, (mode: u32, count: i32, kind: u32, indices: *const c_void, instances: i32, base: i32, first: u32), [mode, count, kind, instances]);
+draw_detour!(draw_arrays_instanced_base_instance, DRAW_ARRAYS_INSTANCED_BASE_INSTANCE, DrawArraysInstancedBaseInstanceFn, (mode: u32, first: i32, count: i32, instances: i32, base: u32), [mode, count, instances]);
+draw_detour!(multi_draw_elements_indirect_bindless, MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS, MultiDrawElementsIndirectBindlessFn, (mode: u32, kind: u32, indirect: *const c_void, draws: i32, stride: i32, buffers: i32), [mode, kind, indirect, draws, stride, buffers]);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(x: f32) -> Rows {
+        [[1.0, 0.0, 0.0, x], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+    }
+
+    #[test]
+    fn a_mesh_streamed_at_another_offset_is_found_by_shape_once() {
+        let mut carried = Carried::default();
+        carried.keep(7, 100, 5, rows(0.2));
+        assert_eq!(carried.find(7, 100, 5, &rows(0.2)), Some(Found::Geometry));
+        carried.keep(7, 200, 9, rows(0.4));
+        // The same shape at another offset: found once, as the left eye's draw stands for one.
+        assert_eq!(carried.find(7, 201, 9, &rows(0.4)), Some(Found::Shape));
+        assert_eq!(carried.find(7, 202, 9, &rows(0.4)), None);
+        // Another place, or another program: not found.
+        carried.keep(7, 300, 11, rows(0.4));
+        assert_eq!(carried.find(7, 301, 11, &rows(0.9)), None);
+        assert_eq!(carried.find(8, 301, 11, &rows(0.4)), None);
+    }
+}
