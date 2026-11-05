@@ -31,6 +31,9 @@ use std::time::{Duration, Instant};
 
 /// A piece's expected GPU time before the game's commands are flushed.
 pub const BUDGET_NS: f64 = 500_000.0;
+/// Whether the GPU pieces are timed at all: off, as a timed frame (two thousand stamps written and
+/// read back) costs the render thread enough to drop refreshes. On for a run that needs them.
+const TIMING: bool = false;
 /// Whether the game's commands are flushed into pieces at all (else only timed).
 const SPLIT: bool = false;
 /// A draw expected to cost less than this is not flushed ahead of on its own (a flush between two
@@ -188,7 +191,7 @@ pub fn splits(piece: f64, cost: f64) -> bool {
 /// frame's are read, and the window's summary is logged when due, with `name` for converted
 /// programs.
 pub fn swap(publishing: bool, name: impl Fn(u32) -> Option<&'static str>) {
-    if !publishing {
+    if !TIMING || !publishing {
         ON.store(false, Relaxed);
         return;
     }
