@@ -22,6 +22,7 @@ use super::gl_api::{self, ActiveUniform, Gl};
 use monaka_producer::log;
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 /// A converted engine program, as the draw hooks use it.
@@ -260,6 +261,21 @@ fn uniform_names(uniforms: &[ActiveUniform]) -> Vec<String> {
     names
 }
 
+/// Each matched engine program's render program name, converted or not (for the logs).
+static NAMES: LazyLock<Mutex<HashMap<u32, &'static str>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn remember(engine: u32, name: &str) {
+    let Ok(mut names) = NAMES.lock() else { return };
+    if names.get(&engine).is_none_or(|known| *known != name) {
+        names.insert(engine, Box::leak(name.to_owned().into_boxed_str()));
+    }
+}
+
+/// The render program name of the engine program `engine`, if it was matched to one.
+pub fn engine_name(engine: u32) -> Option<&'static str> {
+    NAMES.lock().ok()?.get(&engine).copied()
+}
+
 /// The sources' assembly matched to the engine's programs, and a converted scratch program
 /// started for each engine program that can draw both eyes.
 fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: &mut Vec<Converted>) -> Stage {
@@ -303,6 +319,7 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         let Some(&source) = candidates.iter().find(|&&c| names[c] == own).or_else(|| (candidates.len() == 1).then(|| &candidates[0])) else { continue };
         matched += 1;
         let program = &sources[source];
+        remember(engine, &program.name);
         if let Some(fragment) = convert::without_blur_or_grain(&program.name, &program.fragment) {
             jobs.push(patch(gl, engine, &uniforms, source, program, &fragment));
             continue;

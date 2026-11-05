@@ -636,7 +636,8 @@ fn set_pair_depth(pair: Option<(u32, u32, u32)>) {
 
 /// A converted program's render program name, for the logs.
 pub fn program_name(program: u32) -> Option<&'static str> {
-    STATE.locked().as_ref()?.programs.get(&program).map(|p| p.converted.name)
+    let converted = STATE.locked().as_ref().and_then(|s| s.programs.get(&program).map(|p| p.converted.name));
+    converted.or_else(|| super::programs::engine_name(program))
 }
 
 pub fn frame(on: bool) {

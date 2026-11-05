@@ -47,6 +47,7 @@ const LEARN: f64 = 0.2;
 const SAMPLE: u64 = 16;
 
 const GL_TIMESTAMP: u32 = 0x8E28;
+const GL_VIEWPORT: u32 = 0x0BA2;
 const GL_QUERY_RESULT: u32 = 0x8866;
 const GL_QUERY_RESULT_AVAILABLE: u32 = 0x8867;
 
@@ -108,13 +109,15 @@ struct Window {
     longest: (f64, Option<Mark>),
     over_ms: u64,
     flushes: u64,
+    /// The viewport each program drew at (its first timed draw in the window).
+    sizes: HashMap<u32, (i32, i32)>,
     /// Swaps in the window (every frame, timed or not): the flushes' divisor.
     swaps: u64,
 }
 
 impl Window {
     fn new() -> Self {
-        Self { start: Instant::now(), frames: 0, by_mark: HashMap::new(), frame_ns: 0.0, longest: (0.0, None), over_ms: 0, flushes: 0, swaps: 0 }
+        Self { start: Instant::now(), frames: 0, by_mark: HashMap::new(), frame_ns: 0.0, longest: (0.0, None), over_ms: 0, flushes: 0, sizes: HashMap::new(), swaps: 0 }
     }
 }
 
@@ -137,7 +140,8 @@ pub fn before_draw() {
     if !ON.load(Relaxed) {
         return;
     }
-    let mark = Mark::Draw(PROGRAM.load(Relaxed));
+    let program = PROGRAM.load(Relaxed);
+    let mark = Mark::Draw(program);
     let Ok(mut held) = PIECES.lock() else { return };
     let Some(p) = held.as_mut() else { return };
     let cost = p.expected.get(&mark).copied().unwrap_or(0.0);
@@ -148,6 +152,12 @@ pub fn before_draw() {
         p.window.flushes += 1;
     }
     p.piece += cost;
+    if p.timing && !p.window.sizes.contains_key(&program) {
+        let mut viewport = [0i32; 4];
+        // SAFETY: four integers into a local, on the render thread with the game's context current.
+        unsafe { windows::Win32::Graphics::OpenGL::glGetIntegerv(GL_VIEWPORT, viewport.as_mut_ptr()) };
+        p.window.sizes.insert(program, (viewport[2], viewport[3]));
+    }
     p.stamp(mark);
 }
 
@@ -319,7 +329,13 @@ fn describe(w: &Window, name: &impl Fn(u32) -> Option<&'static str>) -> Option<S
     let top: Vec<String> = costly
         .iter()
         .take(8)
-        .map(|(mark, t)| format!("{} {:.2} ms a frame ({:.1} a frame, the longest {:.2})", label(**mark, name), ms(t.ns / frames), t.count as f64 / frames, ms(t.longest)))
+        .map(|(mark, t)| {
+            let size = match mark {
+                Mark::Draw(program) => w.sizes.get(program).map_or_else(String::new, |(x, y)| format!(" at {x}x{y}")),
+                _ => String::new(),
+            };
+            format!("{}{size} {:.2} ms a frame ({:.1} a frame, the longest {:.2})", label(**mark, name), ms(t.ns / frames), t.count as f64 / frames, ms(t.longest))
+        })
         .collect();
     let longest = w.longest.1.map_or_else(String::new, |m| format!(" after {}", label(m, name)));
     Some(format!(
@@ -377,11 +393,12 @@ mod tests {
         w.longest = (2_500_000.0, Some(Mark::Draw(7)));
         w.over_ms = 2;
         w.flushes = 10;
+        w.sizes.insert(7, (8192, 4096));
         w.swaps = 2;
         let line = describe(&w, &|p| (p == 7).then_some("landuniquebump")).unwrap();
         assert!(line.contains("9.00 ms a frame from swap to swap"), "{line}");
         assert!(line.contains("the longest 2.50 ms after landuniquebump (7)"), "{line}");
         assert!(line.contains("flushes added 5.0 a frame"), "{line}");
-        assert!(line.contains("the costliest: landuniquebump (7) 2.40 ms a frame"), "{line}");
+        assert!(line.contains("the costliest: landuniquebump (7) at 8192x4096 2.40 ms a frame"), "{line}");
     }
 }
