@@ -1,6 +1,14 @@
 use super::*;
 
 #[test]
+fn the_decals_unprojection_rows_are_found() {
+    let decal = "void main() {\n\tvec2 window = screenPosToTexcoord( gl_FragCoord.xy, _fa_[1 ] );\n\tvec4 wclip = vec4( window, viewZ, 1.0 );\n\tvec4 worldPos;\n\tworldPos.x = dot( wclip, _fa_[2 ] );\n\tworldPos.y = dot( wclip, _fa_[3 ] );\n\tworldPos.z = dot( wclip, _fa_[4 ] );\n\tworldPos.w = dot( wclip, _fa_[5 ] );\n}\n";
+    assert_eq!(unprojection_row(decal), Some(2));
+    assert_eq!(unprojection_row(&decal.replace("_fa_[4 ]", "_fa_[9 ]")), None);
+    assert_eq!(unprojection_row("void main() { out_FragColor0 = vec4( 1.0 ); }"), None);
+}
+
+#[test]
 fn depth_of_field_and_grain_are_left_out_of_the_post_process_only() {
     let post = "void main() {\n\tfloat dof;\n\t{\n\t\tdof = max(a, b);\n\t};\n\tfloat blur = 0.0;\n\t{\n\t\tgrain *= tempLum;\n\t\tfinal.xyz += grain;\n\t};\n}\n";
     let out = without_blur_or_grain("postprocess", post).expect("the post-process is known");

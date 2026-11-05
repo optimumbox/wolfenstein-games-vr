@@ -1,5 +1,28 @@
 use super::*;
 
+#[test]
+fn the_right_unprojection_takes_the_right_eyes_pixels_to_the_world() {
+    // Asymmetric eyes 0.064 apart, the world turned and moved off the origin.
+    let view = [[0.8, 0.0, -0.6, 3.0], [0.0, 1.0, 0.0, -2.0], [0.6, 0.0, 0.8, 5.0], [0.0, 0.0, 0.0, 1.0]];
+    let shift = |x: f64| [[1.0, 0.0, 0.0, -x], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+    let left = multiply(&frustum(-0.14, 0.09, -0.13, 0.095, 0.1, 1000.0), &multiply(&shift(-0.032), &view));
+    let right = multiply(&frustum(-0.09, 0.14, -0.13, 0.095, 0.1, 1000.0), &multiply(&shift(0.032), &view));
+    let e = multiply(&right, &invert(&left).unwrap());
+    // The engine's unprojection for the left eye: window to world.
+    let left_unprojection = invert(&multiply(&TO_WINDOW, &left)).unwrap();
+    let given = widen(&right_unprojection(&narrow(&e), &narrow(&left_unprojection)).unwrap());
+    for world in [[0.3, -0.2, -4.0, 1.0], [-2.0, 1.0, 7.0, 1.0], [10.0, 3.0, -20.0, 1.0]] {
+        // The point's window position and depth in the right eye.
+        let clip: Vec<f64> = (0..4).map(|i| (0..4).map(|k| right[i][k] * world[k]).sum()).collect();
+        let window = [clip[0] / clip[3] * 0.5 + 0.5, clip[1] / clip[3] * 0.5 + 0.5, clip[2] / clip[3] * 0.5 + 0.5, 1.0];
+        let back: Vec<f64> = (0..4).map(|i| (0..4).map(|k| given[i][k] * window[k]).sum()).collect();
+        for k in 0..3 {
+            let found = back[k] / back[3];
+            assert!((found - world[k]).abs() < 1e-2 * (1.0 + world[k].abs()), "{world:?}: {back:?}");
+        }
+    }
+}
+
 /// An off-centre perspective projection (GL convention) by rows.
 fn frustum(left: f64, right: f64, bottom: f64, top: f64, near: f64, far: f64) -> M {
     [

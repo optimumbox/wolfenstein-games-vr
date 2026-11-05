@@ -41,6 +41,7 @@ struct Layered {
     array: u32,
     views: [u32; 2],
     size: (i32, i32),
+    format: u32,
 }
 
 /// An engine framebuffer's stand-ins: all layers (when every attachment is an eye texture), and
@@ -54,6 +55,10 @@ pub struct Stand {
 pub struct Layers {
     textures: HashMap<u32, Layered>,
     framebuffers: HashMap<u32, Stand>,
+    /// The engine's scene depth (the eye texture at a depth attachment).
+    depth: Option<u32>,
+    /// A copy of a layer of the scene depth (a one-layer array, and its 2D view).
+    depth_copy: Option<(u32, u32)>,
 }
 
 /// An attachment of an engine framebuffer.
@@ -104,7 +109,7 @@ impl Layers {
     /// Stand-ins for the eye textures (`size`) attached to `seen` (the framebuffers the scene was
     /// drawn into), and for every framebuffer drawing into one of them.
     pub fn build(gl: &Gl, seen: &[u32], size: (i32, i32)) -> Result<Self, String> {
-        let mut layers = Self { textures: HashMap::new(), framebuffers: HashMap::new() };
+        let mut layers = Self { textures: HashMap::new(), framebuffers: HashMap::new(), depth: None, depth_copy: None };
         let made = layers.make(gl, seen, size);
         if made.is_err() {
             layers.release(gl);
@@ -118,6 +123,7 @@ impl Layers {
                 if attachment.kind != gl_api::GL_TEXTURE || attachment.level != 0 || self.textures.contains_key(&attachment.name) {
                     continue;
                 }
+                let depth = attachment.point == gl_api::GL_DEPTH_ATTACHMENT;
                 let texture = attachment.name;
                 let own = (level_parameter(gl, texture, gl_api::GL_TEXTURE_WIDTH), level_parameter(gl, texture, GL_TEXTURE_HEIGHT));
                 if own != size {
@@ -145,7 +151,10 @@ impl Layers {
                         }
                     }
                 }
-                self.textures.insert(texture, Layered { array, views, size });
+                self.textures.insert(texture, Layered { array, views, size, format });
+                if depth && self.depth.is_none() {
+                    self.depth = Some(texture);
+                }
             }
         }
         if self.textures.is_empty() {
@@ -236,10 +245,44 @@ impl Layers {
         }
     }
 
+    /// The scene depth's `layer` copied into a texture of ours sampled like the engine's `like`
+    /// (the depth the decals read): its 2D view; none without a layered scene depth.
+    pub fn depth_copy(&mut self, gl: &Gl, layer: usize, like: u32) -> Option<u32> {
+        let eye = self.textures.get(&self.depth?)?;
+        let (array, view) = match self.depth_copy {
+            Some(made) => made,
+            None => {
+                let (mut array, mut view) = (0, 0);
+                // SAFETY: new objects of ours, with storage like the scene depth's.
+                unsafe {
+                    (gl.create_textures)(GL_TEXTURE_2D_ARRAY, 1, &mut array);
+                    (gl.texture_storage_3d)(array, 1, eye.format, eye.size.0, eye.size.1, 1);
+                    (gl.gen_textures)(1, &mut view);
+                    (gl.texture_view)(view, GL_TEXTURE_2D, array, eye.format, 0, 1, 0, 1);
+                    for pname in SAMPLING {
+                        (gl.texture_parameter_i)(view, pname, texture_parameter(gl, like, pname));
+                    }
+                }
+                self.depth_copy = Some((array, view));
+                (array, view)
+            }
+        };
+        // SAFETY: a copy between two textures of the same format and size.
+        unsafe {
+            (gl.copy_image_sub_data)(eye.array, GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer as i32, array, GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, eye.size.0, eye.size.1, 1);
+        }
+        Some(view)
+    }
+
+    /// The copy of the scene depth's layer ([`Self::depth_copy`]), once made.
+    pub fn depth_copy_view(&self) -> Option<u32> {
+        self.depth_copy.map(|(_, view)| view)
+    }
+
     /// Every object of ours deleted.
     pub fn release(&mut self, gl: &Gl) {
         let framebuffers: Vec<u32> = self.framebuffers.values().flat_map(|s| s.layered.into_iter().chain(s.layer)).collect();
-        let textures: Vec<u32> = self.textures.values().flat_map(|t| std::iter::once(t.array).chain(t.views)).collect();
+        let textures: Vec<u32> = self.textures.values().flat_map(|t| std::iter::once(t.array).chain(t.views)).chain(self.depth_copy.take().into_iter().flat_map(|(a, v)| [v, a])).collect();
         // SAFETY: our own objects, unbound by the caller.
         unsafe {
             (gl.delete_framebuffers)(framebuffers.len() as i32, framebuffers.as_ptr());

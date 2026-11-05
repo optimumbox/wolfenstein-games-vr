@@ -38,6 +38,27 @@ pub struct Converted {
     pub name: &'static str,
     /// Its fragment shader reads the scene's maps layered ([`convert::layered_fragment`]).
     pub screen: Option<&'static Screen>,
+    /// Its fragment shader unprojects its pixel with four `_fa_` rows ([`convert::unprojection_row`]):
+    /// the first one's location, and the unit its scene depth (`samp_viewdepthmap`) is read from.
+    pub unproject: Option<(i32, Option<u32>)>,
+}
+
+/// [`Converted::unproject`] for `engine`, linked from `source`.
+fn unproject(gl: &Gl, engine: u32, source: &Renderprog) -> Option<(i32, Option<u32>)> {
+    let row = convert::unprojection_row(&source.fragment)?;
+    // SAFETY: plain queries with NUL-terminated names, into a local.
+    unsafe {
+        let at = (gl.get_uniform_location)(engine, gl_api::c_name(&format!("_fa_[{row}]")).as_ptr());
+        if at < 0 {
+            return None;
+        }
+        let sampler = (gl.get_uniform_location)(engine, gl_api::c_name("samp_viewdepthmap").as_ptr());
+        let mut unit = -1;
+        if sampler >= 0 {
+            (gl.get_uniform_iv)(engine, sampler, &mut unit);
+        }
+        Some((at, u32::try_from(unit).ok()))
+    }
 }
 
 /// A converted program whose fragment shader reads the scene's maps at the layer it draws into
@@ -364,6 +385,7 @@ fn converted_before(gl: &Gl, engine: u32, sources: &[Renderprog], names: &[Vec<S
         reads_screen: convert::reads_screen(&source.fragment),
         name: leak(&source.name),
         screen: screen(gl, engine, &maps),
+        unproject: unproject(gl, engine, source),
     };
     Some((converted, index))
 }
@@ -468,7 +490,7 @@ fn swap(gl: &Gl, job: &Job, source: &Renderprog) -> Result<Option<Converted>, St
     if rows.iter().chain(&stereo).any(|&l| l < 0) {
         return Err(put_back(format!("{} has no _va_ rows or stereo uniform", source.name)));
     }
-    Ok(Some(Converted { program: engine, rows, stereo, reads_screen: convert::reads_screen(&source.fragment), name: leak(&source.name), screen: screen(gl, engine, &job.maps) }))
+    Ok(Some(Converted { program: engine, rows, stereo, reads_screen: convert::reads_screen(&source.fragment), name: leak(&source.name), screen: screen(gl, engine, &job.maps), unproject: unproject(gl, engine, source) }))
 }
 
 fn restore(gl: &Gl, program: u32, uniforms: &[ActiveUniform], values: &[Option<Vec<gl_api::Values>>], blocks: &[u32]) {

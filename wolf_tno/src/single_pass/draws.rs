@@ -89,6 +89,8 @@ const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
 const GL_DRAW_FRAMEBUFFER: u32 = 0x8CA9;
 const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
 const GL_TEXTURE0: u32 = 0x84C0;
+const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_TEXTURE_BINDING_2D: u32 = 0x8069;
 const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
 const GL_DEPTH_BUFFER_BIT: u32 = 0x100;
 
@@ -106,11 +108,31 @@ struct Program {
     fragment: Vec<Row>,
     right_given: Vec<Row>,
     map_units: Vec<u32>,
+    /// For a program unprojecting its pixel ([`Converted::unproject`]): its rows as the engine
+    /// last uploaded them (each one seen), those of the left eye's pass, and whether the right
+    /// eye's stand in the program now.
+    unproject_engine: [Row; 4],
+    unproject_seen: [bool; 4],
+    unproject_left: Option<Rows>,
+    unproject_given: bool,
 }
 
 impl Program {
     fn new(converted: Converted) -> Self {
-        Self { converted, rows: [[0.0; 4]; 4], switch: false, matrix: 0, vertex: Vec::new(), fragment: Vec::new(), right_given: Vec::new(), map_units: Vec::new() }
+        Self {
+            converted,
+            rows: [[0.0; 4]; 4],
+            switch: false,
+            matrix: 0,
+            vertex: Vec::new(),
+            fragment: Vec::new(),
+            right_given: Vec::new(),
+            map_units: Vec::new(),
+            unproject_engine: [[0.0; 4]; 4],
+            unproject_seen: [false; 4],
+            unproject_left: None,
+            unproject_given: false,
+        }
     }
 }
 
@@ -155,6 +177,12 @@ struct Counts {
     /// The engine's copies between textures (`glCopyImageSubData`) of an eye texture, made from or
     /// into the pass's layer.
     copies_layered: u64,
+    /// The right eye's draws of an unprojecting program (the decals) given the right eye's rows,
+    /// and those left with the engine's (no eye matrix or left eye's rows yet).
+    unprojected: u64,
+    unprojected_not: u64,
+    /// Passes whose scene depth the decals read was a copy of the pass's own layer.
+    depth_copies: u64,
     /// The left eye's carried draws made with the scissor test off, their scissor smaller than the
     /// viewport.
     scissor_opened: u64,
@@ -416,6 +444,10 @@ struct State {
     draw_framebuffer: u32,
     read_framebuffer: u32,
     units: HashMap<u32, (u32, u32)>,
+    /// The units given the right eye's scene depth in its pass, with the engine's texture there
+    /// (bound again after the pass), and whether this frame's copy was made.
+    depth_units: HashMap<u32, u32>,
+    depth_copied: bool,
     layers: Option<Layers>,
     /// The stand-ins could not be made (not tried again this run).
     layers_failed: bool,
@@ -497,6 +529,8 @@ fn state() -> State {
         draw_framebuffer: 0,
         read_framebuffer: 0,
         units: HashMap::new(),
+        depth_units: HashMap::new(),
+        depth_copied: false,
         layers: None,
         layers_failed: false,
         seen: HashSet::new(),
@@ -653,6 +687,7 @@ pub fn frame(on: bool) {
         state.trace = Some(Trace { lines: Vec::new(), run: None, draws: 0, scene: 0, binds: Vec::new() });
     }
     let passes = state.pass;
+    depth_given_back(state);
     if let (Some(layers), Some(gl)) = (state.layers.as_ref(), state.gl.as_ref()) {
         layers.copy_back(gl, state.layer());
     }
@@ -804,7 +839,7 @@ pub fn frame(on: bool) {
             by.iter().take(24).map(|(n, name, p)| format!("{name} ({p}) {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
         });
         log!(
-            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch; {} of the right eye's writing neither colour nor depth, drawn; {} with their own depth projection, drawn by each eye (world's {:?}); {} of programs reading the scene's maps or not carried by the eye matrix ({} judged), drawn by each eye; {} of programs reading the scene's maps made for both eyes; {} carried with the scissor test off (their scissor smaller than the viewport); {} texture copies of an eye texture made from or into the pass's layer",
+            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch; {} of the right eye's writing neither colour nor depth, drawn; {} with their own depth projection, drawn by each eye (world's {:?}); {} of programs reading the scene's maps or not carried by the eye matrix ({} judged), drawn by each eye; {} of programs reading the scene's maps made for both eyes; {} carried with the scissor test off (their scissor smaller than the viewport); {} texture copies of an eye texture made from or into the pass's layer; {} right-eye decal draws given the right eye's unprojection ({} not), {} passes whose decals read the pass's own depth",
             c.draws,
             c.converted,
             c.perspective,
@@ -817,7 +852,10 @@ pub fn frame(on: bool) {
             state.misfits.misfits.len(),
             c.screen_shared,
             c.scissor_opened,
-            c.copies_layered
+            c.copies_layered,
+            c.unprojected,
+            c.unprojected_not,
+            c.depth_copies
         );
     }
 }
@@ -827,9 +865,17 @@ pub fn frame(on: bool) {
 fn stop(state: &mut State) {
     SHARING.store(false, Relaxed);
     forward_pending();
+    depth_given_back(state);
     if let Some(gl) = state.gl.as_ref() {
         for program in state.programs.values_mut() {
             set_switch(gl, program, false);
+            if let Some((at, _)) = program.converted.unproject
+                && program.unproject_given
+            {
+                // SAFETY: the engine's rows back into its own program.
+                unsafe { (gl.program_uniform_4fv)(program.converted.program, at, 4, program.unproject_engine.as_ptr().cast()) };
+                program.unproject_given = false;
+            }
         }
         if let Some(layers) = state.layers.as_ref() {
             layers.copy_back(gl, state.layer());
@@ -1192,7 +1238,28 @@ fn set_switch(gl: &Gl, program: &mut Program, on: bool) {
 
 /// Uniform rows uploaded to `program` from `location` on: the position rows among them kept.
 fn uploaded(state: &mut State, program: u32, location: i32, count: i32, values: *const f32) {
+    let pass = state.pass;
     let Some(program) = state.programs.get_mut(&program) else { return };
+    if let Some((at, _)) = program.converted.unproject
+        && !values.is_null()
+    {
+        let mut any = false;
+        for row in 0..4 {
+            let offset = at + row as i32 - location;
+            if offset >= 0 && offset < count {
+                // SAFETY: the engine's buffer holds `count` vec4s.
+                program.unproject_engine[row] = unsafe { *values.add(offset as usize * 4).cast::<Row>() };
+                program.unproject_seen[row] = true;
+                any = true;
+            }
+        }
+        if any {
+            program.unproject_given = false;
+            if pass <= 1 && program.unproject_seen.iter().all(|&s| s) {
+                program.unproject_left = Some(program.unproject_engine);
+            }
+        }
+    }
     for (row, &at) in program.converted.rows.iter().enumerate() {
         let offset = at - location;
         if offset >= 0 && offset < count && !values.is_null() {
@@ -1402,9 +1469,95 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
     goes_ahead
 }
 
+/// An unprojecting program's draw ([`Converted::unproject`], the decals). Its scene depth
+/// (`samp_viewdepthmap`, the engine's own view of its depth texture, which holds only the eye
+/// copied back at the last present) is made a copy of the pass's own layer, in both eyes; in the
+/// right eye's pass its rows are made the right eye's ([`eye_matrix::right_unprojection`], from
+/// the left eye's pass's and the eye matrix); in any other pass the engine's are given back.
+fn unprojecting_draw(state: &mut State, current: u32) {
+    let Some(program) = state.programs.get_mut(&current) else { return };
+    let Some((at, depth_unit)) = program.converted.unproject else { return };
+    let Some(gl) = state.gl.as_ref() else { return };
+    if state.pass != 2 || state.layers.is_none() {
+        if program.unproject_given {
+            // SAFETY: the engine's rows back into its own program.
+            unsafe { (gl.program_uniform_4fv)(current, at, 4, program.unproject_engine.as_ptr().cast()) };
+            program.unproject_given = false;
+        }
+    } else if !program.unproject_given {
+        match state.matrix.as_ref().zip(program.unproject_left.as_ref()).and_then(|(e, left)| eye_matrix::right_unprojection(e, left)) {
+            Some(right) => {
+                // SAFETY: four vec4 rows into the engine's program, at its own array's location.
+                unsafe { (gl.program_uniform_4fv)(current, at, 4, right.as_ptr().cast()) };
+                program.unproject_given = true;
+                state.counts.unprojected += 1;
+            }
+            None => state.counts.unprojected_not += 1,
+        }
+    } else {
+        state.counts.unprojected += 1;
+    }
+    if !(1..=2).contains(&state.pass) {
+        return;
+    }
+    let Some(unit) = depth_unit else { return };
+    let bound = bound_2d(unit);
+    let layer = state.layer();
+    let Some(layers) = state.layers.as_mut() else { return };
+    let copy_bound = bound != 0 && layers.depth_copy_view() == Some(bound);
+    if bound == 0 || (!copy_bound && layers.ours(bound).is_some()) {
+        return;
+    }
+    if !state.depth_copied {
+        if layers.depth_copy(gl, layer, bound).is_none() {
+            return;
+        }
+        state.depth_copied = true;
+        state.counts.depth_copies += 1;
+    }
+    if copy_bound {
+        return;
+    }
+    let Some(view) = layers.depth_copy_view() else { return };
+    state.depth_units.entry(unit).or_insert(bound);
+    // SAFETY: a plain bind of our copy to the program's own depth unit.
+    unsafe { (gl.bind_multi_texture)(GL_TEXTURE0 + unit, GL_TEXTURE_2D, view) };
+}
+
+/// The 2D texture bound to `unit` (`glGetIntegerIndexedvEXT`), 0 when it cannot be read.
+fn bound_2d(unit: u32) -> u32 {
+    type IndexedFn = unsafe extern "system" fn(u32, u32, *mut i32);
+    static INDEXED: std::sync::OnceLock<Option<IndexedFn>> = std::sync::OnceLock::new();
+    let indexed = INDEXED.get_or_init(|| {
+        // SAFETY: EXT_direct_state_access's query, with its signature.
+        gl_api::address("glGetIntegerIndexedvEXT").map(|a| unsafe { std::mem::transmute::<usize, IndexedFn>(a) })
+    });
+    let mut texture = 0;
+    if let Some(indexed) = indexed {
+        // SAFETY: a state query into a local.
+        unsafe { indexed(GL_TEXTURE_BINDING_2D, unit, &mut texture) };
+    }
+    u32::try_from(texture).unwrap_or(0)
+}
+
+/// The engine's textures bound again where the right eye's pass was given its depth's copy.
+fn depth_given_back(state: &mut State) {
+    let units: Vec<(u32, u32)> = state.depth_units.drain().collect();
+    state.depth_copied = false;
+    let Some(gl) = state.gl.as_ref() else { return };
+    let copy = state.layers.as_ref().and_then(Layers::depth_copy_view);
+    for (unit, texture) in units {
+        if copy.is_some() && copy == Some(bound_2d(unit)) {
+            // SAFETY: a plain bind of the engine's own texture back to its unit.
+            unsafe { (gl.bind_multi_texture)(GL_TEXTURE0 + unit, GL_TEXTURE_2D, texture) };
+        }
+    }
+}
+
 fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
     state.counts.draws += 1;
     let current = state.current;
+    unprojecting_draw(state, current);
     let rows = state.programs.get(&current).map(|p| p.rows);
     let perspective = rows.is_some_and(|rows| rows[3][..3].iter().any(|v| v.abs() > 1e-6));
     state.counts.converted += u64::from(rows.is_some());
@@ -2051,6 +2204,7 @@ fn clear_goes_ahead(mask: u32) -> bool {
     }
     if mask & (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT) == GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT {
         state.pass += 1;
+        state.depth_copied = false;
         PASS.store(state.pass.min(2) as u32, Relaxed);
         SHARING.store(state.pass == 2 && state.matrix.is_some() && !state.left_queries.is_empty(), Relaxed);
         state.cut = false;

@@ -634,6 +634,23 @@ pub fn without_blur_or_grain(name: &str, fragment: &str) -> Option<String> {
     Some(out)
 }
 
+/// The first of the four `_fa_` rows a fragment shader unprojects its pixel with (window position
+/// and the scene's depth to the world: `vec4 wclip = vec4( window, viewZ, 1.0 );` then
+/// `dot( wclip, _fa_[k ] )` for k to k + 3): the decals'. None for any other shader.
+pub fn unprojection_row(fragment: &str) -> Option<usize> {
+    let built = fragment.find(" = vec4( window, viewZ, 1.0 );")?;
+    let name = fragment[..built].rsplit("vec4 ").next()?.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let lead = format!("dot( {name}, _fa_[");
+    let rows: Vec<usize> = fragment.match_indices(&lead).filter_map(|(at, _)| fragment[at + lead.len()..].split(' ').next()?.parse().ok()).collect();
+    match rows.as_slice() {
+        [k, rest @ ..] if rest.len() == 3 && rest.iter().enumerate().all(|(i, &r)| r == k + i + 1) => Some(*k),
+        _ => None,
+    }
+}
+
 /// The names of the fragment shader's outputs (`out vec4 out_FragColor0;`).
 pub fn outputs(fragment: &str) -> Vec<String> {
     fragment

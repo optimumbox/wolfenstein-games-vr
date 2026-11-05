@@ -67,6 +67,23 @@ pub(super) fn invert(m: &M) -> Option<M> {
     Some(inverse)
 }
 
+/// Window coordinates (x, y and depth 0..1, GL's default depth range) from clip space: `T`.
+const TO_WINDOW: M = [[0.5, 0.0, 0.0, 0.5], [0.0, 0.5, 0.0, 0.5], [0.0, 0.0, 0.5, 0.5], [0.0, 0.0, 0.0, 1.0]];
+const FROM_WINDOW: M = [[2.0, 0.0, 0.0, -1.0], [0.0, 2.0, 0.0, -1.0], [0.0, 0.0, 2.0, -1.0], [0.0, 0.0, 0.0, 1.0]];
+
+/// The right eye's rows of a fragment shader's unprojection: `left` takes a left-eye pixel's
+/// window position and depth (`vec4( window, depth, 1.0 )`) to where it is in the world; the
+/// right eye's take a right-eye pixel there: `left · T · e⁻¹ · T⁻¹` (`e` the eye matrix, left
+/// clip to right clip). The engine gives the decals the left eye's in both passes, and the eyes'
+/// frusta differ (asymmetric): the same pixel of the right eye is another direction of the left,
+/// its point far off the decal's box, which then clips every pixel.
+pub fn right_unprojection(e: &Rows, left: &Rows) -> Option<Rows> {
+    let inverse = invert(&widen(e))?;
+    let m = multiply(&multiply(&multiply(&widen(left), &TO_WINDOW), &inverse), &FROM_WINDOW);
+    let out = m.map(|row| row.map(|v| v as f32));
+    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+}
+
 /// How far `e · left` is from `right`, relative to `right`'s size.
 pub fn misfit(e: &Rows, left: &Rows, right: &Rows) -> f64 {
     disagreement(&widen(e), left, right)
