@@ -407,6 +407,10 @@ pub struct Melee {
     /// `idHands::isInMeleeSwing` (bool): set only by the quick melee (the melee button), which
     /// draws the knife or the pipe for one attack and goes back to the gun.
     pub in_swing: usize,
+    /// `idHands::overTakedownTarget` (`takedownMode_t`, int: 0 unavailable, 1 stealth, 2 combat,
+    /// 3 stunned, 4 custom, 5 counter, 6 ground): the takedown the hands would do on the melee
+    /// button now; where mapped.
+    pub over_takedown: Option<usize>,
     /// `idPresentable::entity`: the player's game entity (the server core's attacker).
     pub player_entity: usize,
     /// `idDeclWeapon::pistolWhipProjectile`: the projectile decl a weapon's melee hit deals
@@ -628,6 +632,7 @@ pub static ROWS: [Build; 2] = unsafe { [
             ]),
             start_point: 0x9aecc0,
             in_swing: 0x262f,
+            over_takedown: Some(0x400),
             player_entity: 0x4c8,
             pistol_whip: 0x698,
             projectile_damage: 0x1c0,
@@ -839,6 +844,7 @@ pub static ROWS: [Build; 2] = unsafe { [
             ]),
             start_point: 0x9839f0,
             in_swing: 0x2681,
+            over_takedown: None,
             player_entity: 0x518,
             pistol_whip: 0x6f0,
             projectile_damage: 0x1c8,

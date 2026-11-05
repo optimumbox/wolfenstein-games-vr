@@ -147,10 +147,11 @@ fn note_press(pad: &Gamepad) {
         Some(setup) => (quick_melee(setup, hands), held_item::right_decl(setup.layout, hands).and_then(held_item::decl_name)),
         None => (false, None),
     };
+    let over = SETUP.get().filter(|_| hands != 0).and_then(|setup| over_takedown(setup, hands));
     PRESS_BUILD.store(crate::providers::eye_site::builds(), Relaxed);
     PRESS_SWUNG.store(false, Relaxed);
     log!(
-        "melee press: {} handed to the game; left hand's own item {:?}, right hand {:?}; swings attack {}, quick melee under way {quick}; another camera {}, a grab {}; the game's melee starts passed {}, held back {}; the head {:.1} units off the game camera",
+        "melee press: {} handed to the game; left hand's own item {:?}, right hand {:?}; swings attack {}, quick melee under way {quick}; another camera {}, a grab {}; the game's melee starts passed {}, held back {}; the head {:.1} units off the game camera; the hands' takedown {over:?}",
         match pressed { 1 => "the melee button", 2 => "the right trigger", _ => "the melee button and the right trigger" },
         held_item::dual().then(held_item::left_item_name).flatten(),
         right,
@@ -167,9 +168,30 @@ fn note_press(pad: &Gamepad) {
 static PASSED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 static EVENTS_LOGGED: AtomicU64 = AtomicU64::new(0);
 
-/// After a press (for 90 view builds): whether the game's quick melee began.
+/// The hands' takedown now (`idHands::overTakedownTarget`), where mapped.
+fn over_takedown(setup: &Setup, hands: usize) -> Option<i32> {
+    mem::read::<i32>(hands + setup.melee.over_takedown?)
+}
+
+static LAST_OVER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static OVER_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+/// After a press (for 90 view builds): whether the game's quick melee began. And each change of the
+/// hands' takedown (a prompt's takedown offered or not).
 fn watch_press(setup: &Setup, hands: usize) {
     LAST_HANDS.store(hands, Relaxed);
+    if let Some(over) = over_takedown(setup, hands)
+        && LAST_OVER.swap(over, Relaxed) != over
+        && OVER_LOGGED.fetch_add(1, Relaxed) < 60
+    {
+        log!(
+            "melee: the hands' takedown now {over} ({}); left hand's own item {}, another camera {}, the head {:.1} units off the game camera",
+            match over { 0 => "unavailable", 1 => "stealth", 2 => "combat", 3 => "stunned", 4 => "custom", 5 => "counter", 6 => "ground", _ => "?" },
+            held_item::dual(),
+            crate::providers::camera_taken::controlled(),
+            crate::providers::follow_head::head_from_camera().map_or(f32::NAN, |(shift, _)| shift.iter().map(|v| v * v).sum::<f32>().sqrt())
+        );
+    }
     let at = PRESS_BUILD.load(Relaxed);
     if at == u64::MAX {
         return;
