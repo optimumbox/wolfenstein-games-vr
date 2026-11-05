@@ -109,6 +109,13 @@ fn paced(step: i32) -> bool {
     crate::cooking::frame_pacing::allows(step)
 }
 
+/// Whether `step` frames a second divide the headset's refresh (`hz`) into whole refreshes: on 90
+/// Hz, 90 does (and 45), 60 does not (its frames shown for one refresh, then two: a judder).
+pub fn divides(step: i32, hz: f64) -> bool {
+    let refreshes = hz / f64::from(step);
+    refreshes >= 0.99 && (refreshes - refreshes.round()).abs() < 0.02
+}
+
 /// The rate as measures come: down at once when the frames fall behind it (to what they held then,
 /// [`CAP_MARGIN`]), up only after [`RISE_WINDOWS`] measures in a row with room for more, and not
 /// above what they held while behind until that ceiling's wait is over ([`BACKOFF`]).
@@ -120,21 +127,26 @@ pub struct Steps {
     behind: u32,
     /// The last time the frames fell behind: what they held, when, and the drops in a row.
     cap: Option<(f64, Instant, u32)>,
+    /// Times the frames fell behind on the headset's refresh and the rate was kept, the rate below
+    /// not dividing the refresh.
+    pub kept_on_refresh: u64,
 }
 
 impl Steps {
     pub const fn new(current: i32) -> Self {
-        Self { current, rises: 0, behind: 0, cap: None }
+        Self { current, rises: 0, behind: 0, cap: None, kept_on_refresh: 0 }
     }
 
     /// The rate after a measure at `now`: the game thread's promise (`holds` frames a second), the
     /// frames `achieved` a second, up to `ceiling`.
     pub fn next(&mut self, holds: f64, achieved: f64, ceiling: i32, now: Instant) -> i32 {
-        self.step(holds, achieved, ceiling, now, crate::cooking::frame_pacing::headset_period().is_some())
+        let refresh = crate::cooking::frame_pacing::headset_period().map(|period| 1e9 / period as f64);
+        self.step(holds, achieved, ceiling, now, refresh)
     }
 
-    /// [`Steps::next`], the frames paced to the headset's refresh or not (`on_grid`).
-    fn step(&mut self, holds: f64, achieved: f64, ceiling: i32, now: Instant, on_grid: bool) -> i32 {
+    /// [`Steps::next`], the frames paced to the headset's refresh (`refresh`, Hz) or not.
+    fn step(&mut self, holds: f64, achieved: f64, ceiling: i32, now: Instant, refresh: Option<f64>) -> i32 {
+        let on_grid = refresh.is_some();
         // A rate off the headset's refresh (taken before the headset's timing came) is behind by
         // its nature: straight to the best rate on it, nothing learnt.
         if self.current != OWN && !paced(self.current) {
@@ -153,6 +165,16 @@ impl Steps {
         if behind {
             // Behind: what was achieved is the PC's own, whatever the game thread promised.
             self.behind = 0;
+            // On the headset's refresh, a rate that does not divide it (60 on 90 Hz) shows every
+            // other frame twice for as long as it is held: worse than the frames behind. Kept.
+            let lower = under_cap(achieved, ceiling).min(self.current);
+            if let Some(hz) = refresh
+                && !divides(lower, hz)
+            {
+                self.rises = 0;
+                self.kept_on_refresh += 1;
+                return self.current;
+            }
             let drops = match self.cap {
                 Some((_, at, drops)) if now.saturating_duration_since(at) < BACKOFF_MAX => drops + 1,
                 _ => 1,
@@ -217,6 +239,8 @@ const LOGGED: u64 = 200;
 static HELD: AtomicU64 = AtomicU64::new(0);
 const HELD_EVERY: u64 = 20;
 const HELD_LOGGED: u64 = 30;
+/// Rates kept on the headset's refresh while behind ([`Steps::kept_on_refresh`]), logged at most.
+const KEPT_LOGGED: u64 = 40;
 
 /// The game's rate (ticks, and so frames, a second) at most while VR runs ([`FRAME_RATE`]; 60 is
 /// the game's own).
@@ -284,6 +308,12 @@ pub fn frame() {
     let achieved = f64::from(measure_frames) / span.as_secs_f64();
     let before = adapt.steps;
     let rate = if crate::research::options().fixed_rate { adapt.ceiling } else { adapt.steps.next(holds, achieved, adapt.ceiling, now) };
+    let kept = adapt.steps.kept_on_refresh;
+    if kept > before.kept_on_refresh && kept <= KEPT_LOGGED {
+        log!(
+            "the game's rate stays {rate}: the frames fell behind it ({achieved:.0} a second, the game thread promising {holds:.0}), and a lower rate would not divide the headset's refresh (every other frame shown twice)"
+        );
+    }
     if rate == before.current {
         let held = HELD.fetch_add(1, Relaxed);
         if rate < adapt.ceiling && held % HELD_EVERY == 0 && held / HELD_EVERY < HELD_LOGGED {

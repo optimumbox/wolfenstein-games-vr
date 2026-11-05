@@ -113,13 +113,25 @@ fn paced_to_the_headset_a_hitch_keeps_the_rate() {
     let mut steps = Steps::new(90);
     // Two refreshes missed in each half second (87 a second): a hitch, not the PC's limit.
     for _ in 0..BEHIND_PACED_WINDOWS * 3 {
-        assert_eq!(steps.step(900.0, 86.0, 90, start, true), 90);
+        assert_eq!(steps.step(900.0, 86.0, 90, start, Some(90.0)), 90);
     }
-    // Most refreshes missed for two seconds: the PC cannot hold 90.
+    // Most refreshes missed for two seconds: still 90, as 60 does not divide 90 Hz.
+    for _ in 0..BEHIND_PACED_WINDOWS * 3 {
+        assert_eq!(steps.step(900.0, 62.0, 90, start, Some(90.0)), 90);
+    }
+    assert!(steps.kept_on_refresh >= 3);
+    // On 120 Hz, 60 divides the refresh: behind at 120, the rate goes to 60.
+    let mut steps = Steps::new(120);
     for _ in 1..BEHIND_PACED_WINDOWS {
-        assert_eq!(steps.step(900.0, 62.0, 90, start, true), 90);
+        assert_eq!(steps.step(900.0, 62.0, 120, start, Some(120.0)), 120);
     }
-    assert_eq!(steps.step(900.0, 62.0, 90, start, true), OWN);
+    assert_eq!(steps.step(900.0, 62.0, 120, start, Some(120.0)), OWN);
+}
+
+#[test]
+fn rates_that_divide_the_refresh() {
+    assert!(divides(90, 90.0) && divides(90, 89.9) && divides(60, 120.0) && divides(45, 90.0));
+    assert!(!divides(60, 90.0) && !divides(80, 90.0) && !divides(120, 90.0));
 }
 
 #[test]
@@ -128,15 +140,15 @@ fn on_the_headsets_refresh_frames_already_achieved_raise_the_rate() {
     let mut steps = Steps::new(OWN);
     // The present holds the render thread: the game thread promises 92, the frames make 89.5.
     for window in 1..RISE_WINDOWS {
-        assert_eq!(steps.step(92.0, 89.5, 90, start, true), OWN, "window {window}: not yet");
+        assert_eq!(steps.step(92.0, 89.5, 90, start, Some(90.0)), OWN, "window {window}: not yet");
     }
-    assert_eq!(steps.step(92.0, 89.5, 90, start, true), 90);
+    assert_eq!(steps.step(92.0, 89.5, 90, start, Some(90.0)), 90);
     let mut off_grid = Steps::new(OWN);
     for _ in 0..RISE_WINDOWS * 2 {
-        assert!(off_grid.step(92.0, 89.5, 90, start, false) < 90, "no headset refresh: the promise alone");
+        assert!(off_grid.step(92.0, 89.5, 90, start, None) < 90, "no headset refresh: the promise alone");
     }
     let mut short = Steps::new(OWN);
     for _ in 0..RISE_WINDOWS * 2 {
-        assert!(short.step(80.0, 80.0, 90, start, true) < 90, "80 achieved does not keep 90");
+        assert!(short.step(80.0, 80.0, 90, start, Some(90.0)) < 90, "80 achieved does not keep 90");
     }
 }
