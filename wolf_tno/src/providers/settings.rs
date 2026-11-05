@@ -58,6 +58,7 @@ fn install_settings(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
     no_screen_blur(start.ledger, &exe, build);
     log_streaming(&exe);
     gpu_decoding(start.ledger, &exe);
+    hold_vmtr(start.ledger, &exe);
     crate::research::cvars::apply(start.ledger, &exe);
     crate::research::cvars::prepare_cycle(start.ledger, &exe);
     // Kept at 0 by the ledger (what it holds at the stop goes back), so the world never stays
@@ -124,6 +125,25 @@ fn gpu_decoding(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
     log!("texture streaming: pages decoded on the GPU (vt_useCudaTranscode 1), held on while VR runs");
 }
 
+/// The largest `vt_pageImageSizeVmtr` (the material texture cache image) let through, or none.
+/// A trial: the game's texture cache on high (Vmtr 4096, Unique 8192) made the scene's material
+/// draws (landuniquebump) five to ten times costlier a draw than on low (2048, 4096); held at 2048
+/// with Unique left at the game's 8192, a run shows which of the two images costs.
+const VMTR_MOST: Option<i32> = Some(2048);
+/// `vt_pageImageSizeVmtr`, held at [`VMTR_MOST`] at most.
+static VMTR: OnceLock<(Module, &'static Cvar, i32)> = OnceLock::new();
+
+fn hold_vmtr(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
+    let Some(most) = VMTR_MOST else { return };
+    let Some(cvar) = Cvar::find(exe, "vt_pageImageSizeVmtr", eng_idt::Layout::ID_TECH_5) else { return };
+    let _ = VMTR.set((*exe, cvar, most));
+    let game = cvar.int(exe);
+    if game.is_some_and(|v| v > most) {
+        eng_idt::set_int(ledger, exe, cvar, most, "the material texture cache image is the game's size");
+        log!("texture streaming: vt_pageImageSizeVmtr held at {most} (the game's {}), vt_pageImageSizeUnique left as the game has it", game.unwrap_or(0));
+    }
+}
+
 /// On the render thread, every 45th frame: a streaming setting changed (the options menu) is logged,
 /// and GPU decoding turned off is turned on again before the engine rebuilds its texture cache.
 pub fn watch_streaming() {
@@ -135,6 +155,12 @@ pub fn watch_streaming() {
     {
         cvar.set_int(exe, 1);
         log!("texture streaming: the game turned GPU decoding off (vt_useCudaTranscode 0); on again");
+    }
+    if let Some((exe, cvar, most)) = VMTR.get()
+        && cvar.int(exe).is_some_and(|v| v > *most)
+    {
+        cvar.set_int(exe, *most);
+        log!("texture streaming: the game set vt_pageImageSizeVmtr above {most}; held at {most} again");
     }
     let Some(w) = WATCHED.get() else { return };
     let Ok(mut seen) = w.seen.lock() else { return };
