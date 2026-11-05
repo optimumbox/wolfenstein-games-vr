@@ -128,8 +128,9 @@ fn gpu_decoding(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
 /// The largest `vt_pageImageSizeUnique` (the unique texture cache image) let through, or none.
 /// The game's texture cache on high (Vmtr 4096, Unique 8192) throttled the headset a minute into
 /// every run; Vmtr held at 2048 with Unique 8192 did the same, while Vmtr 4096 with Unique 4096 held
-/// 90. So Unique is held at 4096 and Vmtr is left as the game has it.
-const UNIQUE_MOST: Option<i32> = Some(4096);
+/// 90. That was the viewer's copy waiting behind the game's GPU work with Windows' hardware GPU
+/// scheduling off; with it on, high and ultra held 90, so nothing is held (`Some(size)` holds again).
+const UNIQUE_MOST: Option<i32> = None;
 /// `vt_pageImageSizeUnique`, held at [`UNIQUE_MOST`] at most.
 static UNIQUE: OnceLock<(Module, &'static Cvar, i32)> = OnceLock::new();
 
