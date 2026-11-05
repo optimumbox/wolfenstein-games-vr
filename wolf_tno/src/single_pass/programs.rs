@@ -19,6 +19,7 @@
 use super::archive::{self, Renderprog};
 use super::convert;
 use super::gl_api::{self, ActiveUniform, Gl};
+use super::program_cache;
 use monaka_producer::log;
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, channel};
@@ -128,11 +129,13 @@ pub struct Conversion {
     failed: usize,
     /// Converted before and kept so, their conversion again failing.
     kept_before: usize,
+    /// The programs kept for the next run ([`program_cache::save`]).
+    saved: bool,
 }
 
 impl Conversion {
     pub const fn new() -> Self {
-        Self { stage: Stage::Idle, sources: Vec::new(), converted: Vec::new(), failed: 0, kept_before: 0 }
+        Self { stage: Stage::Idle, sources: Vec::new(), converted: Vec::new(), failed: 0, kept_before: 0, saved: false }
     }
 
     /// Whether it ended (converted or given up).
@@ -149,7 +152,7 @@ impl Conversion {
                 Ok(Ok(sources)) => {
                     log!("single pass: {} render programs read from the game's archive; compiling them for their assembly", sources.len());
                     parallel_compiles();
-                    let scratch = sources.iter().map(|s| gl.program(&s.vertex, &s.fragment, &[], &outputs(s, |_| None))).collect();
+                    let scratch = sources.iter().map(|s| program_cache::program(gl, &s.vertex, &s.fragment, &[], &outputs(s, |_| None))).collect();
                     Stage::Compiling { sources, scratch, since: Instant::now() }
                 }
                 Ok(Err(e)) => {
@@ -167,6 +170,7 @@ impl Conversion {
                     let stage = match_and_convert(gl, &self.sources, &scratch, &mut self.converted);
                     if matches!(stage, Stage::Failed) && !self.converted.is_empty() {
                         self.stage = Stage::Done;
+                        self.save_once();
                         return Some(self.converted.clone());
                     }
                     stage
@@ -184,7 +188,11 @@ impl Conversion {
             Stage::Swapping { jobs, done } => {
                 let end = (done + SWAPS_PER_FRAME).min(jobs.len());
                 for job in &jobs[done..end] {
-                    match swap(gl, job, &self.sources[job.source]) {
+                    let swapped = swap(gl, job, &self.sources[job.source]);
+                    if swapped.is_ok() {
+                        program_cache::keep(gl, job.scratch);
+                    }
+                    match swapped {
                         Ok(Some(converted)) => self.converted.push(converted),
                         Ok(None) => log!("single pass: program {} ({}) drawn without depth of field or film grain", job.engine, self.sources[job.source].name),
                         Err(_) if job.before.is_some() => {
@@ -198,21 +206,30 @@ impl Conversion {
                             }
                         }
                     }
-                    // SAFETY: our own scratch program.
-                    unsafe { (gl.delete_program)(job.scratch) };
+                    program_cache::release(gl, job.scratch);
                 }
                 if end < jobs.len() {
                     Stage::Swapping { jobs, done: end }
                 } else {
                     log!("single pass: {} engine programs converted ({} of them decals as converted before, not converted again), {} left as they were", self.converted.len(), self.kept_before, self.failed);
                     self.stage = Stage::Done;
+                    self.save_once();
                     return Some(self.converted.clone());
                 }
             }
             Stage::Done => Stage::Done,
             Stage::Failed => Stage::Failed,
         };
+        self.save_once();
         None
+    }
+
+    /// The programs kept for the next run, once it ended.
+    fn save_once(&mut self) {
+        if self.finished() && !self.saved {
+            self.saved = true;
+            program_cache::save();
+        }
     }
 }
 
@@ -227,9 +244,8 @@ fn relink_plain(gl: &Gl, jobs: &mut [Job], sources: &[Renderprog]) -> bool {
             log!("single pass: {} does not link reading the scene's maps layered ({}): each eye draws it", sources[job.source].name, why.lines().next().unwrap_or(""));
         }
         any = true;
-        // SAFETY: our own scratch program.
-        unsafe { (gl.delete_program)(job.scratch) };
-        job.scratch = gl.program(&plain.vertex, &plain.fragment, &plain.attributes, &plain.outputs);
+        program_cache::release(gl, job.scratch);
+        job.scratch = program_cache::program(gl, &plain.vertex, &plain.fragment, &plain.attributes, &plain.outputs);
         job.maps.clear();
     }
     any
@@ -294,12 +310,12 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
     for (index, &program) in scratch.iter().enumerate() {
         names.push(uniform_names(&gl.uniforms(program)));
         if gl.linked(program).is_ok()
-            && let Some(key) = gl.binary(program).and_then(|(_, b)| gl_api::assembly_key(&b))
+            && let Some(key) = program_cache::binary(gl, program).and_then(|(_, b)| gl_api::assembly_key(&b))
         {
             by_key.entry(key).or_default().push(index);
+            program_cache::keep(gl, program);
         }
-        // SAFETY: our own scratch program.
-        unsafe { (gl.delete_program)(program) };
+        program_cache::release(gl, program);
     }
     let (mut engine_programs, mut matched, mut flat) = (0, 0, 0);
     let mut jobs = Vec::new();
@@ -380,10 +396,10 @@ fn job(gl: &Gl, engine: u32, uniforms: &[ActiveUniform], source: usize, program:
     Some(match layered {
         Some(layered) => {
             let fragment = convert::with_locations(&layered.source, &located);
-            let scratch = gl.program(&vertex, &fragment, &attributes, &outputs);
+            let scratch = program_cache::program(gl, &vertex, &fragment, &attributes, &outputs);
             Job { engine, source, rows, scratch, maps: layered.maps, plain: Some(Relink { vertex, fragment: plain, attributes, outputs }), patched: false, before: None }
         }
-        None => Job { engine, source, rows, scratch: gl.program(&vertex, &plain, &attributes, &outputs), maps: Vec::new(), plain: None, patched: false, before: None },
+        None => Job { engine, source, rows, scratch: program_cache::program(gl, &vertex, &plain, &attributes, &outputs), maps: Vec::new(), plain: None, patched: false, before: None },
     })
 }
 
@@ -396,7 +412,7 @@ fn patch(gl: &Gl, engine: u32, uniforms: &[ActiveUniform], source: usize, progra
     // SAFETY: plain queries with NUL-terminated names.
     let outputs = outputs(program, |name| u32::try_from(unsafe { (gl.get_frag_data_location)(engine, gl_api::c_name(name).as_ptr()) }).ok());
     let attributes = gl.attributes(engine);
-    let scratch = gl.program(&vertex, &fragment, &attributes, &outputs);
+    let scratch = program_cache::program(gl, &vertex, &fragment, &attributes, &outputs);
     Job { engine, source, rows: [0; 4], scratch, maps: Vec::new(), plain: None, patched: true, before: None }
 }
 
@@ -501,13 +517,14 @@ fn locations(gl: &Gl, program: u32, names: &[&str], rows: usize) -> Option<Vec<i
 /// The converted binary moved into the engine's program, its uniform values and block bindings
 /// as they were; none for a program patched alone (it draws no eye but its own).
 fn swap(gl: &Gl, job: &Job, source: &Renderprog) -> Result<Option<Converted>, String> {
-    gl.linked(job.scratch).map_err(|log| format!("the converted program does not link: {}", log.lines().next().unwrap_or("")))?;
-    let (format, binary) = gl.binary(job.scratch).ok_or("no binary of the converted program")?;
     let engine = job.engine;
+    // The engine's own binary first: without it nothing is done (the cheapest way out).
+    let original = gl.binary(engine).ok_or("no binary of the engine's program")?;
+    gl.linked(job.scratch).map_err(|log| format!("the converted program does not link: {}", log.lines().next().unwrap_or("")))?;
+    let (format, binary) = program_cache::binary(gl, job.scratch).ok_or("no binary of the converted program")?;
     let before = gl.uniforms(engine);
     let values: Vec<_> = before.iter().map(|u| gl.values(engine, u)).collect();
     let blocks = gl.block_bindings(engine);
-    let original = gl.binary(engine).ok_or("no binary of the engine's program")?;
     let put_back = |why: String| -> String {
         // SAFETY: the program's own binary, as the driver gave it.
         unsafe { (gl.program_binary)(engine, original.0, original.1.as_ptr().cast(), original.1.len() as i32) };
