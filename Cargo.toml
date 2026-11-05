@@ -3,12 +3,12 @@ resolver = "3"
 members = ["shared", "wolf_tno"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-only"
 # A game pack carries its crate's `repository` as where it comes from (`monaka_contract::pack::About`).
-repository = "https://github.com/Mamfro/wolfenstein-games-vr"
+repository = "https://github.com/optimumbox/wolfenstein-games-vr"
 
 # Monaka's crates, from the checkouts two folders up: `monaka_sdk` and `monaka_vr`, with this
 # repository in `monaka_adapters/wolfenstein-games-vr` beside them. Edits to all build together.

@@ -30,7 +30,7 @@ Currently only the **Steam** versions are supported.
 1. Install **Monaka VR** from its [Releases page](https://github.com/Mamfro/monaka_vr/releases) (see
    its [README](https://github.com/Mamfro/monaka_vr)).
 2. Download `wolfenstein-games-vr-<version>.zip` from this repository's
-   [Releases page](https://github.com/Mamfro/wolfenstein-games-vr/releases). Don't unzip it.
+   [Releases page](https://github.com/optimumbox/wolfenstein-games-vr/releases). Don't unzip it.
 3. In the Monaka VR window, press **Add game pack...** and pick the zip. Both games appear in the
    list.
 
