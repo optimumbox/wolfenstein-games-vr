@@ -12,6 +12,9 @@
 //!    binary back.
 //!
 //! A converted program draws exactly as before until its stereo switch is set ([`super::draws`]).
+//!
+//! The post-process and the depth-of-field passes' size programs are swapped the same way for
+//! their fragment shader without depth of field or film grain ([`convert::without_blur_or_grain`]).
 
 use super::archive::{self, Renderprog};
 use super::convert;
@@ -81,6 +84,8 @@ struct Job {
     scratch: u32,
     maps: Vec<String>,
     plain: Option<Relink>,
+    /// Swapped for its fragment shader alone (no stereo rows): [`convert::without_blur_or_grain`].
+    patched: bool,
 }
 
 struct Relink {
@@ -152,7 +157,8 @@ impl Conversion {
                 let end = (done + SWAPS_PER_FRAME).min(jobs.len());
                 for job in &jobs[done..end] {
                     match swap(gl, job, &self.sources[job.source]) {
-                        Ok(converted) => self.converted.push(converted),
+                        Ok(Some(converted)) => self.converted.push(converted),
+                        Ok(None) => log!("single pass: program {} ({}) drawn without depth of field or film grain", job.engine, self.sources[job.source].name),
                         Err(why) => {
                             self.failed += 1;
                             if self.failed <= 10 {
@@ -276,6 +282,10 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         let Some(&source) = candidates.iter().find(|&&c| names[c] == own).or_else(|| (candidates.len() == 1).then(|| &candidates[0])) else { continue };
         matched += 1;
         let program = &sources[source];
+        if let Some(fragment) = convert::without_blur_or_grain(&program.name, &program.fragment) {
+            jobs.push(patch(gl, engine, &uniforms, source, program, &fragment));
+            continue;
+        }
         if convert::position_rows(&program.vertex).is_none() {
             flat += 1;
             continue;
@@ -319,10 +329,23 @@ fn job(gl: &Gl, engine: u32, uniforms: &[ActiveUniform], source: usize, program:
         Some(layered) => {
             let fragment = convert::with_locations(&layered.source, &located);
             let scratch = gl.program(&vertex, &fragment, &attributes, &outputs);
-            Job { engine, source, rows, scratch, maps: layered.maps, plain: Some(Relink { vertex, fragment: plain, attributes, outputs }) }
+            Job { engine, source, rows, scratch, maps: layered.maps, plain: Some(Relink { vertex, fragment: plain, attributes, outputs }), patched: false }
         }
-        None => Job { engine, source, rows, scratch: gl.program(&vertex, &plain, &attributes, &outputs), maps: Vec::new(), plain: None },
+        None => Job { engine, source, rows, scratch: gl.program(&vertex, &plain, &attributes, &outputs), maps: Vec::new(), plain: None, patched: false },
     })
+}
+
+/// The scratch program for `engine` with its render program's vertex shader and `fragment` in
+/// place of its own, with the engine program's own locations.
+fn patch(gl: &Gl, engine: u32, uniforms: &[ActiveUniform], source: usize, program: &Renderprog, fragment: &str) -> Job {
+    let located = |u: &convert::Uniform| uniforms.iter().find(|a| a.name == u.name).and_then(|a| a.locations.first().copied()).filter(|&l| l >= 0);
+    let vertex = convert::with_locations(&program.vertex, &located);
+    let fragment = convert::with_locations(fragment, &located);
+    // SAFETY: plain queries with NUL-terminated names.
+    let outputs = outputs(program, |name| u32::try_from(unsafe { (gl.get_frag_data_location)(engine, gl_api::c_name(name).as_ptr()) }).ok());
+    let attributes = gl.attributes(engine);
+    let scratch = gl.program(&vertex, &fragment, &attributes, &outputs);
+    Job { engine, source, rows: [0; 4], scratch, maps: Vec::new(), plain: None, patched: true }
 }
 
 /// An engine program an earlier run converted: its locations, from the render program with the
@@ -410,8 +433,8 @@ fn locations(gl: &Gl, program: u32, names: &[&str], rows: usize) -> Option<Vec<i
 }
 
 /// The converted binary moved into the engine's program, its uniform values and block bindings
-/// as they were.
-fn swap(gl: &Gl, job: &Job, source: &Renderprog) -> Result<Converted, String> {
+/// as they were; none for a program patched alone (it draws no eye but its own).
+fn swap(gl: &Gl, job: &Job, source: &Renderprog) -> Result<Option<Converted>, String> {
     gl.linked(job.scratch).map_err(|log| format!("the converted program does not link: {}", log.lines().next().unwrap_or("")))?;
     let (format, binary) = gl.binary(job.scratch).ok_or("no binary of the converted program")?;
     let engine = job.engine;
@@ -435,6 +458,9 @@ fn swap(gl: &Gl, job: &Job, source: &Renderprog) -> Result<Converted, String> {
         }
     }
     restore(gl, engine, &before, &values, &blocks);
+    if job.patched {
+        return Ok(None);
+    }
     // SAFETY: plain queries with NUL-terminated names.
     let location = |name: String| unsafe { (gl.get_uniform_location)(engine, gl_api::c_name(&name).as_ptr()) };
     let rows = job.rows.map(|row| location(format!("_va_[{row}]")));
@@ -442,7 +468,7 @@ fn swap(gl: &Gl, job: &Job, source: &Renderprog) -> Result<Converted, String> {
     if rows.iter().chain(&stereo).any(|&l| l < 0) {
         return Err(put_back(format!("{} has no _va_ rows or stereo uniform", source.name)));
     }
-    Ok(Converted { program: engine, rows, stereo, reads_screen: convert::reads_screen(&source.fragment), name: leak(&source.name), screen: screen(gl, engine, &job.maps) })
+    Ok(Some(Converted { program: engine, rows, stereo, reads_screen: convert::reads_screen(&source.fragment), name: leak(&source.name), screen: screen(gl, engine, &job.maps) }))
 }
 
 fn restore(gl: &Gl, program: u32, uniforms: &[ActiveUniform], values: &[Option<Vec<gl_api::Values>>], blocks: &[u32]) {

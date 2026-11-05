@@ -152,6 +152,9 @@ struct Counts {
     misfit_draws: u64,
     /// Draws of programs reading the scene's maps made for both eyes.
     screen_shared: u64,
+    /// The engine's copies between textures (`glCopyImageSubData`) of an eye texture, made from or
+    /// into the pass's layer.
+    copies_layered: u64,
     /// The left eye's carried draws made with the scissor test off, their scissor smaller than the
     /// viewport.
     scissor_opened: u64,
@@ -801,7 +804,7 @@ pub fn frame(on: bool) {
             by.iter().take(24).map(|(n, name, p)| format!("{name} ({p}) {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
         });
         log!(
-            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch; {} of the right eye's writing neither colour nor depth, drawn; {} with their own depth projection, drawn by each eye (world's {:?}); {} of programs reading the scene's maps or not carried by the eye matrix ({} judged), drawn by each eye; {} of programs reading the scene's maps made for both eyes; {} carried with the scissor test off (their scissor smaller than the viewport)",
+            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch; {} of the right eye's writing neither colour nor depth, drawn; {} with their own depth projection, drawn by each eye (world's {:?}); {} of programs reading the scene's maps or not carried by the eye matrix ({} judged), drawn by each eye; {} of programs reading the scene's maps made for both eyes; {} carried with the scissor test off (their scissor smaller than the viewport); {} texture copies of an eye texture made from or into the pass's layer",
             c.draws,
             c.converted,
             c.perspective,
@@ -813,7 +816,8 @@ pub fn frame(on: bool) {
             c.misfit_draws,
             state.misfits.misfits.len(),
             c.screen_shared,
-            c.scissor_opened
+            c.scissor_opened,
+            c.copies_layered
         );
     }
 }
@@ -890,6 +894,9 @@ type RectFn = unsafe extern "system" fn(i32, i32, i32, i32);
 type ClearFn = unsafe extern "system" fn(u32);
 type BindFramebufferFn = unsafe extern "system" fn(u32, u32);
 type BindTextureFn = unsafe extern "system" fn(u32, u32);
+type CopyTexSubImageFn = unsafe extern "system" fn(u32, i32, i32, i32, i32, i32, i32, i32);
+type BlitFramebufferFn = unsafe extern "system" fn(i32, i32, i32, i32, i32, i32, i32, i32, u32, u32);
+type CopyImageSubDataFn = unsafe extern "system" fn(u32, u32, i32, i32, i32, i32, u32, u32, i32, i32, i32, i32, i32, i32, i32);
 type BindTexturesFn = unsafe extern "system" fn(u32, i32, *const u32);
 type BindMultiTextureFn = unsafe extern "system" fn(u32, u32, u32);
 type DrawArraysFn = unsafe extern "system" fn(u32, i32, i32);
@@ -934,6 +941,10 @@ static CLEAR: Original<ClearFn> = Original::new();
 static BIND_FRAMEBUFFER: Original<BindFramebufferFn> = Original::new();
 static BIND_FRAMEBUFFER_EXT: Original<BindFramebufferFn> = Original::new();
 static BIND_TEXTURE: Original<BindTextureFn> = Original::new();
+static COPY_IMAGE_SUB_DATA: Original<CopyImageSubDataFn> = Original::new();
+static BLIT_FRAMEBUFFER: Original<BlitFramebufferFn> = Original::new();
+static COPY_TEX_SUB_IMAGE_2D: Original<CopyTexSubImageFn> = Original::new();
+static COPY_IMAGE_SUB_DATA_NV: Original<CopyImageSubDataFn> = Original::new();
 static BIND_TEXTURES: Original<BindTexturesFn> = Original::new();
 static BIND_MULTI_TEXTURE: Original<BindMultiTextureFn> = Original::new();
 static DRAW_ARRAYS: Original<DrawArraysFn> = Original::new();
@@ -1090,6 +1101,10 @@ fn install() -> bool {
         return false;
     }
     hook!(BIND_TEXTURE, "glBindTexture", bind_texture as BindTextureFn, false);
+    hook!(COPY_TEX_SUB_IMAGE_2D, "glCopyTexSubImage2D", copy_tex_sub_image_2d as CopyTexSubImageFn, false);
+    hook!(BLIT_FRAMEBUFFER, "glBlitFramebuffer", blit_framebuffer as BlitFramebufferFn, false);
+    hook!(COPY_IMAGE_SUB_DATA, "glCopyImageSubData", copy_image_sub_data as CopyImageSubDataFn, false);
+    hook!(COPY_IMAGE_SUB_DATA_NV, "glCopyImageSubDataNV", copy_image_sub_data_nv as CopyImageSubDataFn, false);
     hook!(BIND_TEXTURES, "glBindTextures", bind_textures as BindTexturesFn, false);
     hook!(BIND_MULTI_TEXTURE, "glBindMultiTextureEXT", bind_multi_texture as BindMultiTextureFn, false);
     draws += hook!(DRAW_ELEMENTS, "glDrawElements", draw_elements as DrawElementsFn, false);
@@ -2423,6 +2438,121 @@ unsafe extern "system" fn disable(cap: u32) {
     Shadow::set(Shadow::capability(cap), false);
     // SAFETY: forwards the game's own call.
     unsafe { DISABLE.get(&flight)(cap) }
+}
+
+/// Distinct copies logged (source and destination), the first few a run.
+static COPIES_LOGGED: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+const COPIES_LOGGED_MOST: usize = 12;
+
+/// A copy between textures (`glCopyImageSubData`) made from or into an eye texture: the engine's
+/// texture holds no pass's drawing (the arrays do; it gets a layer back only at the present), so
+/// the copy is made from or into the pass's layer (its view). The scene's depth copied for the
+/// decals, soft particles, reflections and the post-process (`samp_viewdepthmap`) is one: made
+/// from the engine's own texture, each eye's copy held the eye copied back at the present, and
+/// the right eye's decals, placed by the left eye's depth, fell outside their boxes.
+fn copied(source: u32, source_target: u32, destination: u32, destination_target: u32, size: (i32, i32)) -> (u32, u32) {
+    let mut guard = STATE.locked();
+    let Some(state) = guard.as_mut().filter(|s| s.live) else { return (source, destination) };
+    let plain = |name: u32, target: u32| if target == 0x0DE1 { state.texture(name) } else { name };
+    let (from, into) = (plain(source, source_target), plain(destination, destination_target));
+    if (from, into) != (source, destination) {
+        state.counts.copies_layered += 1;
+    }
+    if let Ok(mut logged) = COPIES_LOGGED.lock()
+        && logged.len() < COPIES_LOGGED_MOST
+        && !logged.contains(&(source, destination))
+    {
+        logged.push((source, destination));
+        log!(
+            "single pass: the engine copies texture {source} (target {source_target:#x}) into {destination} (target {destination_target:#x}), {}x{}, in pass {}: {}",
+            size.0,
+            size.1,
+            state.pass,
+            if (from, into) != (source, destination) { format!("made from {from} into {into}, the pass's layer") } else { "neither an eye texture".to_owned() }
+        );
+    }
+    (from, into)
+}
+
+/// Distinct blits logged (the engine's read and draw framebuffers, the mask), the first few a run.
+static BLITS_LOGGED: std::sync::Mutex<Vec<(u32, u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The engine's blits, made as it asks (its bound framebuffers already ours where they stand in
+/// for an eye's); the first few logged, with what each framebuffer reads or draws.
+unsafe extern "system" fn blit_framebuffer(sx0: i32, sy0: i32, sx1: i32, sy1: i32, dx0: i32, dy0: i32, dx1: i32, dy1: i32, mask: u32, filter: u32) {
+    let flight = InFlight::enter();
+    if let Some(state) = STATE.locked().as_ref().filter(|s| s.live) {
+        let key = (state.read_framebuffer, state.draw_framebuffer, mask);
+        if let Ok(mut logged) = BLITS_LOGGED.lock()
+            && logged.len() < COPIES_LOGGED_MOST
+            && !logged.contains(&key)
+        {
+            logged.push(key);
+            log!(
+                "single pass: the engine blits framebuffer {} (read as {}) into {} (drawn as {}), mask {mask:#x}, {}x{} to {}x{}, in pass {}",
+                state.read_framebuffer,
+                state.mapped(state.read_framebuffer),
+                state.draw_framebuffer,
+                state.mapped(state.draw_framebuffer),
+                sx1 - sx0,
+                sy1 - sy0,
+                dx1 - dx0,
+                dy1 - dy0,
+                state.pass
+            );
+        }
+    }
+    // SAFETY: forwards the game's own call.
+    unsafe { BLIT_FRAMEBUFFER.get(&flight)(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter) }
+}
+
+/// Distinct copies from the read framebuffer logged (it, the target, the unit), the first few a run.
+static FRAMEBUFFER_COPIES_LOGGED: std::sync::Mutex<Vec<(u32, u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The engine's copies from its read framebuffer into a bound texture, made as it asks; the first
+/// few logged, with what the framebuffer reads and the pass.
+unsafe extern "system" fn copy_tex_sub_image_2d(target: u32, level: i32, dx: i32, dy: i32, x: i32, y: i32, w: i32, h: i32) {
+    let flight = InFlight::enter();
+    if let Some(state) = STATE.locked().as_ref().filter(|s| s.live) {
+        let unit = Shadow::unit();
+        let key = (state.read_framebuffer, target, unit);
+        if let Ok(mut logged) = FRAMEBUFFER_COPIES_LOGGED.lock()
+            && logged.len() < COPIES_LOGGED_MOST
+            && !logged.contains(&key)
+        {
+            logged.push(key);
+            log!(
+                "single pass: the engine copies framebuffer {} (read as {}) into the texture on unit {unit} (target {target:#x}, level {level}), {w}x{h}, in pass {}",
+                state.read_framebuffer,
+                state.mapped(state.read_framebuffer),
+                state.pass
+            );
+        }
+    }
+    // SAFETY: forwards the game's own call.
+    unsafe { COPY_TEX_SUB_IMAGE_2D.get(&flight)(target, level, dx, dy, x, y, w, h) }
+}
+
+unsafe extern "system" fn copy_image_sub_data(
+    source: u32, source_target: u32, source_level: i32, sx: i32, sy: i32, sz: i32,
+    destination: u32, destination_target: u32, destination_level: i32, dx: i32, dy: i32, dz: i32,
+    width: i32, height: i32, depth: i32,
+) {
+    let flight = InFlight::enter();
+    let (source, destination) = copied(source, source_target, destination, destination_target, (width, height));
+    // SAFETY: forwards the game's own call (with a layer's view for an eye texture).
+    unsafe { COPY_IMAGE_SUB_DATA.get(&flight)(source, source_target, source_level, sx, sy, sz, destination, destination_target, destination_level, dx, dy, dz, width, height, depth) }
+}
+
+unsafe extern "system" fn copy_image_sub_data_nv(
+    source: u32, source_target: u32, source_level: i32, sx: i32, sy: i32, sz: i32,
+    destination: u32, destination_target: u32, destination_level: i32, dx: i32, dy: i32, dz: i32,
+    width: i32, height: i32, depth: i32,
+) {
+    let flight = InFlight::enter();
+    let (source, destination) = copied(source, source_target, destination, destination_target, (width, height));
+    // SAFETY: forwards the game's own call (with a layer's view for an eye texture).
+    unsafe { COPY_IMAGE_SUB_DATA_NV.get(&flight)(source, source_target, source_level, sx, sy, sz, destination, destination_target, destination_level, dx, dy, dz, width, height, depth) }
 }
 
 unsafe extern "system" fn bind_texture(target: u32, texture: u32) {

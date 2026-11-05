@@ -599,6 +599,41 @@ fn declares(source: &str, at: usize) -> bool {
     uniform(&source[start..end]).is_some()
 }
 
+/// A value no pixel holds: a test against it keeps what it tests in the shader (the compiler
+/// cannot drop the inputs, which would move the engine program's uniforms) while the effect it
+/// gates is gone.
+const NEVER: &str = "3.0e38";
+
+/// The fragment shader of a render program that blurs by depth (depth of field) or lays film
+/// grain, with both left out; none for any other program, or when the text is not the one known.
+///
+/// - `postprocess`, the frame's last pass, blurs by a depth-of-field amount (`dof`, from the
+///   depth and the view's focus rows: the near field of a takedown, the scripted cameras' focus,
+///   set for each eye apart) by sampling the scene's colour at a coarser mip, and adds grain
+///   (`samp_grainmap`). Both are made 0; the rest (glare, colour grading, the screen overlay, the
+///   damage distortion's blur, sharpening, the colour cube) is as it was.
+/// - `calcdepthoffieldvalues` and `calcdepthoffieldmaxkernel` give the slower modes' filter passes
+///   their blur sizes: made 0, the filters sample each pixel itself.
+pub fn without_blur_or_grain(name: &str, fragment: &str) -> Option<String> {
+    let edits: &[(&str, String)] = match name {
+        "postprocess" => &[
+            ("\tfloat blur = 0.0;\n", format!("\tdof = ( dof == {NEVER} ) ? dof : 0.0;\n\tfloat blur = 0.0;\n")),
+            ("final.xyz += grain;", format!("final.xyz += ( grain.x == {NEVER} ) ? grain : vec3( 0.0 );")),
+        ],
+        "calcdepthoffieldvalues" => &[("out_FragColor0 = vec4( dof * 0.1 );", format!("out_FragColor0 = vec4( ( dof == {NEVER} ) ? dof * 0.1 : 0.0 );"))],
+        "calcdepthoffieldmaxkernel" => &[("out_FragColor0 = vec4( res );", format!("out_FragColor0 = vec4( ( res == {NEVER} ) ? res : 0.0 );"))],
+        _ => return None,
+    };
+    let mut out = fragment.to_owned();
+    for (from, to) in edits {
+        if out.matches(from).count() != 1 {
+            return None;
+        }
+        out = out.replacen(from, to, 1);
+    }
+    Some(out)
+}
+
 /// The names of the fragment shader's outputs (`out vec4 out_FragColor0;`).
 pub fn outputs(fragment: &str) -> Vec<String> {
     fragment

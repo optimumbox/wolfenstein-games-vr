@@ -1,5 +1,21 @@
 use super::*;
 
+#[test]
+fn depth_of_field_and_grain_are_left_out_of_the_post_process_only() {
+    let post = "void main() {\n\tfloat dof;\n\t{\n\t\tdof = max(a, b);\n\t};\n\tfloat blur = 0.0;\n\t{\n\t\tgrain *= tempLum;\n\t\tfinal.xyz += grain;\n\t};\n}\n";
+    let out = without_blur_or_grain("postprocess", post).expect("the post-process is known");
+    assert!(out.contains("\tdof = ( dof == 3.0e38 ) ? dof : 0.0;\n\tfloat blur = 0.0;"), "{out}");
+    assert!(out.contains("final.xyz += ( grain.x == 3.0e38 ) ? grain : vec3( 0.0 );"), "{out}");
+    assert!(!out.contains("final.xyz += grain;"), "{out}");
+    let values = without_blur_or_grain("calcdepthoffieldvalues", "\tout_FragColor0 = vec4( dof * 0.1 );\n").unwrap();
+    assert!(values.contains("vec4( ( dof == 3.0e38 ) ? dof * 0.1 : 0.0 )"), "{values}");
+    let kernel = without_blur_or_grain("calcdepthoffieldmaxkernel", "\tout_FragColor0 = vec4( res );\n").unwrap();
+    assert!(kernel.contains("vec4( ( res == 3.0e38 ) ? res : 0.0 )"), "{kernel}");
+    // Another program, or a text not the one known, is left alone.
+    assert_eq!(without_blur_or_grain("decalblood", post), None);
+    assert_eq!(without_blur_or_grain("postprocess", "void main() {}"), None);
+}
+
 const VERTEX: &str = "#version 150\n\nuniform vec4 _va_ [6];\nuniform vec4 hardwareSkinning ;\nuniform matrices_ubo { vec4 matrices[768]; };\nin vec4 in_Position;\n\nvoid main() {\n\tvec4 position = in_Position * _va_[0 ] + _va_[1 ];\n\tgl_Position.x = dot4( position, _va_[2 ] );\n\tgl_Position.y = dot4( position, _va_[3 ] );\n\tgl_Position.z = dot4( position, _va_[4 ] );\n\tgl_Position.w = dot4( position, _va_[5 ] );\n}\n";
 
 #[test]
