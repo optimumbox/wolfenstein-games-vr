@@ -19,15 +19,23 @@ use monaka_hook::{InFlight, Original, mem};
 use monaka_producer::Rejection;
 use monaka_producer::game::{Lack, Start};
 use monaka_stereo::same_frame::PAIRS;
-use std::sync::OnceLock;
+use monaka_body::look::Share;
+use monaka_core::sync::Locked;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
+
+/// The share is held while the game holds it ([`camera_taken::holds`]: a mounted gun, a machine
+/// driven, the wheel) and while another camera has the view ([`TAKEOVER`]).
+fn holds() -> bool {
+    camera_taken::holds() || camera_taken::controlled()
+}
 
 /// The Wolfensteins look by the command: the head the same-frame loop holds, the player's own pitch
 /// kept level only while the game's pad is on; another camera has the view while the game's view
 /// camera getter says so; the share held as it was on a mounted gun, in a driven machine and while
 /// the weapon wheel is open ([`camera_taken::holds`]).
 impl Looks for Wolf {
-    const DELIVERY: Delivery<Self> = Delivery::Command { head: || PAIRS.head().current(), levels: || crate::on(crate::GAMEPAD_AT), holds: camera_taken::holds, pitch: Pitch::Own };
+    const DELIVERY: Delivery<Self> = Delivery::Command { head: || PAIRS.head().current(), levels: || crate::on(crate::GAMEPAD_AT), holds: holds, pitch: Pitch::Own };
     const REPORTS: &'static [Situation] = &[Situation::CameraTaken];
 
     fn install(start: &mut Start<'_, Self>) -> Result<(), Lack> {
@@ -79,12 +87,102 @@ pub unsafe extern "system" fn usercmd_builder(generator: usize, out: usize, play
         let snapped = crate::cooking::body_forward::take_snapped();
         engine::COMMANDS.rewrite(generator, out, player as u32 as usize, scale, |pitch, yaw| {
             let yaw = yaw - snapped;
+            let (pitch, yaw) = TAKEOVER.locked().command(pitch, yaw, camera_taken::controlled() && !camera_taken::mounted(), monaka_body::look::baked::<Wolf>(None));
             let built = command::built(pitch, yaw).or((snapped != 0.0).then_some((pitch, yaw)));
             // On a mounted gun, turned toward where the right controller points.
             let (p, y) = built.unwrap_or((pitch, yaw));
-            crate::cooking::turret_aim::steer(p, y).or(built)
+            let out = crate::cooking::turret_aim::steer(p, y).or(built);
+            TAKEOVER.locked().sent(out.unwrap_or((p, y)));
+            out
         });
     }
     result
 }
 
+
+/// Another camera taking the view (a ladder's mount, a grab, a scene): the head's share stays in
+/// the player's angles as it was, so the game sees no turn the size of the head's at the take (a
+/// ladder taken from the water let go of at once with the head's pitch pulled out). If the game
+/// set the angles meanwhile (a scene ending where it faces), they hold no share at the end: the
+/// held one is put back in for the look to take out, and the head's goes on them.
+pub static TAKEOVER: Mutex<Takeover> = Mutex::new(Takeover::new());
+
+/// The angles the game set at the end of a takeover differ from the last sent by more than this
+/// (degrees).
+pub const SET_BY_GAME: f32 = 2.0;
+
+pub struct Takeover {
+    /// The share the angles held before the take, while not taken.
+    before: Option<Share>,
+    taken: bool,
+    /// The angles last sent (pitch, yaw).
+    last: Option<(f32, f32)>,
+    /// Takeovers ended with the angles as left, and with the game's own.
+    kept: u64,
+    set: u64,
+}
+
+impl Takeover {
+    pub const fn new() -> Self {
+        Self { before: None, taken: false, last: None, kept: 0, set: 0 }
+    }
+
+    /// A command's angles as built (pitch, yaw) with another camera on the view (`taken`) or not,
+    /// the look's share now (`share`): as the look should take them.
+    pub fn command(&mut self, pitch: f32, yaw: f32, taken: bool, share: Option<Share>) -> (f32, f32) {
+        let was = std::mem::replace(&mut self.taken, taken);
+        if taken {
+            return (pitch, yaw);
+        }
+        let mut out = (pitch, yaw);
+        if was && let Some(held) = self.before {
+            let set = self.last.is_some_and(|(p, y)| (pitch - p).abs() > SET_BY_GAME || crate::cooking::turret_aim::wrapped(yaw, y).abs() > SET_BY_GAME);
+            if set {
+                out = command::reshare(pitch, yaw, Share::default(), held);
+                self.set += 1;
+            } else {
+                self.kept += 1;
+            }
+            if self.kept + self.set <= 40 {
+                monaka_producer::log!(
+                    "look: another camera let go of the view; the angles {} (the head's share held {:.1} yaw, {:.1} pitch degrees)",
+                    if set { "set by the game: the share goes on them" } else { "as left: the share stays in them" },
+                    held.yaw.to_degrees(),
+                    held.pitch.to_degrees()
+                );
+            }
+        }
+        if let Some(share) = share {
+            self.before = Some(share);
+        }
+        out
+    }
+
+    pub fn sent(&mut self, angles: (f32, f32)) {
+        self.last = Some(angles);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_takeover_keeps_the_share_and_puts_it_back_on_angles_the_game_set() {
+        let share = Share { yaw: 0.5, pitch: 0.3 };
+        let mut t = Takeover::new();
+        assert_eq!(t.command(-10.0, 40.0, false, Some(share)), (-10.0, 40.0));
+        t.sent((-10.0, 40.0));
+        // Taken: the angles go through as they are.
+        assert_eq!(t.command(-10.0, 40.0, true, None), (-10.0, 40.0));
+        t.sent((-10.0, 40.0));
+        // Let go with the angles as left: the share is still in them.
+        assert_eq!(t.command(-10.0, 40.0, false, Some(share)), (-10.0, 40.0));
+        t.sent((-10.0, 40.0));
+        // Let go with the angles the game set: the held share is put in for the look to take out.
+        t.command(-10.0, 40.0, true, None);
+        let (pitch, yaw) = t.command(5.0, 90.0, false, None);
+        let (held_yaw, held_pitch) = (share.yaw.to_degrees(), -share.pitch.to_degrees());
+        assert!((pitch - (5.0 + held_pitch)).abs() < 1e-3 && (yaw - (90.0 + held_yaw)).abs() < 1e-3, "{pitch} {yaw}");
+    }
+}

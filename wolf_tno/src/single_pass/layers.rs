@@ -107,6 +107,27 @@ fn level_parameter(gl: &Gl, texture: u32, pname: u32) -> i32 {
     value
 }
 
+/// Engine texture `texture` as found now: its size, format and target, and the framebuffers it is
+/// attached to (and where): for the log, once.
+pub fn describe(gl: &Gl, texture: u32) -> String {
+    let size = (level_parameter(gl, texture, gl_api::GL_TEXTURE_WIDTH), level_parameter(gl, texture, GL_TEXTURE_HEIGHT));
+    let format = level_parameter(gl, texture, GL_TEXTURE_INTERNAL_FORMAT);
+    let target = texture_parameter(gl, texture, GL_TEXTURE_TARGET);
+    let mut on = Vec::new();
+    for framebuffer in 1..=FRAMEBUFFERS_SWEPT {
+        // SAFETY: a plain query.
+        if unsafe { (gl.is_framebuffer)(framebuffer) } == 0 {
+            continue;
+        }
+        for a in attachments(gl, framebuffer) {
+            if a.kind == gl_api::GL_TEXTURE && a.name == texture {
+                on.push(format!("fb {framebuffer} at {:#x} level {}", a.point, a.level));
+            }
+        }
+    }
+    format!("texture {texture}: {}x{} format {format:#x} target {target:#x}, attached to {}", size.0, size.1, if on.is_empty() { "no framebuffer".to_owned() } else { on.join(", ") })
+}
+
 impl Layers {
     /// Stand-ins for the eye textures (`size`) attached to `seen` (the framebuffers the scene was
     /// drawn into), and for every framebuffer drawing into one of them.

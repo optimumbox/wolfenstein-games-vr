@@ -1736,6 +1736,13 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
                 }
             } else if eye_maps.is_some() {
                 state.counts.eye_maps_missing += 1;
+                // Once: what the self-shadow map read is, to stand it in for too.
+                static MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
+                if !MISSING_LOGGED.swap(true, Relaxed) {
+                    let found: Vec<String> = program.map_units.iter().map(|&unit| format!("unit {unit}: {}", super::layers::describe(gl, bound_2d(unit)))).collect();
+                    let eye_textures = state.layers.as_ref().map(|l| l.counts().0).unwrap_or(0);
+                    log!("single pass: a carried draw's self-shadow map is no eye texture (of {eye_textures}; eye size {}x{}): {}", state.size.0 / 2, state.size.1, found.join("; "));
+                }
             }
             set_switch(gl, program, true);
             if scissor_clips(state) {

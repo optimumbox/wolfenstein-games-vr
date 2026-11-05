@@ -24,7 +24,8 @@
 //!
 //! The HUD movie tints the whole screen with a sprite of one rectangle at times (swimming darkens
 //! it): on the flat screen a tint, in the HUD in front of the eyes a dark rectangle floating in the
-//! world. A sprite of the HUD movie found drawing so ([`is_fill`]) is left out from then on.
+//! world. Each rectangle the HUD movie draws over nearly all its layout is flattened as drawn
+//! ([`fill_quads`]), whichever sprite draws it.
 
 use crate::providers::engine::{self, DrawElementsFn, HudPieces, HudRenderFn, RenderSpriteFn};
 use crate::{Facts as Build, Wolf};
@@ -213,20 +214,68 @@ static CHECKLIST_SPRITES: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::
 /// Pieces' sprites drawn on surfaces of their own, by piece.
 static SPLIT: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
-/// Sprites of the HUD movie found filling its layout with a rectangle ([`is_fill`]), left out.
-static FILLS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Screen-filling rectangles of the HUD movie flattened ([`fill_quads`]), and ones of other
+/// movies seen and left as they are.
 static FILLS_HIDDEN: AtomicU64 = AtomicU64::new(0);
-/// The most vertices a screen fill draws (a rectangle or two).
-const FILL_MOST_VERTICES: i32 = 8;
+static FILLS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// The share of the layout's width and height a screen fill covers, at least.
 const FILL_COVERS: f32 = 0.9;
-/// The fills remembered at most (sprite instances, rebuilt with the HUD at a reload).
-const FILLS_MOST: usize = 64;
+/// How near a corner of the box each of a rectangle's vertices is (share of the layout).
+const FILL_CORNER: f32 = 0.02;
+/// The most vertices of one sprite's draw looked through.
+const FILL_SCAN_MOST: i32 = 4096;
 
-/// Whether a sprite drawing `vertices` vertices within `bounds` (layout units) of a layout of
-/// `layout` fills the screen: a rectangle or two over nearly all of it.
-pub fn is_fill(vertices: i32, bounds: [f32; 4], layout: (f32, f32)) -> bool {
-    (1..=FILL_MOST_VERTICES).contains(&vertices) && bounds[2] - bounds[0] >= FILL_COVERS * layout.0 && bounds[3] - bounds[1] >= FILL_COVERS * layout.1
+/// The starts of the rectangles among `points` (layout units; four vertices in a row, each at a
+/// corner of their box) that cover nearly all of a layout of `layout`: the screen tints.
+pub fn fill_quads(points: &[[f32; 2]], layout: (f32, f32)) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 4 <= points.len() {
+        let quad = &points[i..i + 4];
+        let (x0, x1) = quad.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
+        let (y0, y1) = quad.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p[1]), hi.max(p[1])));
+        let near = |v: f32, a: f32, b: f32, size: f32| (v - a).abs() <= FILL_CORNER * size || (v - b).abs() <= FILL_CORNER * size;
+        let corners = quad.iter().all(|p| near(p[0], x0, x1, layout.0) && near(p[1], y0, y1, layout.1));
+        if corners && x1 - x0 >= FILL_COVERS * layout.0 && y1 - y0 >= FILL_COVERS * layout.1 {
+            starts.push(i);
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    starts
+}
+
+/// After `sprite` drew vertices `from..to`: its rectangles over nearly all the layout, if it is of
+/// the HUD movie, flattened onto a point (drawn, they cover nothing).
+fn hide_fills(facts: &Facts, sprite: usize, from: i32, to: i32, layout: (f32, f32)) {
+    let Some(base) = mem::read::<usize>(facts.exe.at(facts.pieces.gui_vertices)).filter(|&b| b != 0) else { return };
+    let from = from.max(0);
+    let to = to.min(from + FILL_SCAN_MOST);
+    let at = |i: i32| base + i as usize * engine::GUI_VERTEX_SIZE;
+    let points: Vec<[f32; 2]> = (from..to).map(|i| mem::read::<[f32; 2]>(at(i)).filter(|p| p.iter().all(|v| v.is_finite())).unwrap_or([f32::NAN; 2])).collect();
+    let quads = fill_quads(&points, layout);
+    if quads.is_empty() {
+        return;
+    }
+    let movie = movie_name(sprite);
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if movie.as_deref() != Some("hudmain") {
+        FILLS_ELSEWHERE.fetch_add(1, Relaxed);
+        if LOGGED.fetch_add(1, Relaxed) < 20 {
+            log!("HUD pieces: {} of the {movie:?} movie fills the screen ({} vertices drawn): left as it is", crate::research::hud_sprites::path(sprite), to - from);
+        }
+        return;
+    }
+    for &q in &quads {
+        let point = points[q];
+        for k in 0..4 {
+            mem::write(at(from + (q + k) as i32), point);
+        }
+    }
+    if FILLS_HIDDEN.fetch_add(quads.len() as u64, Relaxed) == 0 || LOGGED.fetch_add(1, Relaxed) < 20 {
+        log!("HUD pieces: {} fills the screen ({} rectangles in {} vertices drawn): flattened", crate::research::hud_sprites::path(sprite), quads.len(), to - from);
+    }
 }
 
 /// The name of `sprite`'s movie (its topmost parent's).
@@ -243,7 +292,7 @@ fn movie_name(sprite: usize) -> Option<String> {
 
 pub fn summary() -> String {
     format!(
-        "HUD pieces: ammo drawn apart {} times (left), {} (right), checklists {}; {} draws into the panels; crosshair drawn apart {} times in a driven machine, {} draws moved onto its aim, {} times left out (hidden); screen fills left out {} times ({} sprites)",
+        "HUD pieces: ammo drawn apart {} times (left), {} (right), checklists {}; {} draws into the panels; crosshair drawn apart {} times in a driven machine, {} draws moved onto its aim, {} times left out (hidden); screen fills flattened {} times, {} of other movies left",
         SPLIT[LEFT_HAND].load(Relaxed),
         SPLIT[RIGHT_HAND].load(Relaxed),
         SPLIT[CHECKLISTS].load(Relaxed),
@@ -252,7 +301,7 @@ pub fn summary() -> String {
         CROSSHAIR_MOVED.load(Relaxed),
         CROSSHAIR_HIDDEN.load(Relaxed),
         FILLS_HIDDEN.load(Relaxed),
-        FILLS.locked().len()
+        FILLS_ELSEWHERE.load(Relaxed)
     )
 }
 
@@ -406,33 +455,19 @@ unsafe extern "system" fn render_sprite(swf: usize, gui: usize, sprite: usize, s
     let mark = piece.map(|piece| MARKS[piece]).or(crosshair.then_some(CROSSHAIR_MARK));
     let (Some(mark), Some(facts)) = (mark, FACTS.get()) else {
         let Some(facts) = FACTS.get().filter(|_| sprite != 0) else { return original() };
-        if FILLS.locked().contains(&sprite) {
-            FILLS_HIDDEN.fetch_add(1, Relaxed);
-            return;
-        }
         let from = vertex_count(facts);
         original();
         let (Some(from), Some(to)) = (from, vertex_count(facts)) else { return };
-        let probing = crate::research::hud_sprites::wanted(sprite);
-        if to <= from || !(probing || to - from <= FILL_MOST_VERTICES) {
+        if to <= from {
             return;
         }
-        let (Some(bounds), Some(layout)) = (written_box(facts, from, to), layout(gui, facts)) else { return };
+        let probing = crate::research::hud_sprites::wanted(sprite);
+        let Some(layout) = layout(gui, facts) else { return };
         // Which sprite is drawn where, once each (`research::hud_sprites`).
-        if probing {
+        if probing && let Some(bounds) = written_box(facts, from, to) {
             crate::research::hud_sprites::drawn(sprite, bounds, layout);
         }
-        if is_fill(to - from, bounds, layout) && movie_name(sprite).is_some_and(|m| m == "hudmain") {
-            let mut fills = FILLS.locked();
-            if fills.len() >= FILLS_MOST {
-                fills.clear();
-            }
-            fills.push(sprite);
-            static LOGGED: AtomicU64 = AtomicU64::new(0);
-            if LOGGED.fetch_add(1, Relaxed) < 20 {
-                log!("HUD pieces: {} fills the screen ({} vertices over {bounds:.0?} of a {:.0}x{:.0} layout): left out from here", crate::research::hud_sprites::path(sprite), to - from, layout.0, layout.1);
-            }
-        }
+        hide_fills(facts, sprite, from, to, layout);
         return;
     };
     // Room for the two surfaces this adds, or it is drawn as the game draws it.
