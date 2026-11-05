@@ -11,6 +11,10 @@
 //! The expectation is learnt from the GPU itself: a timestamp is written before each of the game's
 //! draws and at the swap, read back a few frames later, and the time from one stamp to the next
 //! (the draw's work and whatever came before the next one, idle time included) kept per program.
+//! Only one frame in [`SAMPLE`] is stamped: a stamp before every draw (about two thousand a frame)
+//! and their reading back cost the render thread enough to make the game miss refreshes. The
+//! flushes go on every frame from what the sampled frames taught.
+//!
 //! Every [`WINDOW`] the costliest programs, the longest single stretch and the flushes added are
 //! logged.
 
@@ -33,6 +37,8 @@ const STAMPS: usize = 2048;
 const WINDOW: Duration = Duration::from_secs(10);
 /// How much of a program's expected cost each new frame's measure takes.
 const LEARN: f64 = 0.2;
+/// One frame in this many is stamped (and later read); the rest only flush.
+const SAMPLE: u64 = 16;
 
 const GL_TIMESTAMP: u32 = 0x8E28;
 const GL_QUERY_RESULT: u32 = 0x8866;
@@ -80,6 +86,10 @@ struct Pieces {
     expected: HashMap<Mark, f64>,
     /// The expected GPU time sent since the last flush.
     piece: f64,
+    /// Swaps seen, to pick the frames stamped.
+    swaps: u64,
+    /// The frame under way is stamped.
+    timing: bool,
     window: Window,
 }
 
@@ -133,6 +143,11 @@ pub fn before_draw() {
     p.stamp(mark);
 }
 
+/// Whether the frame after swap number `swaps` is stamped.
+pub fn sampled(swaps: u64) -> bool {
+    swaps % SAMPLE == 0
+}
+
 /// Whether to flush ahead of a draw expected to cost `cost` with `piece` already sent unflushed.
 pub fn splits(piece: f64, cost: f64) -> bool {
     piece > 0.0 && piece + cost > BUDGET_NS && (cost >= ALONE_NS || piece >= BUDGET_NS)
@@ -168,6 +183,8 @@ pub fn swap(publishing: bool, name: impl Fn(u32) -> Option<&'static str>) {
     p.piece = 0.0;
     p.at = (p.at + 1) % RING;
     p.read_oldest();
+    p.swaps += 1;
+    p.timing = sampled(p.swaps);
     // The new frame's stamps begin at the same swap, so its hand-off is timed with it.
     p.stamp(Mark::Swap);
     if p.window.start.elapsed() >= WINDOW {
@@ -208,10 +225,13 @@ impl Pieces {
                 Frame { queries, marks: Vec::with_capacity(STAMPS) }
             })
             .collect();
-        Some(Self { gl, frames, at: 0, expected: HashMap::new(), piece: 0.0, window: Window::new() })
+        Some(Self { gl, frames, at: 0, expected: HashMap::new(), piece: 0.0, swaps: 0, timing: false, window: Window::new() })
     }
 
     fn stamp(&mut self, mark: Mark) {
+        if !self.timing {
+            return;
+        }
         let frame = &mut self.frames[self.at];
         let Some(&query) = frame.queries.get(frame.marks.len()) else { return };
         // SAFETY: one of our query names, given the GPU's time when the commands before it are done.
@@ -323,6 +343,12 @@ mod tests {
         assert!(!splits(480_000.0, 30_000.0));
         // ...but a piece already at the budget is flushed whatever follows.
         assert!(splits(500_000.0, 10_000.0));
+    }
+
+    #[test]
+    fn one_frame_in_sixteen_is_stamped() {
+        let stamped: Vec<u64> = (1..=48).filter(|&n| sampled(n)).collect();
+        assert_eq!(stamped, vec![16, 32, 48]);
     }
 
     #[test]
