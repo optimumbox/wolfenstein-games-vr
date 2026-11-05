@@ -122,6 +122,11 @@ pub fn allows(hz: i32) -> bool {
     headset_period().is_none_or(|period| refreshes_per_frame(period, hz).is_some())
 }
 
+/// Whether frames start on the headset's grid now (the game in play; not in its menus).
+pub fn pacing() -> bool {
+    PACING.load(Acquire)
+}
+
 /// How long the last frame waited for its slot (microseconds), taken once.
 pub fn take_waited_us() -> u64 {
     WAITED_US.swap(0, Relaxed)
@@ -276,7 +281,7 @@ fn set_pacing(pacing: bool) {
 }
 
 /// Waits (sleeping, then spinning the last stretch) until `slot` on the performance counter.
-fn wait_until(slot: u64) {
+pub(crate) fn wait_until(slot: u64) {
     loop {
         let now = now_ns();
         if now >= slot {

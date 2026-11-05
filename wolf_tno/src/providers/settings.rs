@@ -57,6 +57,7 @@ fn install_settings(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
     }
     no_screen_blur(start.ledger, &exe, build);
     log_streaming(&exe);
+    gpu_decoding(start.ledger, &exe);
     crate::research::cvars::apply(start.ledger, &exe);
     crate::research::cvars::prepare_cycle(start.ledger, &exe);
     // Kept at 0 by the ledger (what it holds at the stop goes back), so the world never stays
@@ -93,14 +94,61 @@ const STREAMING: &[&str] = &[
 ];
 
 fn log_streaming(exe: &Module) {
-    let values: Vec<String> = STREAMING
-        .iter()
-        .filter_map(|name| {
-            let cvar = Cvar::find(exe, name, eng_idt::Layout::ID_TECH_5)?;
-            Some(format!("{name} {} ({})", cvar.int(exe)?, cvar.float(exe)?))
-        })
-        .collect();
+    let found: Vec<(&'static str, &'static Cvar)> = STREAMING.iter().filter_map(|&name| Some((name, Cvar::find(exe, name, eng_idt::Layout::ID_TECH_5)?))).collect();
+    let values: Vec<String> = found.iter().filter_map(|(name, cvar)| Some(format!("{name} {} ({})", cvar.int(exe)?, cvar.float(exe)?))).collect();
     log!("texture streaming settings: {}", values.join(", "));
+    let seen = found.iter().map(|(_, c)| c.int(exe)).collect();
+    let _ = WATCHED.set(Watched { exe: *exe, found, seen: std::sync::Mutex::new(seen) });
+}
+
+/// The streaming settings as last seen, for [`watch_streaming`].
+struct Watched {
+    exe: Module,
+    found: Vec<(&'static str, &'static Cvar)>,
+    seen: std::sync::Mutex<Vec<Option<i32>>>,
+}
+
+static WATCHED: OnceLock<Watched> = OnceLock::new();
+/// `vt_useCudaTranscode`, held on ([`gpu_decoding`]).
+static GPU_DECODING: OnceLock<(Module, &'static Cvar)> = OnceLock::new();
+static WATCH_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The texture pages decoded on the GPU (`vt_useCudaTranscode` 1, the game's own CUDA decoder)
+/// rather than on the CPU's job threads: the work that grows with the streaming settings raised
+/// moves off the CPU. The game's options menu writes it back to 0 whenever its video settings are
+/// applied, so it is held on ([`watch_streaming`]); the ledger puts the game's own back at the stop.
+fn gpu_decoding(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
+    let Some(cvar) = Cvar::find(exe, "vt_useCudaTranscode", eng_idt::Layout::ID_TECH_5) else { return };
+    eng_idt::set_int(ledger, exe, cvar, 1, "texture pages are decoded on the CPU");
+    let _ = GPU_DECODING.set((*exe, cvar));
+    log!("texture streaming: pages decoded on the GPU (vt_useCudaTranscode 1), held on while VR runs");
+}
+
+/// Every 45th frame on the render thread: a streaming setting changed (the options menu) is logged,
+/// and GPU decoding turned off is turned on again before the engine rebuilds its texture cache.
+pub fn watch_streaming() {
+    if WATCH_FRAMES.fetch_add(1, Relaxed) % 45 != 0 {
+        return;
+    }
+    if let Some((exe, cvar)) = GPU_DECODING.get()
+        && cvar.int(exe) == Some(0)
+    {
+        cvar.set_int(exe, 1);
+        log!("texture streaming: the game turned GPU decoding off (vt_useCudaTranscode 0); on again");
+    }
+    let Some(w) = WATCHED.get() else { return };
+    let Ok(mut seen) = w.seen.lock() else { return };
+    let mut changed = Vec::new();
+    for ((name, cvar), last) in w.found.iter().zip(seen.iter_mut()) {
+        let now = cvar.int(&w.exe);
+        if now != *last {
+            changed.push(format!("{name} {} -> {}", last.map_or("?".to_owned(), |v| v.to_string()), now.map_or("?".to_owned(), |v| v.to_string())));
+            *last = now;
+        }
+    }
+    if !changed.is_empty() {
+        log!("texture streaming settings changed: {}", changed.join(", "));
+    }
 }
 
 /// What shakes the view, each set to 0 while the screen shake is off: the camera shakes

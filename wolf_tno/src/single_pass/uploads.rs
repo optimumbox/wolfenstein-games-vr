@@ -128,6 +128,7 @@ static FRAMES: Mutex<Frames> = Mutex::new(Frames { last: None, window_start: Non
 /// At each of the game's frames (render thread): the frame's tally, logged if it was slow, and the
 /// window's summary every [`WINDOW`].
 pub fn end_frame() {
+    crate::providers::settings::watch_streaming();
     let Ok(mut f) = FRAMES.lock() else { return };
     let now = Instant::now();
     let tally = Tally::take();

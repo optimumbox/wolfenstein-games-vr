@@ -284,6 +284,7 @@ pub unsafe extern "system" fn swap_buffers(dc: HDC) -> BOOL {
         true => {
             // SAFETY: flushes the game's current context on its own thread.
             unsafe { windows::Win32::Graphics::OpenGL::glFlush() };
+            desktop::hold();
             BOOL::from(true)
         }
         // SAFETY: forwards the game's own call.
@@ -374,6 +375,42 @@ mod desktop {
 
     static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
 
+    /// The last flushed frame's due time (nanoseconds; 0: none).
+    static DUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static HELD_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// The headset's refresh when the viewer has not sent one (90 Hz).
+    const DEFAULT_PERIOD_NS: u64 = 11_111_111;
+
+    /// After a flushed frame: unless the frame pacing holds the game to the headset (in play),
+    /// the render thread waits for the next headset refresh. A skipped swap was the only thing
+    /// slowing the game's menus, which ran some 750 frames a second with nothing to wait for and
+    /// took the GPU and CPU from the headset.
+    pub fn hold() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::cooking::frame_pacing::pacing() {
+            DUE.store(0, Relaxed);
+            return;
+        }
+        let period = crate::cooking::frame_pacing::headset_period().unwrap_or(DEFAULT_PERIOD_NS);
+        let now = monaka_channel::pose::now_ns();
+        let due = next_due(DUE.load(Relaxed), period, now);
+        if !HELD_LOGGED.swap(true, Relaxed) {
+            log!("desktop window: frames outside play are held to the headset's refresh ({:.1} Hz) while the window's present is skipped", 1e9 / period as f64);
+        }
+        crate::cooking::frame_pacing::wait_until(due);
+        DUE.store(due, Relaxed);
+    }
+
+    /// When the next frame is due after one due at `last` (0: none), a `period` apart, at `now`:
+    /// the next on the grid, or now when the grid fell a period behind.
+    pub(super) fn next_due(last: u64, period: u64, now: u64) -> u64 {
+        match last {
+            0 => now,
+            _ if last + period + period < now => now,
+            _ => last + period,
+        }
+    }
+
     pub fn skips(publishing: bool) -> bool {
         WATCH.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Watch::default).skips(publishing)
     }
@@ -403,6 +440,15 @@ mod desktop {
             assert!(off && watch.skips(true) && watch.times == 1);
             assert!(!watch.skips(false), "back once the pairs stop");
             assert!(!watch.swapped(false, Duration::from_millis(10)));
+        }
+
+        /// Frames come a refresh apart; one far behind starts the grid afresh.
+        #[test]
+        fn held_frames_come_a_refresh_apart() {
+            assert_eq!(next_due(0, 100, 5_000), 5_000);
+            assert_eq!(next_due(5_000, 100, 5_010), 5_100);
+            assert_eq!(next_due(5_000, 100, 5_150), 5_100);
+            assert_eq!(next_due(5_000, 100, 5_300), 5_300);
         }
     }
 }
