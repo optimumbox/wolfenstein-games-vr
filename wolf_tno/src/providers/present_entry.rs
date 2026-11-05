@@ -270,7 +270,9 @@ pub unsafe extern "system" fn swap_buffers(dc: HDC) -> BOOL {
     crate::providers::window_size::seen(dc);
     crate::single_pass::draws::frame(crate::on(crate::SINGLE_PASS_AT));
     vsync::follow(PAIRS.publishing());
+    crate::single_pass::pieces::swap(PAIRS.publishing(), crate::single_pass::draws::program_name);
     gl::present(dc);
+    crate::single_pass::pieces::handed();
     crate::cooking::frame_pacing::published();
     if let Some(at) = started {
         use monaka_contract::debug_draw::Cost;

@@ -634,6 +634,11 @@ fn set_pair_depth(pair: Option<(u32, u32, u32)>) {
     }
 }
 
+/// A converted program's render program name, for the logs.
+pub fn program_name(program: u32) -> Option<&'static str> {
+    STATE.locked().as_ref()?.programs.get(&program).map(|p| p.converted.name)
+}
+
 pub fn frame(on: bool) {
     let mut guard = STATE.locked();
     if guard.is_none() {
@@ -2361,6 +2366,7 @@ unsafe extern "system" fn use_program(program: u32) {
     if let Some(state) = STATE.locked().as_mut() {
         state.current = program;
     }
+    super::pieces::program(program);
     // SAFETY: forwards the game's own call.
     unsafe { USE_PROGRAM.get(&flight)(program) }
 }
@@ -2797,6 +2803,7 @@ macro_rules! draw_detour {
             let mut shape = call;
             $(shape = (shape ^ $counted as usize as u64).wrapping_mul(0x0000_0100_0000_01b3);)*
             if draw(geometry, shape) {
+                super::pieces::before_draw();
                 // SAFETY: forwards the game's own call.
                 unsafe { $original.get(&flight)($($arg),*) }
             }
