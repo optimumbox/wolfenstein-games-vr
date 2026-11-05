@@ -142,9 +142,17 @@ fn compressed_pages(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) 
     log!("texture streaming: the texture cache's pages stored compressed (vt_uncompressedPhysicalImages 0)");
 }
 
-/// Every 45th frame on the render thread: a streaming setting changed (the options menu) is logged,
+/// On the render thread, every 45th frame: a streaming setting changed (the options menu) is logged,
 /// and GPU decoding turned off is turned on again before the engine rebuilds its texture cache.
 pub fn watch_streaming() {
+    // Every frame: the game's options code sets it back to 1 when it starts and whenever its video
+    // settings are applied, and rebuilds the texture cache soon after; it has to be 0 by then.
+    if let Some((exe, cvar)) = COMPRESSED.get()
+        && cvar.int(exe) == Some(1)
+    {
+        cvar.set_int(exe, 0);
+        log!("texture streaming: the game set the texture cache's pages uncompressed (vt_uncompressedPhysicalImages 1); compressed again");
+    }
     if WATCH_FRAMES.fetch_add(1, Relaxed) % 45 != 0 {
         return;
     }
@@ -153,12 +161,6 @@ pub fn watch_streaming() {
     {
         cvar.set_int(exe, 1);
         log!("texture streaming: the game turned GPU decoding off (vt_useCudaTranscode 0); on again");
-    }
-    if let Some((exe, cvar)) = COMPRESSED.get()
-        && cvar.int(exe) == Some(1)
-    {
-        cvar.set_int(exe, 0);
-        log!("texture streaming: the game set the texture cache's pages uncompressed (vt_uncompressedPhysicalImages 1); compressed again");
     }
     let Some(w) = WATCHED.get() else { return };
     let Ok(mut seen) = w.seen.lock() else { return };
