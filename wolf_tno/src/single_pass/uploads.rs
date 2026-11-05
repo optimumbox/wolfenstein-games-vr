@@ -163,12 +163,37 @@ pub fn end_frame() {
             f.worst.0.as_secs_f64() * 1e3,
             f.worst.1.describe()
         );
+        log_video_memory();
         f.window_start = Some(now);
         f.window = Tally::default();
         f.worst = (Duration::ZERO, Tally::default());
         f.frames = 0;
         f.slow = 0;
     }
+}
+
+/// The GPU's memory as the driver tells the game's context (GL_NVX_gpu_memory_info): what is free,
+/// and what the driver evicted to system memory to make room since the last report. Evictions show
+/// the game's textures no longer fitting beside everything else on the GPU.
+fn log_video_memory() {
+    const AVAILABLE: u32 = 0x9049;
+    const EVICTIONS: u32 = 0x904A;
+    const EVICTED: u32 = 0x904B;
+    static LAST: Mutex<(i32, i32)> = Mutex::new((0, 0));
+    let (mut available, mut evictions, mut evicted) = (-1, -1, -1);
+    // SAFETY: plain queries on the game's current context, on its render thread.
+    unsafe {
+        windows::Win32::Graphics::OpenGL::glGetIntegerv(AVAILABLE, &mut available);
+        windows::Win32::Graphics::OpenGL::glGetIntegerv(EVICTIONS, &mut evictions);
+        windows::Win32::Graphics::OpenGL::glGetIntegerv(EVICTED, &mut evicted);
+    }
+    if available < 0 {
+        return;
+    }
+    let Ok(mut last) = LAST.lock() else { return };
+    let (since, since_kb) = (evictions - last.0, evicted - last.1);
+    *last = (evictions, evicted);
+    log!("video memory: {} MB free; {} evictions ({} MB) since the last report", available / 1024, since, since_kb / 1024);
 }
 
 pub unsafe extern "system" fn tex_sub_image_2d(target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, kind: u32, pixels: *const c_void) {

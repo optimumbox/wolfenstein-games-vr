@@ -111,6 +111,8 @@ struct Watched {
 static WATCHED: OnceLock<Watched> = OnceLock::new();
 /// `vt_useCudaTranscode`, held on ([`gpu_decoding`]).
 static GPU_DECODING: OnceLock<(Module, &'static Cvar)> = OnceLock::new();
+/// `vt_uncompressedPhysicalImages`, held at 0 ([`compressed_pages`]).
+static COMPRESSED: OnceLock<(Module, &'static Cvar)> = OnceLock::new();
 static WATCH_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The texture pages decoded on the GPU (`vt_useCudaTranscode` 1, the game's own CUDA decoder)
@@ -130,11 +132,13 @@ fn gpu_decoding(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
 /// of the memory, and every texture read of the scene (both eyes at the headset's size) reads a
 /// quarter of the bytes. The game keeps them uncompressed for the CPU decoder's sake; the cost of
 /// that grows with the VT cache setting, which is what made any cache above low too heavy for VR.
-/// Set before the level's texture cache is made, and not changed under a cache already made: the
-/// game reads it when it rebuilds the cache (a level load, or its video settings applied).
+/// The game reads it when it rebuilds the cache (a level load, or its video settings applied), and
+/// puts its archived value back at each level load: held at 0 ([`watch_streaming`]), as is the
+/// archived value in wolfConfig.cfg.
 fn compressed_pages(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
     let Some(cvar) = Cvar::find(exe, "vt_uncompressedPhysicalImages", eng_idt::Layout::ID_TECH_5) else { return };
     eng_idt::set_int(ledger, exe, cvar, 0, "texture cache pages are stored uncompressed (RGBA8)");
+    let _ = COMPRESSED.set((*exe, cvar));
     log!("texture streaming: the texture cache's pages stored compressed (vt_uncompressedPhysicalImages 0)");
 }
 
@@ -149,6 +153,12 @@ pub fn watch_streaming() {
     {
         cvar.set_int(exe, 1);
         log!("texture streaming: the game turned GPU decoding off (vt_useCudaTranscode 0); on again");
+    }
+    if let Some((exe, cvar)) = COMPRESSED.get()
+        && cvar.int(exe) == Some(1)
+    {
+        cvar.set_int(exe, 0);
+        log!("texture streaming: the game set the texture cache's pages uncompressed (vt_uncompressedPhysicalImages 1); compressed again");
     }
     let Some(w) = WATCHED.get() else { return };
     let Ok(mut seen) = w.seen.lock() else { return };
