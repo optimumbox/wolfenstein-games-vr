@@ -80,6 +80,23 @@ fn barrel() -> Option<([f32; 3], [f32; 9])> {
     Some((placed.origin, placed.axis))
 }
 
+static FROM_BODY_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// The head's shift for the focus: none while the player's own camera has the view. What the
+/// focus finds there the game checks again from the player's own eye as it acts on it (a
+/// takedown's prompt shown from the head leaning in, refused from the body behind it: a plain
+/// swing instead), so it traces from that eye, turned where the head looks, as on a flat screen.
+/// A cutscene's camera has no body to check from: the head's shift stays.
+fn play_shift(shift: [f32; 3]) -> [f32; 3] {
+    if crate::providers::camera_taken::controlled() {
+        return shift;
+    }
+    if !FROM_BODY_LOGGED.swap(true, Relaxed) {
+        log!("focus: in play the focus traces from the player's own eye, turned where the head looks (the head {:.1} units off it now)", shift.iter().map(|v| v * v).sum::<f32>().sqrt());
+    }
+    [0.0; 3]
+}
+
 unsafe extern "system" fn focus_update(tracker: usize, player: usize, origin: *const f32, axis: *const f32, extra: usize) {
     let flight = InFlight::enter();
     let view = (!origin.is_null() && !axis.is_null())
@@ -87,7 +104,7 @@ unsafe extern "system" fn focus_update(tracker: usize, player: usize, origin: *c
         .flatten();
     let moved = match barrel() {
         Some(barrel) => Some(barrel),
-        None => crate::on(crate::EYES_AT).then(follow_head::head_from_camera).flatten().zip(view).map(|((shift, turn), (o, rows))| followed(o, &rows, shift, &turn)),
+        None => crate::on(crate::EYES_AT).then(follow_head::head_from_camera).flatten().zip(view).map(|((shift, turn), (o, rows))| followed(o, &rows, play_shift(shift), &turn)),
     };
     match moved {
         Some((o, rows)) if o.iter().chain(&rows).all(|v| v.is_finite()) => {

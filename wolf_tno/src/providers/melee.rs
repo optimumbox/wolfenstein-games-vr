@@ -150,7 +150,7 @@ fn note_press(pad: &Gamepad) {
     PRESS_BUILD.store(crate::providers::eye_site::builds(), Relaxed);
     PRESS_SWUNG.store(false, Relaxed);
     log!(
-        "melee press: {} handed to the game; left hand's own item {:?}, right hand {:?}; swings attack {}, quick melee under way {quick}; another camera {}, a grab {}; the game's melee starts passed {}, held back {}",
+        "melee press: {} handed to the game; left hand's own item {:?}, right hand {:?}; swings attack {}, quick melee under way {quick}; another camera {}, a grab {}; the game's melee starts passed {}, held back {}; the head {:.1} units off the game camera",
         match pressed { 1 => "the melee button", 2 => "the right trigger", _ => "the melee button and the right trigger" },
         held_item::dual().then(held_item::left_item_name).flatten(),
         right,
@@ -158,7 +158,8 @@ fn note_press(pad: &Gamepad) {
         crate::providers::camera_taken::controlled(),
         crate::providers::camera_taken::grabbed(),
         PASSED[0].load(Relaxed),
-        HELD_BACK[0].load(Relaxed)
+        HELD_BACK[0].load(Relaxed),
+        crate::providers::follow_head::head_from_camera().map_or(f32::NAN, |(shift, _)| shift.iter().map(|v| v * v).sum::<f32>().sqrt())
     );
 }
 
