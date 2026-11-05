@@ -20,15 +20,15 @@ use monaka_contract::protocol::{HeadPose, LEFT_HAND, RIGHT_HAND};
 use monaka_core::math::{Vec3, forward_axis};
 use monaka_core::sync::Locked;
 use monaka_hook::{InFlight, Original, mem};
-use monaka_producer::game::{Component, Lack, OrMissing, Start, Switch, place};
+use monaka_producer::game::{Component, Lack, OrMissing, Start, Switch};
 use monaka_producer::log;
-use std::sync::atomic::{AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
 use std::sync::{Mutex, OnceLock};
 
 pub const MECH_LEVERS_OPTION: Opt = opt(
     "mech_levers",
     "Aim the mech with your hands",
-    "Pull both controllers back to aim up, push them forward to aim down. Off: the right stick aims it.",
+    "Pull both controllers back to aim up, push them forward to aim down. Off: the right controller aims it.",
     Kind::Switch { default: false },
 )
 .on(Shown::Game)
@@ -39,16 +39,36 @@ pub const MECH_LEVERS: Component<Wolf> = Component {
     name: "mech_levers",
     games: &["wolf_tno"],
     options: &[MECH_LEVERS_OPTION],
-    switch: Some(SWITCH),
+    settings: |options, manifest| {
+        SWITCH.on(options, manifest);
+    },
     install,
     summary: Some(summary),
     ..Component::NONE
 };
 
-/// The mech aimed by the right stick (`mech_levers=0`).
+/// The mech aimed by the right stick or the right controller (`mech_levers=0`). Read at the
+/// install, not as the component's switch: the mech's hook is placed either way, to say when the
+/// player is in the mech (`turret_aim`).
 pub const SWITCH: Switch = Switch::new("mech_levers", false, "the right stick aims the mech");
 
-pub(crate) const MECH_LEVERS_AT: usize = place::<Wolf>(&MECH_LEVERS);
+/// Whether the levers aim the mech (`mech_levers`), read at the install.
+static LEVERS_ON: AtomicBool = AtomicBool::new(false);
+/// When the mech's view angles were last updated (tick, ms; 0: never): the player is in the mech.
+static MECH_SEEN: AtomicU64 = AtomicU64::new(0);
+/// The mech counts as driven this long after its last update (ms).
+const SEEN_MS: u64 = 250;
+
+/// Whether the player is in the mech now (its own update ran just now).
+pub fn in_mech() -> bool {
+    let seen = MECH_SEEN.load(Relaxed);
+    seen != 0 && monaka_channel::tick().saturating_sub(seen) <= SEEN_MS
+}
+
+/// Whether the levers aim the mech.
+pub fn levers_on() -> bool {
+    LEVERS_ON.load(Relaxed)
+}
 
 /// How long after getting in the hands' rest is taken (ms): time to put them on the levers.
 pub const SETTLE_MS: u64 = 1000;
@@ -79,6 +99,9 @@ fn install(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
     let crate::Facts { exe, build } = *start.build;
     let facts = build.mech_aim.as_ref().or_missing(&format!("{} has no mech mapped", build.game))?;
     let _ = FACTS.set(*facts);
+    let on = SWITCH.on(start.options, start.manifest);
+    LEVERS_ON.store(on, Relaxed);
+    log!("mech_levers: {}", if on { "the hands aim the mech up and down" } else { "off (the right controller aims the mech)" });
     start.hooks.site(&VIEW_ANGLES_ORIGINAL, &exe, &facts.view_angles, view_angles)?;
     Ok(())
 }
@@ -114,7 +137,7 @@ fn both_hands() -> Option<[Vec3; 2]> {
 
 /// The pitch change that takes `mech` toward the hands' pitch, or None for the game's own.
 fn lever_change(mech: usize) -> Option<f32> {
-    if !crate::on(MECH_LEVERS_AT) {
+    if !levers_on() {
         return None;
     }
     let facts = FACTS.get()?;
@@ -157,6 +180,7 @@ fn lever_change(mech: usize) -> Option<f32> {
 /// commands'; the yaw change as the commands give it.
 unsafe extern "system" fn view_angles(mech: usize, pitch: f32, yaw: f32) {
     let flight = InFlight::enter();
+    MECH_SEEN.store(monaka_channel::tick().max(1), Relaxed);
     let pitch = lever_change(mech).unwrap_or(pitch);
     // SAFETY: forwards the game's own call, the pitch change ours while the hands aim.
     unsafe { VIEW_ANGLES_ORIGINAL.get(&flight)(mech, pitch, yaw) };

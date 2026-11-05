@@ -1,9 +1,10 @@
-//! Waits for a Monaka ready-made for machines aimed by a hand: a mounted gun aimed by the right
-//! controller.
+//! Waits for a Monaka ready-made for machines aimed by a hand: a mounted gun, and TNO's mech, aimed
+//! by the right controller.
 //!
 //! A mounted gun has the view while the player uses it and turns by the change in the player's
 //! command angles (`engine::Build::mounted_gun_vtable`), so the stick aims it and the view turns
-//! with it. With the controllers placing the guns, the right controller aims it instead:
+//! with it; the mech the same way (`engine::Driven`, `engine::MechAim`), unless its levers aim it
+//! (`mech_levers`). With the controllers placing the guns, the right controller aims them instead:
 //!
 //! - The eyes are built on the gun's view as it was when the player got on, levelled and turned
 //!   by its yaw only ([`anchored`]): the world stays put while the gun turns in it, as a gun on a
@@ -11,8 +12,11 @@
 //!   world under the player, and the controller with it).
 //! - Each command, the gun's aim (its view now) is turned toward where the right controller points
 //!   in that world ([`steer`]): a share of the difference goes into the command angles, which the
-//!   gun follows by a factor of its own; the stick still adds its own turn.
+//!   gun follows by a factor of its own.
+//! - The stick's turn turns the world the eyes keep with it ([`steer`]): the mech walks where the
+//!   stick turns it, and the controller still aims within that.
 
+use crate::extras::mech_levers;
 use crate::providers::{camera_taken, eye_site, held_item};
 use monaka_contract::protocol::RIGHT_HAND;
 use monaka_core::sync::Locked;
@@ -30,10 +34,15 @@ const MOST_STEP: f32 = 15.0;
 const DEAD_ZONE: f32 = 0.15;
 /// How often the aim's tallies are logged (commands steered).
 const LOG_EVERY: u64 = 900;
+/// A turn larger than this in one command (degrees) is no stick's (a teleport, a reload).
+const MOST_STICK: f32 = 30.0;
 
 /// The gun's view rows (forward, left, up) the eyes keep while on a mounted gun, levelled; None
 /// off one.
 static ANCHOR: Mutex<Option<[f32; 9]>> = Mutex::new(None);
+/// The yaw the last steered command went out with (degrees): what the game's own turn (the stick)
+/// is measured from at the next.
+static LAST_YAW: Mutex<Option<f32>> = Mutex::new(None);
 static STEERED: AtomicU64 = AtomicU64::new(0);
 static TALLY: Mutex<Tally> = Mutex::new(Tally::new());
 
@@ -54,10 +63,18 @@ impl Tally {
     }
 }
 
-/// Whether the right controller aims a mounted gun now: on one, with the controllers placing the
-/// guns.
+/// Whether the right controller aims a mounted gun or the mech now: on one, with the controllers
+/// placing the guns (the mech's levers not aiming it).
 fn aiming() -> bool {
-    camera_taken::on_mounted_gun() && crate::on(crate::GUNS_AT) && held_item::setup().is_some()
+    let mech = camera_taken::driving() && mech_levers::in_mech() && !mech_levers::levers_on();
+    (camera_taken::on_mounted_gun() || mech) && crate::on(crate::GUNS_AT) && held_item::setup().is_some()
+}
+
+/// Levelled rows (forward, left, up) turned by `yaw` degrees (positive left) from `rows`'.
+pub fn turned_rows(rows: &[f32; 9], yaw: f32) -> [f32; 9] {
+    let now = rows[1].atan2(rows[0]) + yaw.to_radians();
+    let (s, c) = now.sin_cos();
+    [c, s, 0.0, -s, c, 0.0, 0.0, 0.0, 1.0]
 }
 
 /// Levelled rows (forward, left, up) turned by the yaw of `rows`' forward.
@@ -77,12 +94,13 @@ pub fn anchored(player: usize, origin_axis: [f32; 12]) -> [f32; 12] {
     let mut anchor = ANCHOR.locked();
     if !aiming() {
         if anchor.take().is_some() {
-            log!("turret: off the mounted gun: the view follows the game's camera again");
+            *LAST_YAW.locked() = None;
+            log!("turret: off the mounted gun or the mech: the view follows the game's camera again");
         }
         return origin_axis;
     }
     let rows = *anchor.get_or_insert_with(|| {
-        log!("turret: on a mounted gun: the right controller aims it, the view stays where the player got on");
+        log!("turret: on a mounted gun or the mech: the right controller aims it, the view stays where the player got on and turns with the stick");
         level_rows(&std::array::from_fn(|k| origin_axis[3 + k]))
     });
     let mut out = origin_axis;
@@ -133,9 +151,21 @@ pub fn steer(pitch: f32, yaw: f32) -> Option<(f32, f32)> {
     if !aiming() {
         return None;
     }
-    let (gun, wanted) = aims()?;
+    // The game's own turn since the last command (the stick's): the world the eyes keep turns too.
+    let stick = LAST_YAW.locked().map_or(0.0, |last| wrapped(yaw, last));
+    if stick != 0.0
+        && stick.abs() <= MOST_STICK
+        && let Some(rows) = ANCHOR.locked().as_mut()
+    {
+        *rows = turned_rows(rows, stick);
+    }
+    let Some((gun, wanted)) = aims() else {
+        *LAST_YAW.locked() = Some(yaw);
+        return None;
+    };
     let (d_pitch, d_yaw) = step(gun, wanted);
     tally(gun, wanted, d_yaw);
+    *LAST_YAW.locked() = Some(yaw + d_yaw);
     Some((pitch + d_pitch, yaw + d_yaw))
 }
 
@@ -196,6 +226,12 @@ mod tests {
         }
         assert!(wrapped(wanted.0, gun.0).abs() < 0.5 && (wanted.1 - gun.1).abs() < 0.5, "{gun:?}");
         assert_eq!(step(wanted, wanted), (0.0, 0.0));
+    }
+
+    #[test]
+    fn the_stick_turns_the_kept_view_left() {
+        let rows = turned_rows(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], 90.0);
+        assert!(rows[0].abs() < 1e-6 && (rows[1] - 1.0).abs() < 1e-6, "{rows:?}");
     }
 
     #[test]

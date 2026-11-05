@@ -57,8 +57,7 @@ ADS has been removed, since you can actually do it with your own hands.
 | **Melee** | Swing the knife to stab; throw it along your swing | Little tested |
 | **Finger tracking** | On a free hand | On a free hand |
 | **Cutscenes** | Level horizon, free look; videos on a flat screen | Videos on a flat screen; not otherwise reviewed |
-| **Mounted guns** | Your right controller aims them; the view stays where you got on | Not reviewed |
-| **The mech** | The stick aims it, your head looks around | Not reviewed |
+| **Mounted guns and the mech** | Your right controller aims them; the view stays where you got on and the stick turns it | Not reviewed |
 | **Hotwiring** | With your hands | Not in this game |
 
 ## Known bugs
