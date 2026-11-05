@@ -647,6 +647,7 @@ pub fn frame(on: bool) {
         stop(state);
         return;
     }
+    super::uploads::end_frame();
     // Once views are being built: the engine's programs are made by then.
     if !state.started {
         if crate::providers::eye_site::builds() == 0 {
@@ -1192,6 +1193,18 @@ fn install() -> bool {
     draws += hook!(DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE, "glDrawElementsInstancedBaseVertexBaseInstance", draw_elements_instanced_base_vertex_base_instance as DrawElementsInstancedBaseVertexBaseInstanceFn, false);
     draws += hook!(DRAW_ARRAYS_INSTANCED_BASE_INSTANCE, "glDrawArraysInstancedBaseInstance", draw_arrays_instanced_base_instance as DrawArraysInstancedBaseInstanceFn, false);
     draws += hook!(MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS, "glMultiDrawElementsIndirectBindlessNV", multi_draw_elements_indirect_bindless as MultiDrawElementsIndirectBindlessFn, false);
+    {
+        use super::uploads as u;
+        hook!(u::TEX_SUB_IMAGE_2D, "glTexSubImage2D", u::tex_sub_image_2d as u::TexSubImage2dFn, false);
+        hook!(u::COMPRESSED_TEX_SUB_IMAGE_2D, "glCompressedTexSubImage2D", u::compressed_tex_sub_image_2d as u::CompressedTexSubImage2dFn, false);
+        hook!(u::TEX_SUB_IMAGE_3D, "glTexSubImage3D", u::tex_sub_image_3d as u::TexSubImage3dFn, false);
+        hook!(u::COMPRESSED_TEX_SUB_IMAGE_3D, "glCompressedTexSubImage3D", u::compressed_tex_sub_image_3d as u::CompressedTexSubImage3dFn, false);
+        hook!(u::TEXTURE_SUB_IMAGE_2D, "glTextureSubImage2DEXT", u::texture_sub_image_2d as u::TextureSubImage2dFn, false);
+        hook!(u::COMPRESSED_TEXTURE_SUB_IMAGE_2D, "glCompressedTextureSubImage2DEXT", u::compressed_texture_sub_image_2d as u::CompressedTextureSubImage2dFn, false);
+        hook!(u::BUFFER_SUB_DATA, "glBufferSubData", u::buffer_sub_data as u::BufferSubDataFn, false);
+        hook!(u::NAMED_BUFFER_SUB_DATA, "glNamedBufferSubDataEXT", u::named_buffer_sub_data as u::NamedBufferSubDataFn, false);
+        hook!(u::CLIENT_WAIT_SYNC, "glClientWaitSync", u::client_wait_sync as u::ClientWaitSyncFn, false);
+    }
     let unit = hook!(ACTIVE_TEXTURE, "glActiveTexture", active_texture as CapFn, false);
     let state_kept = [
         hook!(COLOR_MASK, "glColorMask", color_mask as ColorMaskFn, false),

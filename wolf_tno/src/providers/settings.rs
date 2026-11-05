@@ -56,6 +56,7 @@ fn install_settings(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
         no_screen_shake(start.ledger, &exe, build);
     }
     no_screen_blur(start.ledger, &exe, build);
+    log_streaming(&exe);
     crate::research::cvars::apply(start.ledger, &exe);
     crate::research::cvars::prepare_cycle(start.ledger, &exe);
     // Kept at 0 by the ledger (what it holds at the stop goes back), so the world never stays
@@ -65,6 +66,41 @@ fn install_settings(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
         monaka_producer::debug::offer(Category::FreezeWorld);
     }
     Ok(())
+}
+
+/// The game's texture streaming settings, as the run starts (read only): with the streaming
+/// lines of [`crate::single_pass::uploads`], what a hitch was made of and what to turn.
+const STREAMING: &[&str] = &[
+    "vt_maxPPF",
+    "vt_pageImageSizeVmtr",
+    "vt_pageImageSizeUnique",
+    "vt_pageImageSizeUniqueDiffuseOnly",
+    "vt_uncompressedPhysicalImages",
+    "vt_useCudaTranscode",
+    "vt_useTranscodeJobs",
+    "vt_splitTranscodeJobs",
+    "vt_usePageFileCache",
+    "vt_usePageTablePBOs",
+    "vt_useUnsynchronizedPageTablePBOs",
+    "vt_feedbackLodBias",
+    "vt_feedbackHighWater",
+    "vt_feedbackLowWater",
+    "vt_lodBias",
+    "vt_maxAniso",
+    "vt_pageFadeInSteps",
+    "r_usePBOTextureFeedback",
+    "jobs_numThreads",
+];
+
+fn log_streaming(exe: &Module) {
+    let values: Vec<String> = STREAMING
+        .iter()
+        .filter_map(|name| {
+            let cvar = Cvar::find(exe, name, eng_idt::Layout::ID_TECH_5)?;
+            Some(format!("{name} {} ({})", cvar.int(exe)?, cvar.float(exe)?))
+        })
+        .collect();
+    log!("texture streaming settings: {}", values.join(", "));
 }
 
 /// What shakes the view, each set to 0 while the screen shake is off: the camera shakes
