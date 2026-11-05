@@ -98,7 +98,7 @@ fn warp(start: &Start<'_, Wolf>) -> Option<GlWarp> {
                 jitter_sign: settings.jitter_sign,
                 depth_flags,
                 dlls: leak(found.unwrap_or_default()),
-                dlss: Some(GlFsrDlss { quality: settings.quality, data: leak(start.session.dir().join("ngx")) }),
+                dlss: Some(GlFsrDlss { quality: settings.quality, preset: settings.preset, data: leak(start.session.dir().join("ngx")) }),
             })
         }
         (None, None) => None,
@@ -161,6 +161,7 @@ fn dlss(start: &Start<'_, Wolf>) -> Option<GlDlss> {
     let leak = |p: std::path::PathBuf| -> &'static std::path::Path { Box::leak(p.into_boxed_path()) };
     Some(GlDlss {
         quality: settings.quality,
+        preset: settings.preset,
         display,
         frame: eye_site::dlss_frame,
         depth: eye_site::scene_depth,

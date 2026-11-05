@@ -68,10 +68,21 @@ pub const DLSS_SHARPNESS: Opt =
     opt("dlss_sharpness", "DLSS sharpness", "Sharpens the upscaled image. 0 turns sharpening off.", Kind::Number { min: 0.0, max: 1.0, step: 0.05, default: 0.5 })
         .on(Shown::Rendering);
 
-/// DLSS settings (`dlss`, `dlss_sharpness`, and `dlss_jitter_sign` on the command line only).
+/// The DLSS model ([`monaka_dlss11::Preset`]): K, the transformer, unless chosen.
+pub const DLSS_PRESET: Opt = opt(
+    "dlss_preset",
+    "DLSS model",
+    "NVIDIA's DLSS preset. K and J are the transformer model (sharpest, costs more GPU); E and F the older CNN model (cheaper, softer, more ghosting); L and M the newer DLSS 4.5 transformer (heaviest).",
+    choice(&[("k", "K (transformer)"), ("j", "J (transformer)"), ("l", "L (DLSS 4.5)"), ("m", "M (DLSS 4.5)"), ("e", "E (CNN, cheaper)"), ("f", "F (CNN)")], "k"),
+)
+.on(Shown::Rendering);
+
+/// DLSS settings (`dlss`, `dlss_preset`, `dlss_sharpness`, and `dlss_jitter_sign` on the command line only).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Dlss {
     pub quality: monaka_dlss11::Quality,
+    /// The DLSS model (`dlss_preset`).
+    pub preset: monaka_dlss11::Preset,
     /// CAS sharpening 0..1 after DLSS (`dlss_sharpness`; 0 turns it off).
     pub sharpness: Option<f32>,
     /// 1 or -1: whether DLSS is told the content shift or its opposite.
@@ -152,6 +163,7 @@ impl EyeSettings {
             framegen: FrameGenerator::chosen(&FRAMEGEN, options) == FrameGenerator::Fsr,
             dlss: options.text("dlss").and_then(monaka_dlss11::Quality::parse).map(|quality| Dlss {
                 quality,
+                preset: options.text("dlss_preset").and_then(monaka_dlss11::Preset::parse).unwrap_or(monaka_dlss11::Preset::K),
                 sharpness: Some(options.number("dlss_sharpness", 0.0, 1.0, 0.5)).filter(|&s| s > 0.0),
                 jitter_sign: if options.number("dlss_jitter_sign", -1.0, 1.0, 1.0) < 0.0 { -1.0 } else { 1.0 },
             }),
