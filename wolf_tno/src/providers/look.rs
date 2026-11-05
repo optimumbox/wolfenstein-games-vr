@@ -25,11 +25,11 @@ use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 
 /// The share is held while the game holds it ([`camera_taken::holds`]: a mounted gun, a machine
-/// driven, the wheel) and while another camera has the view ([`TAKEOVER`]: a ladder's mount), but
-/// not under a control camera ([`camera_taken::grabbed`]): the game builds that from the player's
-/// angles, and the head looks around it, so a share held in them turned the view twice over.
+/// driven, the wheel) and through a short take of the view by another camera ([`TAKEOVER`]: a
+/// ladder's mount from the water), not under a control camera ([`camera_taken::grabbed`]) nor
+/// past [`HOLD_FOR`] (a scene): those are as they always were.
 fn holds() -> bool {
-    camera_taken::holds() || taken()
+    camera_taken::holds() || TAKEOVER.locked().holding()
 }
 
 /// Another camera has the view, not built from the player's angles.
@@ -118,6 +118,10 @@ pub static TAKEOVER: Mutex<Takeover> = Mutex::new(Takeover::new());
 /// (degrees).
 pub const SET_BY_GAME: f32 = 2.0;
 
+/// A take of the view longer than this is a scene's, not a ladder's mount (1.7 s): the share is
+/// let go of as it always was.
+pub const HOLD_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub struct Takeover {
     /// The share the angles held before the take, while not taken.
     before: Option<Share>,
@@ -127,11 +131,13 @@ pub struct Takeover {
     /// Takeovers ended with the angles as left, and with the game's own.
     kept: u64,
     set: u64,
+    /// When the take began, while taken.
+    since: Option<std::time::Instant>,
 }
 
 impl Takeover {
     pub const fn new() -> Self {
-        Self { before: None, taken: false, last: None, kept: 0, set: 0 }
+        Self { before: None, taken: false, last: None, kept: 0, set: 0, since: None }
     }
 
     /// A command's angles as built (pitch, yaw) with another camera on the view (`taken`) or not,
@@ -139,10 +145,14 @@ impl Takeover {
     pub fn command(&mut self, pitch: f32, yaw: f32, taken: bool, share: Option<Share>) -> (f32, f32) {
         let was = std::mem::replace(&mut self.taken, taken);
         if taken {
+            if !was {
+                self.since = Some(std::time::Instant::now());
+            }
             return (pitch, yaw);
         }
+        let short = self.since.take().is_some_and(|since| since.elapsed() < HOLD_FOR);
         let mut out = (pitch, yaw);
-        if was && let Some(held) = self.before {
+        if was && short && let Some(held) = self.before {
             let set = self.last.is_some_and(|(p, y)| (pitch - p).abs() > SET_BY_GAME || crate::cooking::turret_aim::wrapped(yaw, y).abs() > SET_BY_GAME);
             if set {
                 out = command::reshare(pitch, yaw, Share::default(), held);
@@ -163,6 +173,11 @@ impl Takeover {
             self.before = Some(share);
         }
         out
+    }
+
+    /// Whether the share is held now: taken, for no longer than [`HOLD_FOR`].
+    pub fn holding(&self) -> bool {
+        self.taken && self.since.is_some_and(|since| since.elapsed() < HOLD_FOR)
     }
 
     pub fn sent(&mut self, angles: (f32, f32)) {

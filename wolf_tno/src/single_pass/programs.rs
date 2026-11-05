@@ -164,6 +164,8 @@ impl Conversion {
                     Stage::Compiling { sources, scratch, since }
                 } else {
                     self.sources = sources;
+                    let built = scratch.iter().filter(|&&p| gl.program_done(p)).count();
+                    log!("single pass: the render programs compiled in {:.1} s ({built} of {} built); sweeping the engine's", since.elapsed().as_secs_f32(), scratch.len());
                     Stage::Sweeping(Box::new(Sweep::new(gl, &scratch)))
                 }
             }
@@ -314,6 +316,13 @@ struct Sweep {
     matched: usize,
     flat: usize,
     passed_over: usize,
+    /// Programs the driver had not finished building when swept (`KHR_parallel_shader_compile`),
+    /// looked at again once at the end; asking for anything of theirs waits for their build.
+    unfinished: Vec<u32>,
+    again: Option<usize>,
+    /// The time spent asking: whether a program is one and finished, whether converted before,
+    /// its signature, its binary and the rest.
+    asking: [Duration; 4],
     frames: usize,
     spent: Duration,
     since: Instant,
@@ -345,6 +354,9 @@ impl Sweep {
             matched: 0,
             flat: 0,
             passed_over: 0,
+            unfinished: Vec::new(),
+            again: None,
+            asking: [Duration::ZERO; 4],
             frames: 0,
             spent: Duration::ZERO,
             since: Instant::now(),
@@ -358,21 +370,51 @@ impl Sweep {
         while self.next <= LAST_NAME && start.elapsed() < SWEEP_PER_FRAME {
             let engine = self.next;
             self.next += 1;
-            self.one(gl, engine, sources, already);
+            self.one(gl, engine, sources, already, true);
+            if self.next % 4096 == 0 {
+                log!("single pass: programs swept to {} in {:.1} s ({} engine programs, {} unfinished, {} passed over)", self.next, self.since.elapsed().as_secs_f32(), self.engine_programs, self.unfinished.len(), self.passed_over);
+            }
+        }
+        if self.next > LAST_NAME {
+            // The unfinished ones once more: those the game uses are built by now.
+            let mut at = self.again.unwrap_or(0);
+            while at < self.unfinished.len() && start.elapsed() < SWEEP_PER_FRAME {
+                let engine = self.unfinished[at];
+                at += 1;
+                self.one(gl, engine, sources, already, false);
+            }
+            self.again = Some(at);
         }
         self.spent += start.elapsed();
-        self.next > LAST_NAME
+        self.again.is_some_and(|at| at >= self.unfinished.len())
     }
 
-    fn one(&mut self, gl: &Gl, engine: u32, sources: &[Renderprog], already: &mut Vec<Converted>) {
-        // SAFETY: a plain query.
-        if unsafe { (gl.is_program)(engine) } == 0 {
+    fn one(&mut self, gl: &Gl, engine: u32, sources: &[Renderprog], already: &mut Vec<Converted>, first: bool) {
+        let t = Instant::now();
+        if first {
+            // SAFETY: a plain query.
+            if unsafe { (gl.is_program)(engine) } == 0 {
+                self.asking[0] += t.elapsed();
+                return;
+            }
+            self.engine_programs += 1;
+        }
+        let done = gl.program_done(engine);
+        self.asking[0] += t.elapsed();
+        if !done {
+            if first {
+                self.unfinished.push(engine);
+            } else {
+                self.passed_over += 1;
+            }
             return;
         }
-        self.engine_programs += 1;
         // Converted by an earlier run in this process: known by its stereo uniform, its source by
         // its other uniforms' names.
-        if let Some((converted, source)) = converted_before(gl, engine, sources, &self.names) {
+        let t = Instant::now();
+        let before = converted_before(gl, engine, sources, &self.names);
+        self.asking[1] += t.elapsed();
+        if let Some((converted, source)) = before {
             // Converted before its fragment shader read the scene's maps layered: converted again.
             let layered = gl.uniforms(engine).iter().any(|u| u.name.starts_with(convert::LAYERED_PREFIX));
             let fragment = &sources[source].fragment;
@@ -384,11 +426,17 @@ impl Sweep {
             }
             return;
         }
-        if !self.signatures.contains(&signature(gl, engine)) {
+        let t = Instant::now();
+        let like = self.signatures.contains(&signature(gl, engine));
+        self.asking[2] += t.elapsed();
+        if !like {
             self.passed_over += 1;
             return;
         }
-        let Some(key) = gl.binary(engine).and_then(|(_, b)| gl_api::assembly_key(&b)) else { return };
+        let t = Instant::now();
+        let key = gl.binary(engine);
+        self.asking[3] += t.elapsed();
+        let Some(key) = key.and_then(|(_, b)| gl_api::assembly_key(&b)) else { return };
         let Some(candidates) = self.by_key.get(&key) else { return };
         let uniforms = gl.uniforms(engine);
         let own = uniform_names(&uniforms);
@@ -411,15 +459,20 @@ impl Sweep {
 
     fn finish(self, already: usize) -> Stage {
         log!(
-            "single pass: {} engine programs, {already} converted before, {} passed over (unlike every render program), {} matched to their render program ({} full-screen or 2D, left as they are); converting {}; swept over {} frames in {:.1} s ({:.0} ms of the render thread's)",
+            "single pass: {} engine programs, {already} converted before, {} passed over (unlike every render program, or unbuilt: {} unbuilt when first swept), {} matched to their render program ({} full-screen or 2D, left as they are); converting {}; swept over {} frames in {:.1} s ({:.0} ms of the render thread's: {:.0} ms whether built, {:.0} whether converted before, {:.0} their counts, {:.0} their binaries)",
             self.engine_programs,
             self.passed_over,
+            self.unfinished.len(),
             self.matched,
             self.flat,
             self.jobs.len(),
             self.frames,
             self.since.elapsed().as_secs_f32(),
-            self.spent.as_secs_f32() * 1000.0
+            self.spent.as_secs_f32() * 1000.0,
+            self.asking[0].as_secs_f32() * 1000.0,
+            self.asking[1].as_secs_f32() * 1000.0,
+            self.asking[2].as_secs_f32() * 1000.0,
+            self.asking[3].as_secs_f32() * 1000.0
         );
         if self.jobs.is_empty() {
             return Stage::Failed;
