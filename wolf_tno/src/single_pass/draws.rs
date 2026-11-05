@@ -244,6 +244,12 @@ const MISFIT_SHARE: f64 = 0.8;
 /// eye's own draws of it fail the depth the left eye's copies laid (black floors), at twice the cost.
 const CARRIED_JUDGED_AFTER: u64 = 600;
 const CARRIED_MISFIT_SHARE: f64 = 0.97;
+/// Frames with the program's draws needed too: the world's program makes 600 draws in a dozen
+/// frames, as few as a level's first frames (the eye matrix still settling) miss.
+const CARRIED_JUDGED_FRAMES: u64 = 180;
+/// A frame counts towards the judgments only when the eye matrix carried this share of its right
+/// eye's draws: in a frame it does not, every program misses alike.
+const FRAME_FOUND_SHARE: f64 = 0.33;
 
 /// The programs the eye matrix does not carry: each one's checked draws and those not found, and
 /// the programs judged misfits (drawn by each pass).
@@ -253,8 +259,12 @@ struct Misfits {
     misfits: HashSet<u32>,
     /// A checked frame's left-eye stretch rows by program.
     left: HashMap<u32, Vec<Rows>>,
-    /// The right eye's stretch draws by program, and those not among the left eye's ([`Carried`]).
-    carried: HashMap<u32, (u64, u64)>,
+    /// The right eye's stretch draws by program, and those not among the left eye's ([`Carried`]),
+    /// with the frames they came from; counted from frames the matrix carried ([`Self::end_frame`]).
+    carried: HashMap<u32, (u64, u64, u64)>,
+    /// The frame's own count, by program, before it is known whether the frame counts.
+    frame: HashMap<u32, (u64, u64)>,
+    frame_names: HashMap<u32, &'static str>,
 }
 
 impl Misfits {
@@ -262,12 +272,34 @@ impl Misfits {
     /// draws mostly are not found draws other geometry in each pass (sprites and particles built
     /// for each eye's view), not what one eye culled: drawn by each eye from then on, or the right
     /// eye would show both its own and the left eye's copy.
-    fn carried(&mut self, program: u32, name: &str, found: bool) {
-        let (seen, missed) = self.carried.entry(program).or_default();
+    ///
+    /// A draw found a little elsewhere (moved between the passes: animated, swaying) counts as found.
+    /// The count waits for the frame's end: a frame whose draws the matrix mostly did not carry
+    /// (a level coming in, the matrix settling) is left out, or it would judge the world's own
+    /// programs (black floors, doubled characters).
+    fn carried(&mut self, program: u32, name: &'static str, found: bool) {
+        let (seen, missed) = self.frame.entry(program).or_default();
         *seen += 1;
         *missed += u64::from(!found);
-        if *seen >= CARRIED_JUDGED_AFTER && *missed as f64 > *seen as f64 * CARRIED_MISFIT_SHARE && self.misfits.insert(program) {
-            log!("single pass: program {program} ({name}) draws other geometry in each eye's pass ({missed} of {seen} of the right eye's draws not the left's): each eye draws it");
+        self.frame_names.entry(program).or_insert(name);
+    }
+
+    /// The frame's counts kept when the matrix carried enough of its draws, and the programs judged.
+    fn end_frame(&mut self) {
+        let (seen, missed) = self.frame.values().fold((0, 0), |(s, m), (fs, fm)| (s + fs, m + fm));
+        let counts = seen > 0 && (seen - missed) as f64 >= seen as f64 * FRAME_FOUND_SHARE;
+        for (program, (frame_seen, frame_missed)) in self.frame.drain() {
+            if !counts {
+                continue;
+            }
+            let (seen, missed, frames) = self.carried.entry(program).or_default();
+            *seen += frame_seen;
+            *missed += frame_missed;
+            *frames += 1;
+            if *seen >= CARRIED_JUDGED_AFTER && *frames >= CARRIED_JUDGED_FRAMES && *missed as f64 > *seen as f64 * CARRIED_MISFIT_SHARE && self.misfits.insert(program) {
+                let name = self.frame_names.get(&program).copied().unwrap_or("?");
+                log!("single pass: program {program} ({name}) draws other geometry in each eye's pass ({missed} of {seen} of the right eye's draws over {frames} frames not the left's): each eye draws it");
+            }
         }
     }
 
@@ -662,6 +694,7 @@ pub fn frame(on: bool) {
     state.agreeing = measured.map_or((0, paired.len()), |m| (m.agreeing, m.looked_at));
     state.left.clear();
     state.misfits.left.clear();
+    state.misfits.end_frame();
     state.left_queries.clear();
     state.query_cursor = 0;
     state.carried.clear();
@@ -1492,7 +1525,8 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
             if state.matrix.is_some() {
                 let found = state.carried.find(current, geometry, shape, &rows);
                 let name = state.programs.get(&current).map_or("?", |p| p.converted.name);
-                state.misfits.carried(current, name, found.is_some());
+                let moved = found.is_none() && state.carried.nearest(current, geometry, &rows).is_some_and(|near| near <= MOVED_BETWEEN);
+                state.misfits.carried(current, name, found.is_some() || moved);
                 if found == Some(Found::Shape) {
                     state.counts.by_shape += 1;
                     *state.by_shape_by.entry(current).or_default() += 1;
