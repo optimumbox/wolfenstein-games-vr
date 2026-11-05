@@ -11,6 +11,10 @@
 //! The expectation is learnt from the GPU itself: a timestamp is written before each of the game's
 //! draws and at the swap, read back a few frames later, and the time from one stamp to the next
 //! (the draw's work and whatever came before the next one, idle time included) kept per program.
+//! The flushing is off ([`SPLIT`]): with it the viewer's GPU time as SteamVR saw it went from about
+//! 2 ms to 9-18 ms and SteamVR throttled it more (each flush another switch between the game's
+//! work and the viewer's), where the same cache without it ran at full rate.
+//!
 //! Only one frame in [`SAMPLE`] is stamped: a stamp before every draw (about two thousand a frame)
 //! and their reading back cost the render thread enough to make the game miss refreshes. The
 //! flushes go on every frame from what the sampled frames taught.
@@ -27,6 +31,8 @@ use std::time::{Duration, Instant};
 
 /// A piece's expected GPU time before the game's commands are flushed.
 pub const BUDGET_NS: f64 = 500_000.0;
+/// Whether the game's commands are flushed into pieces at all (else only timed).
+const SPLIT: bool = false;
 /// A draw expected to cost less than this is not flushed ahead of on its own (a flush between two
 /// cheap draws buys nothing).
 const ALONE_NS: f64 = 50_000.0;
@@ -102,11 +108,13 @@ struct Window {
     longest: (f64, Option<Mark>),
     over_ms: u64,
     flushes: u64,
+    /// Swaps in the window (every frame, timed or not): the flushes' divisor.
+    swaps: u64,
 }
 
 impl Window {
     fn new() -> Self {
-        Self { start: Instant::now(), frames: 0, by_mark: HashMap::new(), frame_ns: 0.0, longest: (0.0, None), over_ms: 0, flushes: 0 }
+        Self { start: Instant::now(), frames: 0, by_mark: HashMap::new(), frame_ns: 0.0, longest: (0.0, None), over_ms: 0, flushes: 0, swaps: 0 }
     }
 }
 
@@ -133,7 +141,7 @@ pub fn before_draw() {
     let Ok(mut held) = PIECES.lock() else { return };
     let Some(p) = held.as_mut() else { return };
     let cost = p.expected.get(&mark).copied().unwrap_or(0.0);
-    if splits(p.piece, cost) {
+    if SPLIT && splits(p.piece, cost) {
         // SAFETY: the game's context is current on its render thread.
         unsafe { windows::Win32::Graphics::OpenGL::glFlush() };
         p.piece = 0.0;
@@ -184,6 +192,7 @@ pub fn swap(publishing: bool, name: impl Fn(u32) -> Option<&'static str>) {
     p.at = (p.at + 1) % RING;
     p.read_oldest();
     p.swaps += 1;
+    p.window.swaps += 1;
     p.timing = sampled(p.swaps);
     // The new frame's stamps begin at the same swap, so its hand-off is timed with it.
     p.stamp(Mark::Swap);
@@ -320,7 +329,7 @@ fn describe(w: &Window, name: &impl Fn(u32) -> Option<&'static str>) -> Option<S
         ms(w.frame_ns / frames),
         w.over_ms as f64 / frames,
         ms(w.longest.0),
-        w.flushes as f64 / frames,
+        w.flushes as f64 / w.swaps.max(1) as f64,
         ms(BUDGET_NS),
         top.join("; ")
     ))
@@ -368,6 +377,7 @@ mod tests {
         w.longest = (2_500_000.0, Some(Mark::Draw(7)));
         w.over_ms = 2;
         w.flushes = 10;
+        w.swaps = 2;
         let line = describe(&w, &|p| (p == 7).then_some("landuniquebump")).unwrap();
         assert!(line.contains("9.00 ms a frame from swap to swap"), "{line}");
         assert!(line.contains("the longest 2.50 ms after landuniquebump (7)"), "{line}");
