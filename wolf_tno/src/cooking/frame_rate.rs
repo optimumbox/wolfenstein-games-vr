@@ -15,6 +15,12 @@
 //! is the frame rate achieved ([`BEHIND`]): behind, the rate drops to what was achieved
 //! ([`CAP_MARGIN`]) and stays under it for [`BACKOFF`], doubled with each drop, before a higher
 //! rate is tried.
+//!
+//! On the headset's refresh the game thread's promise is not the whole story either: when the
+//! window's present holds the render thread (a swap blocked for most of a refresh), the game thread
+//! waits on it and promises no more than the refresh itself, though the frames keep up with it. A
+//! rate on the refresh whose frames are already achieved ([`achieved_step`]) is taken too, or the
+//! rate stays at 60, the frames are never paced, and the world moves 60 ticks over 90 frames.
 
 use crate::Wolf;
 use crate::providers::settings::{self, GameRate};
@@ -91,6 +97,12 @@ fn under_cap(holds: f64, ceiling: i32) -> i32 {
     STEPS.iter().copied().filter(|&step| step <= ceiling && f64::from(step) <= holds * CAP_MARGIN && paced(step)).max().unwrap_or(OWN).max(OWN)
 }
 
+/// The highest step at most `ceiling`, on the headset's refresh, whose frames `achieved` already
+/// keeps up with (as a measure not [`BEHIND`] it would); at least [`OWN`].
+pub fn achieved_step(achieved: f64, ceiling: i32) -> i32 {
+    STEPS.iter().copied().filter(|&step| step <= ceiling && f64::from(step) * BEHIND <= achieved && paced(step)).max().unwrap_or(OWN).max(OWN)
+}
+
 /// Whether `step` keeps the frames on the headset's refresh while they are paced to it (every step
 /// when they are not): a rate between two fractions of the refresh would drift against it.
 fn paced(step: i32) -> bool {
@@ -151,6 +163,9 @@ impl Steps {
             return self.current;
         }
         let mut target = fitting(holds, ceiling);
+        if on_grid {
+            target = target.max(achieved_step(achieved, ceiling));
+        }
         if let Some((held, at, drops)) = self.cap {
             let wait = BACKOFF.saturating_mul(1 << (drops - 1).min(8)).min(BACKOFF_MAX);
             if now.saturating_duration_since(at) < wait {
@@ -197,6 +212,11 @@ static CHANGES: AtomicU64 = AtomicU64::new(0);
 const GIVE_BACK_MS: u64 = 1000;
 /// Rate changes logged at most.
 const LOGGED: u64 = 200;
+/// Measures leaving the rate as it was; one in [`HELD_EVERY`] logged while under the ceiling (every
+/// 10 s), at most [`HELD_LOGGED`] times.
+static HELD: AtomicU64 = AtomicU64::new(0);
+const HELD_EVERY: u64 = 20;
+const HELD_LOGGED: u64 = 30;
 
 /// The game's rate (ticks, and so frames, a second) at most while VR runs ([`FRAME_RATE`]; 60 is
 /// the game's own).
@@ -265,6 +285,10 @@ pub fn frame() {
     let before = adapt.steps;
     let rate = if crate::research::options().fixed_rate { adapt.ceiling } else { adapt.steps.next(holds, achieved, adapt.ceiling, now) };
     if rate == before.current {
+        let held = HELD.fetch_add(1, Relaxed);
+        if rate < adapt.ceiling && held % HELD_EVERY == 0 && held / HELD_EVERY < HELD_LOGGED {
+            log!("the game's rate stays {rate} ({achieved:.0} frames a second, the game thread promising {holds:.0})");
+        }
         return;
     }
     if !adapt.setting.write(&rate) {

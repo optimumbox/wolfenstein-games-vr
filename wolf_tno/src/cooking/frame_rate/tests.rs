@@ -121,3 +121,22 @@ fn paced_to_the_headset_a_hitch_keeps_the_rate() {
     }
     assert_eq!(steps.step(900.0, 62.0, 90, start, true), OWN);
 }
+
+#[test]
+fn on_the_headsets_refresh_frames_already_achieved_raise_the_rate() {
+    let start = Instant::now();
+    let mut steps = Steps::new(OWN);
+    // The present holds the render thread: the game thread promises 92, the frames make 89.5.
+    for window in 1..RISE_WINDOWS {
+        assert_eq!(steps.step(92.0, 89.5, 90, start, true), OWN, "window {window}: not yet");
+    }
+    assert_eq!(steps.step(92.0, 89.5, 90, start, true), 90);
+    let mut off_grid = Steps::new(OWN);
+    for _ in 0..RISE_WINDOWS * 2 {
+        assert!(off_grid.step(92.0, 89.5, 90, start, false) < 90, "no headset refresh: the promise alone");
+    }
+    let mut short = Steps::new(OWN);
+    for _ in 0..RISE_WINDOWS * 2 {
+        assert!(short.step(80.0, 80.0, 90, start, true) < 90, "80 achieved does not keep 90");
+    }
+}

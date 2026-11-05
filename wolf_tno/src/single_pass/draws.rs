@@ -1629,7 +1629,7 @@ fn inspect_frame(state: &mut State) {
     *next += 1;
     let lines = vec![
         format!("The draws of {INSPECTED_FRAMES} frames from frame {} on, both passes (1 the left eye's, 2 the right's), as the single pass drew them.", state.live_frames),
-        "Each line: pass, framebuffer, program, how it was drawn, depth projection ratio (world's in the header), GL state (depth test function, depth writes, polygon offset, blend, cull, the scissor while its test is on: \"opened\" when turned off for the right eye's copy), where the model's origin lands (NDC x y z), for the left eye's carried draws where their copy lands in the right eye, and for the right eye's own the farthest-apart of the left eye's carried copies of the same mesh.".into(),
+        "Each line: pass, framebuffer, program, how it was drawn, depth projection ratio (world's in the header), GL state (depth test function, depth writes, polygon offset, blend, cull, the scissor while its test is on: \"opened\" when turned off for the right eye's copy), where the model's origin lands (NDC x y z), for the left eye's carried draws where their copy lands in the right eye, and for the right eye's own the farthest-apart of the left eye's carried copies of the same mesh. Draws of decals, particles and unconverted programs add, after bars: GL errors raised since the draw before, the framebuffer bound and its attachments, the stencil test, the colour mask and cull face, each sampler's unit and texture (ours: a layer's view or an array), and the fragment rows.".into(),
         format!("world depth ratio {:?}, eye matrix {:?}", state.world_depth, state.matrix),
     ];
     state.inspect = Some(Inspect { folder: capture, frames: INSPECTED_FRAMES, lines });
@@ -1698,9 +1698,101 @@ fn inspected_draw(state: &mut State, pass: u32, geometry: u64, shape: u64, goes_
             line += &format!(" nearest carried {near:.2e}");
         }
     }
+    if name == "-" || name.contains("decal") || name.contains("particle") {
+        line += &inspected_detail(state, current);
+    }
     if let Some(inspect) = state.inspect.as_mut() {
         inspect.lines.push(line);
     }
+}
+
+/// More of how a draw reading the scene's maps (decals, soft particles) or an unconverted one was
+/// made, for the inspection: the GL errors raised since the draw before, the framebuffer bound and
+/// its attachments, the stencil test, the colour mask, the cull face, each sampler's unit and the
+/// texture bound there (ours: a layer's view or an array standing in for an engine eye texture),
+/// and the program's fragment rows (`_fa_`).
+fn inspected_detail(state: &State, program: u32) -> String {
+    let Some(gl) = state.gl.as_ref() else { return String::new() };
+    let mut out = String::new();
+    let mut errors = Vec::new();
+    // SAFETY: state queries into locals (only while inspecting).
+    unsafe {
+        for _ in 0..4 {
+            let error = windows::Win32::Graphics::OpenGL::glGetError();
+            if error == 0 {
+                break;
+            }
+            errors.push(format!("{error:#x}"));
+        }
+        if !errors.is_empty() {
+            out += &format!(" | GL errors before {}", errors.join(" "));
+        }
+        let mut bound = 0;
+        glGetIntegerv(0x8CA6, &mut bound);
+        out += &format!(" | drawn into {}", describe(Some(gl), bound as u32));
+        let (mut func, mut reference, mut mask, mut write) = (0, 0, 0, 0);
+        if glIsEnabled(0x0B90) != 0 {
+            glGetIntegerv(0x0B92, &mut func);
+            glGetIntegerv(0x0B97, &mut reference);
+            glGetIntegerv(0x0B93, &mut mask);
+            glGetIntegerv(0x0B98, &mut write);
+            out += &format!(" | stencil func {func:#x} ref {reference} mask {mask:#x} write {write:#x}");
+        } else {
+            out += " | stencil off";
+        }
+        let bounds = glIsEnabled(0x8890) != 0;
+        if bounds {
+            out += " | depth bounds test on";
+        }
+        let mut colour = [0u8; 4];
+        glGetBooleanv(0x0C23, colour.as_mut_ptr());
+        let (mut face, mut front) = (0, 0);
+        glGetIntegerv(0x0B45, &mut face);
+        glGetIntegerv(0x0B46, &mut front);
+        out += &format!(" | colour mask {colour:?} cull face {face:#x} front {front:#x}");
+    }
+    type IndexedFn = unsafe extern "system" fn(u32, u32, *mut i32);
+    let indexed = gl_api::address("glGetIntegerIndexedvEXT").map(|a| {
+        // SAFETY: EXT_direct_state_access's query, with its signature.
+        unsafe { std::mem::transmute::<usize, IndexedFn>(a) }
+    });
+    let mut samplers = Vec::new();
+    let mut rows = String::new();
+    for uniform in gl.uniforms(program) {
+        let Some(values) = gl.values(program, &uniform) else { continue };
+        if (0x8B5D..=0x8B64).contains(&uniform.kind) || (0x8DC0..=0x8DD8).contains(&uniform.kind) || (0x9108..=0x910A).contains(&uniform.kind) {
+            let Some(gl_api::Values::Ints(unit)) = values.first() else { continue };
+            let unit = unit[0].max(0) as u32;
+            let binding = if uniform.kind == 0x8DC1 { 0x8C1D } else { 0x8069 };
+            let mut texture = -1;
+            if let Some(indexed) = indexed {
+                // SAFETY: a state query into a local.
+                unsafe { indexed(binding, unit, &mut texture) };
+            }
+            let ours = state.layers.as_ref().and_then(|l| l.ours(texture.max(0) as u32));
+            let what = match ours {
+                Some((engine, Some(layer))) => format!(" (layer {layer} of {engine})"),
+                Some((engine, None)) => format!(" (array of {engine})"),
+                None => String::new(),
+            };
+            let engine = state.units.get(&unit).map_or(String::new(), |&(_, t)| format!(" engine {t}"));
+            samplers.push(format!("{}=u{unit} t{texture}{what}{engine}", uniform.name));
+        } else if uniform.name == "_fa_" || uniform.name.starts_with("monaka_f") {
+            let text: Vec<String> = values
+                .iter()
+                .take(8)
+                .map(|v| match v {
+                    gl_api::Values::Floats(f) => format!("[{}]", f.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(" ")),
+                    gl_api::Values::Ints(i) => format!("{i:?}"),
+                })
+                .collect();
+            rows += &format!(" | {} {}", uniform.name, text.join(" "));
+        }
+    }
+    if !samplers.is_empty() {
+        out += &format!(" | samplers {}", samplers.join(", "));
+    }
+    out + &rows
 }
 
 /// The left eye's stretch ratios kept a frame.

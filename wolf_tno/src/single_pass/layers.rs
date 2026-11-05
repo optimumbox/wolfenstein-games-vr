@@ -210,6 +210,18 @@ impl Layers {
         self.textures.get(&texture).map(|t| t.views[layer])
     }
 
+    /// What a texture of ours is: the engine eye texture and layer it is a view of, or the engine
+    /// eye texture it is the array of (layer none).
+    pub fn ours(&self, texture: u32) -> Option<(u32, Option<usize>)> {
+        self.textures.iter().find_map(|(&engine, t)| {
+            if t.array == texture {
+                Some((engine, None))
+            } else {
+                t.views.iter().position(|&v| v == texture).map(|layer| (engine, Some(layer)))
+            }
+        })
+    }
+
     pub fn counts(&self) -> (usize, usize, usize) {
         (self.textures.len(), self.framebuffers.len(), self.framebuffers.values().filter(|s| s.layered.is_some()).count())
     }
