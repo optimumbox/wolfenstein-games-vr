@@ -293,7 +293,7 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         // SAFETY: our own scratch program.
         unsafe { (gl.delete_program)(program) };
     }
-    let (mut engine_programs, mut matched, mut flat) = (0, 0, 0);
+    let (mut engine_programs, mut matched, mut flat, mut no_binary) = (0, 0, 0, 0);
     let mut jobs = Vec::new();
     for engine in 1..=LAST_NAME {
         // SAFETY: a plain query.
@@ -310,6 +310,9 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
             let wanted = layered_maps(fragment, fragment).is_some();
             if layered == wanted {
                 already.push(converted);
+            } else if !has_binary(gl, engine) {
+                // Its binary cannot be had to put back: it would stay as it is after a compile.
+                no_binary += 1;
             } else if let Some(job) = job(gl, engine, &gl.uniforms(engine), source, &sources[source]) {
                 jobs.push(job);
             }
@@ -336,7 +339,7 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         }
     }
     log!(
-        "single pass: {engine_programs} engine programs, {} converted before, {matched} matched to their render program ({flat} full-screen or 2D, left as they are); converting {}",
+        "single pass: {engine_programs} engine programs, {} converted before ({no_binary} more left as they are, no binary of theirs to be had), {matched} matched to their render program ({flat} full-screen or 2D, left as they are); converting {}",
         already.len(),
         jobs.len()
     );
@@ -344,6 +347,14 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         return Stage::Failed;
     }
     Stage::Converting { jobs, since: Instant::now() }
+}
+
+/// Whether the driver gives `program`'s binary (the swap puts it back if the converted one fails).
+fn has_binary(gl: &Gl, program: u32) -> bool {
+    let mut length = 0;
+    // SAFETY: a plain query into a local.
+    unsafe { (gl.get_program_iv)(program, gl_api::GL_PROGRAM_BINARY_LENGTH, &mut length) };
+    length > 0
 }
 
 /// The converted scratch program for `engine` from its render program `program` (`sources[source]`),

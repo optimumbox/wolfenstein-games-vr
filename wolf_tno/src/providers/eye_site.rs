@@ -188,6 +188,14 @@ pub fn render_view() -> Option<[f32; 12]> {
     *RENDER_VIEW.locked()
 }
 
+/// How far the render view points up (degrees), once known.
+pub fn render_view_up() -> Option<f32> {
+    let view = render_view()?;
+    let forward = [view[3], view[4], view[5]];
+    let length = (forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2]).sqrt().max(f32::EPSILON);
+    Some((forward[2] / length).clamp(-1.0, 1.0).asin().to_degrees())
+}
+
 /// How far along the game camera's forward axis a driven machine's aim is shown (metres): far
 /// enough that both eyes agree on it for what the machine shoots at.
 pub const AIM_DISTANCE: f32 = 20.0;

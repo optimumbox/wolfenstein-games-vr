@@ -168,10 +168,7 @@ fn note_change(kind: Kind) {
     if LAST_KIND.swap(code, Relaxed) == code || CHANGES_LOGGED.fetch_add(1, Relaxed) >= CHANGES_LOG_MOST {
         return;
     }
-    let Some(view) = crate::providers::eye_site::render_view() else { return };
-    let forward = [view[3], view[4], view[5]];
-    let length = (forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2]).sqrt().max(f32::EPSILON);
-    let up = (forward[2] / length).clamp(-1.0, 1.0).asin().to_degrees();
+    let (Some(view), Some(up)) = (crate::providers::eye_site::render_view(), crate::providers::eye_site::render_view_up()) else { return };
     let head = monaka_body::look::baked::<Wolf>(None).map_or(f32::NAN, |share| share.pitch.to_degrees());
     log!("melee: now {kind:?}; the view pitched {up:.1} degrees up (the head's share {head:.1}), at height {:.1}", view[2]);
 }
