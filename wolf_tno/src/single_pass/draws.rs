@@ -619,6 +619,21 @@ impl State {
 
 /// At each `SwapBuffers` (render thread, the game's context current): the conversion's next step,
 /// then the eye matrix for the next frame from this one's draws.
+/// Both eyes' scene depth side by side for the frame being presented ([`Layers::depth_pair`]):
+/// texture, width and height; none unless the frame drew both eyes layered.
+static PAIR_DEPTH: std::sync::Mutex<Option<(u32, u32, u32)>> = std::sync::Mutex::new(None);
+
+/// [`PAIR_DEPTH`]: what the upscaler reads as the scene depth in place of the engine's texture.
+pub fn pair_depth() -> Option<(u32, u32, u32)> {
+    *PAIR_DEPTH.lock().ok()?
+}
+
+fn set_pair_depth(pair: Option<(u32, u32, u32)>) {
+    if let Ok(mut held) = PAIR_DEPTH.lock() {
+        *held = pair;
+    }
+}
+
 pub fn frame(on: bool) {
     let mut guard = STATE.locked();
     if guard.is_none() {
@@ -688,6 +703,11 @@ pub fn frame(on: bool) {
     }
     let passes = state.pass;
     depth_given_back(state);
+    let pair = match (state.layers.as_mut(), state.gl.as_ref()) {
+        (Some(layers), Some(gl)) if passes == 2 => layers.depth_pair(gl),
+        _ => None,
+    };
+    set_pair_depth(pair.and_then(|(view, (w, h))| Some((view, u32::try_from(w).ok()?, u32::try_from(h).ok()?))));
     if let (Some(layers), Some(gl)) = (state.layers.as_ref(), state.gl.as_ref()) {
         layers.copy_back(gl, state.layer());
     }
@@ -864,6 +884,7 @@ pub fn frame(on: bool) {
 /// detours stand aside.
 fn stop(state: &mut State) {
     SHARING.store(false, Relaxed);
+    set_pair_depth(None);
     forward_pending();
     depth_given_back(state);
     if let Some(gl) = state.gl.as_ref() {
@@ -1376,8 +1397,12 @@ fn give_right_eye(gl: &Gl, program: &mut Program, learner: &Learner, map_arrays:
 fn draw(geometry: u64, shape: u64) -> bool {
     let goes_ahead = draw_locked(geometry, shape);
     match PENDING.load(Relaxed) {
-        // A query of the right eye answered by the left eye's: nothing in it is drawn.
-        PENDING_SHARED => false,
+        // A query of the right eye answered by the left eye's (matched by its first draw): the rest
+        // of it goes as any right eye's draw, skipped where the left eye's pass carried it and
+        // drawn where it did not. The right eye sees past the left eye's frustum at its outer
+        // edge, so its query of a wall can hold more of it than the left eye's: skipped whole,
+        // those surfaces were missing (a black patch flickering at the right eye's edge).
+        PENDING_SHARED => goes_ahead,
         PENDING_OPEN => {
             forward_pending();
             goes_ahead
@@ -1686,6 +1711,11 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
                 if check {
                     state.counts.unwritten_checked += 1;
                     state.counts.unwritten_other_buffers += u64::from(other_buffers_written());
+                }
+                if PENDING.load(Relaxed) == PENDING_SHARED {
+                    // Inside a query not made: nothing to count it for.
+                    state.last_path = "right: writes neither colour nor depth, in a query answered by the left eye's, skipped";
+                    return false;
                 }
                 state.last_path = "right: writes neither colour nor depth, drawn";
                 return true;
@@ -2025,7 +2055,7 @@ static ACTIVE_QUERY_ID: AtomicU32 = AtomicU32::new(0);
 
 /// The right eye's pass may answer its queries by the left eye's ([`SHARING`]): a samples-passed
 /// query it begins is held back ([`PENDING_OPEN`]) until its first draw, which either is a copy of a
-/// left query's draw ([`PENDING_SHARED`]: the query is not made, nor anything in it drawn) or not
+/// left query's draw ([`PENDING_SHARED`]: the query is not made, and the rest of it drawn only where the left eye did not carry it) or not
 /// (the query is begun then, as the engine began it).
 static SHARING: AtomicBool = AtomicBool::new(false);
 static PENDING: AtomicU32 = AtomicU32::new(PENDING_NONE);

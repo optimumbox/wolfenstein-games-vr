@@ -1041,6 +1041,14 @@ pub fn near_metres() -> Option<f32> {
 /// The scene's depth texture now (`engine::SceneDepth`), behind the frame being presented.
 pub fn scene_depth() -> Option<GlDepth> {
     static SEEN: AtomicBool = AtomicBool::new(false);
+    static PAIRED: AtomicBool = AtomicBool::new(false);
+    // Single pass: the engine's texture holds one eye; both eyes' layers side by side instead.
+    if let Some((texture, width, height)) = crate::single_pass::draws::pair_depth() {
+        if !PAIRED.swap(true, Relaxed) {
+            log!("frame warping: scene depth is both eyes' layers side by side, GL texture {texture}, {width}x{height}");
+        }
+        return Some(GlDepth { texture, width, height, multisampled: false });
+    }
     let global = SETUP.get()?.scene_depth?;
     let destination = mem::read::<usize>(global).filter(|p| *p != 0)?;
     let image = mem::read::<usize>(destination + engine::DESTINATION_DEPTH).filter(|p| *p != 0)?;
@@ -1049,7 +1057,7 @@ pub fn scene_depth() -> Option<GlDepth> {
     let height = mem::read::<i32>(image + engine::IMAGE_HEIGHT)?;
     let samples = mem::read::<i32>(image + engine::IMAGE_SAMPLES)?;
     let depth = GlDepth { texture, width: u32::try_from(width).ok()?, height: u32::try_from(height).ok()?, multisampled: samples > 1 };
-    if !SEEN.swap(true, Relaxed) {
+    if !SEEN.swap(true, Relaxed) || PAIRED.swap(false, Relaxed) {
         log!("frame warping: scene depth is GL texture {texture}, {width}x{height}, {samples} samples");
     }
     Some(depth)

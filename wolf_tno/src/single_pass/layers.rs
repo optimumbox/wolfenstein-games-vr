@@ -59,6 +59,8 @@ pub struct Layers {
     depth: Option<u32>,
     /// A copy of a layer of the scene depth (a one-layer array, and its 2D view).
     depth_copy: Option<(u32, u32)>,
+    /// Both eyes' scene depth side by side (a one-layer array twice the eye's width, and its 2D view).
+    depth_pair: Option<(u32, u32)>,
 }
 
 /// An attachment of an engine framebuffer.
@@ -109,7 +111,7 @@ impl Layers {
     /// Stand-ins for the eye textures (`size`) attached to `seen` (the framebuffers the scene was
     /// drawn into), and for every framebuffer drawing into one of them.
     pub fn build(gl: &Gl, seen: &[u32], size: (i32, i32)) -> Result<Self, String> {
-        let mut layers = Self { textures: HashMap::new(), framebuffers: HashMap::new(), depth: None, depth_copy: None };
+        let mut layers = Self { textures: HashMap::new(), framebuffers: HashMap::new(), depth: None, depth_copy: None, depth_pair: None };
         let made = layers.make(gl, seen, size);
         if made.is_err() {
             layers.release(gl);
@@ -274,6 +276,36 @@ impl Layers {
         Some(view)
     }
 
+    /// Both eyes' scene depth side by side, left eye first, as the presented frame has their
+    /// colour (the upscaler's depth): its 2D view and size. The engine's own depth texture holds
+    /// one eye only (the one copied back), and DLSS stretched it over both eyes: the camera's motion
+    /// vectors were right for turning (no depth in them) and wrong for walking.
+    pub fn depth_pair(&mut self, gl: &Gl) -> Option<(u32, (i32, i32))> {
+        let eye = self.textures.get(&self.depth?)?;
+        let (array, view) = match self.depth_pair {
+            Some(made) => made,
+            None => {
+                let (mut array, mut view) = (0, 0);
+                // SAFETY: new objects of ours, with storage like the scene depth's.
+                unsafe {
+                    (gl.create_textures)(GL_TEXTURE_2D_ARRAY, 1, &mut array);
+                    (gl.texture_storage_3d)(array, 1, eye.format, eye.size.0 * 2, eye.size.1, 1);
+                    (gl.gen_textures)(1, &mut view);
+                    (gl.texture_view)(view, GL_TEXTURE_2D, array, eye.format, 0, 1, 0, 1);
+                }
+                self.depth_pair = Some((array, view));
+                (array, view)
+            }
+        };
+        // SAFETY: copies between textures of the same format, each layer into its half.
+        unsafe {
+            for layer in 0..2 {
+                (gl.copy_image_sub_data)(eye.array, GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, array, GL_TEXTURE_2D_ARRAY, 0, layer * eye.size.0, 0, 0, eye.size.0, eye.size.1, 1);
+            }
+        }
+        Some((view, (eye.size.0 * 2, eye.size.1)))
+    }
+
     /// The copy of the scene depth's layer ([`Self::depth_copy`]), once made.
     pub fn depth_copy_view(&self) -> Option<u32> {
         self.depth_copy.map(|(_, view)| view)
@@ -282,7 +314,7 @@ impl Layers {
     /// Every object of ours deleted.
     pub fn release(&mut self, gl: &Gl) {
         let framebuffers: Vec<u32> = self.framebuffers.values().flat_map(|s| s.layered.into_iter().chain(s.layer)).collect();
-        let textures: Vec<u32> = self.textures.values().flat_map(|t| std::iter::once(t.array).chain(t.views)).chain(self.depth_copy.take().into_iter().flat_map(|(a, v)| [v, a])).collect();
+        let textures: Vec<u32> = self.textures.values().flat_map(|t| std::iter::once(t.array).chain(t.views)).chain(self.depth_copy.take().into_iter().flat_map(|(a, v)| [v, a])).chain(self.depth_pair.take().into_iter().flat_map(|(a, v)| [v, a])).collect();
         // SAFETY: our own objects, unbound by the caller.
         unsafe {
             (gl.delete_framebuffers)(framebuffers.len() as i32, framebuffers.as_ptr());
