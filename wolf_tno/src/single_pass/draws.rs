@@ -235,7 +235,11 @@ const CHECK_EVERY: u64 = 15;
 const JUDGED_AFTER: u64 = 12;
 const MISFIT_SHARE: f64 = 0.8;
 /// The right eye's draws of a program seen before judging whether its geometry is its own.
-const CARRIED_JUDGED_AFTER: u64 = 24;
+/// Judged on many draws, nearly all missed: a program misjudged so draws the world for each eye
+/// (the world's own program was, from its first 24 draws while a level came in), and the right
+/// eye's own draws of it fail the depth the left eye's copies laid (black floors), at twice the cost.
+const CARRIED_JUDGED_AFTER: u64 = 600;
+const CARRIED_MISFIT_SHARE: f64 = 0.97;
 
 /// The programs the eye matrix does not carry: each one's checked draws and those not found, and
 /// the programs judged misfits (drawn by each pass).
@@ -258,7 +262,7 @@ impl Misfits {
         let (seen, missed) = self.carried.entry(program).or_default();
         *seen += 1;
         *missed += u64::from(!found);
-        if *seen >= CARRIED_JUDGED_AFTER && *missed as f64 > *seen as f64 * MISFIT_SHARE && self.misfits.insert(program) {
+        if *seen >= CARRIED_JUDGED_AFTER && *missed as f64 > *seen as f64 * CARRIED_MISFIT_SHARE && self.misfits.insert(program) {
             log!("single pass: program {program} ({name}) draws other geometry in each eye's pass ({missed} of {seen} of the right eye's draws not the left's): each eye draws it");
         }
     }
