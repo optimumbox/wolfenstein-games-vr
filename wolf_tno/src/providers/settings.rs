@@ -55,6 +55,7 @@ fn install_settings(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
     if start.options.switch(DISABLE_SCREEN_SHAKE.id, false) {
         no_screen_shake(start.ledger, &exe, build);
     }
+    no_screen_blur(start.ledger, &exe, build);
     crate::research::cvars::apply(start.ledger, &exe);
     crate::research::cvars::prepare_cycle(start.ledger, &exe);
     // Kept at 0 by the ledger (what it holds at the stop goes back), so the world never stays
@@ -93,6 +94,30 @@ fn no_screen_shake(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module, b
             eng_idt::set_float(ledger, exe, cvar, 0.0, "the view shakes");
         } else {
             eng_idt::set_int(ledger, exe, cvar, 0, "the view shakes");
+        }
+    }
+}
+
+/// The blurs laid over the whole screen when the player is hit (the damage blur and its
+/// amplitudes), each 0 while VR runs: a flat image's smear, not the same in the two eyes (each eye
+/// drawn on its own, or one warped from the other), and a blurred frame upscaled and warped turns
+/// to noise. The game has no camera motion blur to turn off.
+const BLURS: &[(&str, bool)] = &[("view_damageBlur", false), ("view_blur_min", true), ("view_blur_max", true)];
+
+/// The screen blurs off ([`BLURS`]), found in the running game as the shakes are; one the game
+/// does not have is left out.
+fn no_screen_blur(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module, build: &engine::Build) {
+    if let Some(bob) = Cvar::find(exe, build.no_bob.name, eng_idt::Layout::ID_TECH_5)
+        && bob.name_pointer != build.no_bob.name_pointer
+    {
+        return;
+    }
+    for &(name, float) in BLURS {
+        let Some(cvar) = Cvar::find(exe, name, eng_idt::Layout::ID_TECH_5) else { continue };
+        if float {
+            eng_idt::set_float(ledger, exe, cvar, 0.0, "the screen blurs when the player is hit");
+        } else {
+            eng_idt::set_int(ledger, exe, cvar, 0, "the screen blurs when the player is hit");
         }
     }
 }
