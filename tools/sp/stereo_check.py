@@ -15,6 +15,9 @@ Flagged (in both directions: what the left eye shows that the right does not, an
   something drawn in one eye only, doubled things, a light or decal in one eye);
 - height: it matches clearly better a few pixels above or below its line than on it (lights or
   things at different heights in each eye);
+- the eyes' heights: the whole right eye's picture higher or lower than the frustum it is shown
+  with (`pairs.txt`'s fields of view) puts it, against the left's (single pass's hardware keeps only
+  x of the right eye's position, so eyes framed differently up and down lose that difference);
 - depth: it matches best beyond the far plane (further apart than infinity: drawn in the wrong
   place sideways).
 
@@ -222,6 +225,83 @@ def where(x0, y0, x1, y1, w, h):
     return f'{row}-{col}' if (row, col) != ('middle', 'middle') else 'centre'
 
 
+def told_fov(folder, pair):
+    """Each eye's field of view (left, right, up, down; radians) in the pose record of `pair`."""
+    path = os.path.join(folder, 'pairs.txt')
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding='utf-8', errors='replace') as f:
+        for line in f:
+            if line.startswith(f'pair {pair} '):
+                fovs = re.findall(r'fov \[([^\]]+)\]', line)
+                if len(fovs) == 2:
+                    return [np.array([float(v) for v in f.split(',')]) for f in fovs]
+    return None
+
+
+def eye_heights(folder, pair, left_path, right_path):
+    """How far the right eye's whole picture sits from the height its own frustum gives it.
+
+    Each eye is shown with the frustum in its pose record. A thing in direction tangent t (up) is
+    at row (tan(up) - t) / (tan(up) - tan(down)) of each eye's image, whatever its distance (the eyes
+    sit side by side), so between the eyes it moves by a known number of rows at each height. The
+    picture is matched block by block (any sideways shift, a band of heights) and the rows it
+    actually moved are compared with that: a whole eye drawn higher or lower than its frustum
+    (single pass drawing the right eye at the left eye's height) shows as one offset everywhere."""
+    fov = told_fov(folder, pair)
+    if fov is None:
+        return None, []
+    s = 4
+    L = grey(left_path, s)
+    R = grey(right_path, s)
+    h, w = L.shape
+    up = [np.tan(f[2]) for f in fov]
+    down = [np.tan(f[3]) for f in fov]
+    lines = []
+    if abs(up[0] - up[1]) > 1e-4 or abs(down[0] - down[1]) > 1e-4:
+        expected_mid = ((up[1] - 0.0) / (up[1] - down[1]) - (up[0] - 0.0) / (up[0] - down[0])) * h * s
+        lines.append(f'the eyes are framed differently up and down (right eye needs things {expected_mid:+.0f} rows from the left at the centre):'
+                     " single pass keeps only the left eye's height for the right eye's copy of a draw")
+    B = 12
+    residuals = []
+    for by in range(B * 2, h - B * 2, B * 2):
+        for bx in range(B * 2, w - B * 2, B * 2):
+            a = L[by - B:by + B, bx - B:bx + B]
+            if a.std() < TEXTURED:
+                continue
+            t = up[0] - (by + 0.5) * s / (h * s) * (up[0] - down[0])
+            row_r = (up[1] - t) / (up[1] - down[1]) * h
+            want = row_r - by
+            best = (-2.0, 0, 0)
+            an = (a - a.mean()) / (a.std() + 1e-6)
+            for dy in range(-12, 13):
+                y = by + dy
+                if y - B < 0 or y + B > h:
+                    continue
+                band = R[y - B:y + B]
+                for dx in range(-w // 3, w // 12):
+                    x = bx + dx
+                    if x - B < 0 or x + B > w:
+                        continue
+                    b = band[:, x - B:x + B]
+                    sd = b.std()
+                    if sd < 1e-3:
+                        continue
+                    c = float((an * (b - b.mean())).mean() / sd)
+                    if c > best[0]:
+                        best = (c, dx, dy)
+            if best[0] >= 0.8:
+                residuals.append((best[2] - want) * s)
+    if len(residuals) >= 8:
+        off = float(np.median(residuals))
+        spread = float(np.percentile(residuals, 75) - np.percentile(residuals, 25))
+        verdict = "height: the right eye's picture is off its frustum" if abs(off) > 3 + spread / 2 else "the eyes' heights match their frustums"
+        lines.append(f'{verdict}: {off:+.0f} rows (lower +) from where its frustum puts it, over {len(residuals)} matched blocks (middle half within {spread:.0f})')
+    else:
+        lines.append(f'eye heights: too few blocks matched ({len(residuals)}) to judge')
+    return residuals, lines
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('folder')
@@ -253,7 +333,8 @@ def main():
                         med = float(np.median(vals)) * args.scale
                         detail = f', {"rows" if kind == "height" else "pixels beyond the far plane"} {med:+.0f}'
                 found.append((eye, kind, x0, y0, x1, y1, n, detail))
-    lines = [f'{args.folder} pair {args.pair}: eye matrix {E.tolist()}',
+    _, height_lines = eye_heights(args.folder, args.pair, left_path, right_path)
+    lines = [f'{args.folder} pair {args.pair}: eye matrix {E.tolist()}', *height_lines,
              'Regions (eye they were found from: "left" = shown by the left eye, not lined up in the right; "right" = the other way). Positions are % of the eye image from its left and top.']
     colours = {'missing': (255, 40, 40), 'height': (255, 220, 0), 'depth': (255, 0, 255)}
     li = Image.open(left_path).convert('RGB')

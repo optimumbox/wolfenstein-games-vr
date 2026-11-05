@@ -250,3 +250,14 @@ fn a_machine_aiming_behind_the_eyes_has_no_aim_in_them() {
     own[3] = -1.0;
     assert_eq!(aim_tangents(&own, &EAST, 3.0, 1000.0), None);
 }
+
+#[test]
+fn both_eyes_drawn_with_one_vertical_field_of_view_spanning_both() {
+    // A Beyond's eyes: the right framed a little higher at the top, the left lower at the bottom.
+    let mut pose = HeadPose::EMPTY;
+    pose.fov = [[-0.9548, 0.7305, 0.7537, -0.9317], [-0.7412, 0.9481, 0.7637, -0.9267]];
+    let shared = shared_vertical(pose);
+    assert_eq!(shared.fov, [[-0.9548, 0.7305, 0.7637, -0.9317], [-0.7412, 0.9481, 0.7637, -0.9317]]);
+    let [left, right] = shared.fov.map(|f| Frustum::from_fov(f).expect("a frustum"));
+    assert_eq!(left.extents(1.0)[2..], right.extents(1.0)[2..], "the same bottom and top: no height for the hardware to drop");
+}

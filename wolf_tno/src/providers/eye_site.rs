@@ -415,6 +415,28 @@ static BUILDING_THREAD: AtomicU32 = AtomicU32::new(0);
 static EYE_CALLS: AtomicU32 = AtomicU32::new(0);
 /// The pose of the frame being built.
 static FRAME_POSE: Mutex<Option<HeadPose>> = Mutex::new(None);
+/// Both eyes drawn with one vertical field of view ([`share_vertical`]).
+static SHARED_VERTICAL: AtomicBool = AtomicBool::new(false);
+
+/// Whether both eyes are drawn with one vertical field of view, both eyes' together (single pass:
+/// its hardware draws the right eye's copy of a draw at the left eye's height, taking only the `x`
+/// of the right eye's position, so a right eye framed higher or lower than the left would show the
+/// world off by that much, about a degree on a Beyond).
+pub fn share_vertical(on: bool) {
+    SHARED_VERTICAL.store(on, Relaxed);
+}
+
+/// `pose` with both eyes' fields of view spanning both eyes' up and down (the pose record says the
+/// same, so the headset shows each eye with the frustum it was drawn with).
+pub fn shared_vertical(mut pose: HeadPose) -> HeadPose {
+    let up = pose.fov[0][2].max(pose.fov[1][2]);
+    let down = pose.fov[0][3].min(pose.fov[1][3]);
+    for fov in &mut pose.fov {
+        fov[2] = up;
+        fov[3] = down;
+    }
+    pose
+}
 /// View builds and the player views turned at them (the engine draws both eyes from each).
 static BUILDS: Tally = Tally::new("view builds");
 static PROJECTED: AtomicU64 = AtomicU64::new(0);
@@ -640,6 +662,7 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
         Some(_) if HEAD_TRACKED.load(Acquire) && crate::on(crate::EYES_AT) => look::command::head_baked().or_else(|| PAIRS.head().current()),
         _ => None,
     };
+    let pose = pose.map(|p| if SHARED_VERTICAL.load(Relaxed) { shared_vertical(p) } else { p });
     let mut saved = Saved::<View, { engine::PLAYER_VIEWS }>::new();
     let warping = WARPING.load(Acquire);
     if warping {

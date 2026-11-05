@@ -170,7 +170,12 @@ pub const SINGLE_PASS: Component<Wolf> = Component {
     settings: |options, _| {
         eyes::single_pass_on(options);
     },
-    on: |run| On::when(eyes::single_pass_on(run.options), "the stereo method is not Single-pass (Same-frame)"),
+    on: |run| {
+        let on = eyes::single_pass_on(run.options);
+        // Both eyes framed alike up and down: the hardware keeps only the left eye's height.
+        eye_site::share_vertical(on);
+        On::when(on, "the stereo method is not Single-pass (Same-frame)")
+    },
     give_back: single_pass::draws::give_back,
     let_go: Some(single_pass::draws::let_go),
     summary: Some(single_pass::draws::summary),
