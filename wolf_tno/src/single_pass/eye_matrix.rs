@@ -168,19 +168,24 @@ pub fn pairs_with(previous: &Rows, left: &[(u32, Rows)], right: &[(u32, Rows)]) 
 /// the right eye's own decals flicker on the carried surfaces). The matrix does not change (the
 /// eyes' distance and frustums), so the average of thousands of pairs stands still and is nearer the
 /// truth. Older pairs fade once [`FIT_KEPT`] are held, and a frame's own measure far from the average
-/// [`FIT_SETTLES`] frames in a row, its pairs agreeing with none of it, starts it afresh (the eye
-/// distance changed).
+/// [`FIT_SETTLES`] frames in a row, its pairs agreeing with none of it and each frame's measure the
+/// same new matrix, starts it afresh (the eye distance changed). While textures and meshes stream in,
+/// the passes draw different things and a frame's pairs can agree on a wrong matrix: those differ
+/// from frame to frame, and starting afresh from one shifted the right eye's near things for a few
+/// frames (a flicker in the right eye only).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Fit {
     sum: M,
     weight: f64,
     misses: u32,
+    /// The frames' own measure while they miss the average: the same each frame, or no reset.
+    candidate: Option<M>,
 }
 
 /// Pairs' weight the average holds before older ones fade.
 pub const FIT_KEPT: f64 = 2000.0;
 /// Frames in a row whose own measure is far from the average before it starts afresh.
-pub const FIT_SETTLES: u32 = 3;
+pub const FIT_SETTLES: u32 = 6;
 /// How far (relative) a frame's own measure may be from the average and still be the same matrix.
 pub const FIT_SAME: f64 = 1e-3;
 /// How far (relative) one pair's own matrix may be from the average and still be added (a pair of
@@ -226,13 +231,18 @@ impl Fit {
         let added = self.add_agreeing(pairs, &estimate);
         if added > 0 {
             self.misses = 0;
+            self.candidate = None;
             return FitStep::Added(added);
         }
         let Some(fresh) = fresh else { return FitStep::Nothing };
         if apart(fresh, &estimate.map(|row| row.map(|v| v as f32))) <= FIT_SAME {
             return FitStep::Nothing;
         }
-        self.misses += 1;
+        let same = self.candidate.is_some_and(|c| apart(fresh, &c.map(|row| row.map(|v| v as f32))) <= FIT_SAME);
+        self.misses = if same { self.misses + 1 } else { 1 };
+        if !same {
+            self.candidate = Some(widen(fresh));
+        }
         if self.misses < FIT_SETTLES {
             return FitStep::Held;
         }

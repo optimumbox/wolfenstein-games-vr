@@ -177,3 +177,23 @@ fn the_average_starts_afresh_when_the_eyes_move_apart() {
     assert_eq!(last, FitStep::Reset);
     assert!(apart(&fit.matrix().unwrap(), &fresh.matrix) < 1e-4);
 }
+
+#[test]
+fn the_average_holds_through_frames_measuring_different_wrong_matrices() {
+    let head = translate(0.0, -1.6, 0.0);
+    let models = [translate(0.0, 0.0, -5.0), translate(1.0, 0.0, -6.0), translate(-2.0, 1.0, -8.0), multiply(&translate(2.0, 0.0, -9.0), &turn(0.5))];
+    let pairs: Vec<_> = models.iter().map(|m| pair(&head, m)).collect();
+    let mut fit = Fit::default();
+    for _ in 0..10 {
+        fit.add(&pairs, measure(&pairs).as_ref().map(|m| &m.matrix));
+    }
+    let before = fit.matrix().unwrap();
+    // Streaming: each frame's pairs agree on another wrong matrix; none starts the average afresh.
+    for frame in 0..(FIT_SETTLES * 4) {
+        let off = 0.3 + 0.2 * f64::from(frame % 2);
+        let wrong: Vec<_> = pairs.iter().map(|(l, r)| (*l, narrow(&multiply(&translate(-off, 0.0, 0.0), &widen(r))))).collect();
+        let fresh = measure(&wrong).unwrap();
+        assert_eq!(fit.add(&wrong, Some(&fresh.matrix)), FitStep::Held);
+    }
+    assert_eq!(fit.matrix().unwrap(), before);
+}
