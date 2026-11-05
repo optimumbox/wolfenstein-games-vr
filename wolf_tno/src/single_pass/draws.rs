@@ -151,6 +151,14 @@ struct Counts {
     rematched: u64,
     /// The right eye's stretch draws found among the left eye's by shape alone ([`Carried`]).
     by_shape: u64,
+    /// The right eye's stretch draws of a mesh the left eye's drew a little elsewhere (moved
+    /// between the passes), skipped.
+    moved: u64,
+    /// The right eye's draws drawn though the left eye's drew the same mesh (farther off).
+    right_only_same_geometry: u64,
+    /// Frames whose measured matrix was far from the last, and those that kept the last one.
+    matrix_jumps: u64,
+    matrix_held: u64,
 }
 
 /// The left eye's stretch draws of a frame made for both eyes, by program and geometry (a key of
@@ -192,11 +200,29 @@ impl Carried {
         Some(Found::Shape)
     }
 
+    /// How far the right eye's draw with `rows` is from the nearest of the left eye's carried
+    /// draws of the same program and geometry (none: no such draw).
+    fn nearest(&self, program: u32, geometry: u64, rows: &Rows) -> Option<f64> {
+        self.by.get(&(program, geometry))?.iter().map(|c| eye_matrix::apart(c, rows)).min_by(f64::total_cmp)
+    }
+
     fn clear(&mut self) {
         self.by.clear();
         self.by_shape.clear();
     }
 }
+
+/// How far (relative) the right eye's draw of a mesh may be from the left eye's carried draw of it
+/// and still be the same thing, moved between the passes (swaying, turned to the camera, animated
+/// on): a repeat of the mesh elsewhere is metres away, far beyond it.
+const MOVED_BETWEEN: f64 = 0.02;
+
+/// How far (relative) a frame's measured eye matrix may be from the last one and be taken at once.
+/// The eyes' distance and frustums do not change from frame to frame: a matrix this far off is a
+/// mispairing (draws of other things paired), and one frame of it puts the right eye's whole world
+/// somewhere else. It is taken only once [`MATRIX_SETTLES`] frames in a row measure it.
+const MATRIX_JUMP: f64 = 1e-3;
+const MATRIX_SETTLES: u32 = 3;
 
 /// The frames between checks of the right eye's draws against the left's carried by the matrix.
 const CHECK_EVERY: u64 = 15;
@@ -375,6 +401,12 @@ struct State {
     by_shape_by: HashMap<u32, u64>,
     /// The last matrix measured, to pair the passes' draws by when their order does not.
     last_matrix: Option<Rows>,
+    /// A matrix far from the last measured in the latest frames in a row, and how many.
+    jumped: Option<(Rows, u32)>,
+    /// The farthest a measured matrix has been from the last.
+    largest_jump: f64,
+    /// The right eye's draws skipped as moved between the passes, by program, and the farthest.
+    moved_by: HashMap<u32, (u64, f64)>,
     misfits: Misfits,
     /// The right eye's rows of the programs reading the scene's maps, learnt.
     screen: Learner,
@@ -429,6 +461,9 @@ fn state() -> State {
         right_only_by: HashMap::new(),
         by_shape_by: HashMap::new(),
         last_matrix: None,
+        jumped: None,
+        largest_jump: 0.0,
+        moved_by: HashMap::new(),
         misfits: Misfits::default(),
         screen: Learner::default(),
         map_arrays: HashMap::new(),
@@ -570,8 +605,30 @@ pub fn frame(on: bool) {
         measured = eye_matrix::measure_with(last, &state.left, &state.right);
         state.counts.rematched += u64::from(measured.is_some());
     }
-    if let Some(m) = &measured {
-        state.last_matrix = Some(m.matrix);
+    if let Some(m) = measured.as_mut() {
+        match state.last_matrix {
+            Some(last) if eye_matrix::apart(&m.matrix, &last) > MATRIX_JUMP => {
+                let jump = eye_matrix::apart(&m.matrix, &last);
+                state.largest_jump = state.largest_jump.max(jump);
+                state.counts.matrix_jumps += 1;
+                let streak = match state.jumped {
+                    Some((other, n)) if eye_matrix::apart(&m.matrix, &other) <= MATRIX_JUMP => n + 1,
+                    _ => 1,
+                };
+                if streak >= MATRIX_SETTLES {
+                    state.jumped = None;
+                    state.last_matrix = Some(m.matrix);
+                } else {
+                    state.jumped = Some((m.matrix, streak));
+                    state.counts.matrix_held += 1;
+                    m.matrix = last;
+                }
+            }
+            _ => {
+                state.jumped = None;
+                state.last_matrix = Some(m.matrix);
+            }
+        }
     }
     if state.matrix.is_some() {
         state.counts.frames_on += 1;
@@ -662,6 +719,20 @@ pub fn frame(on: bool) {
             by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
             by.iter().take(12).map(|(n, name, p)| format!("{name} ({p}) {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
         }, c.rematched);
+        log!(
+            "single pass: the right eye's stretch draws of a mesh the left eye's drew a little elsewhere (moved between the passes), skipped: {} ({:.1} a frame; by program, farthest: {}); right eye's own draws of a mesh the left eye's drew farther off: {}; eye matrices measured far from the last: {} (kept the last in {}, farthest {:.2e})",
+            c.moved,
+            c.moved as f64 / frames,
+            {
+                let mut by: Vec<_> = state.moved_by.iter().map(|(p, (n, far))| (*n, *far, state.programs.get(p).map_or("?", |p| p.converted.name), *p)).collect();
+                by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                by.iter().take(12).map(|(n, far, name, p)| format!("{name} ({p}) {:.1} {far:.3}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
+            },
+            c.right_only_same_geometry,
+            c.matrix_jumps,
+            c.matrix_held,
+            state.largest_jump
+        );
         log!("single pass: the right eye's stretch draws found among the left eye's by shape alone (streamed at another offset), skipped: {} ({:.1} a frame; by program: {})", c.by_shape, c.by_shape as f64 / frames, {
             let mut by: Vec<_> = state.by_shape_by.iter().map(|(p, n)| (*n, state.programs.get(p).map_or("?", |p| p.converted.name), *p)).collect();
             by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
@@ -1342,6 +1413,17 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
                     state.counts.skipped += 1;
                     return false;
                 }
+                let nearest = state.carried.nearest(current, geometry, &rows);
+                if let Some(near) = nearest.filter(|&near| near <= MOVED_BETWEEN) {
+                    // The same mesh the left eye's pass drew, moved a little between the passes:
+                    // drawn too it would show twice in the right eye.
+                    state.counts.moved += 1;
+                    let entry = state.moved_by.entry(current).or_default();
+                    entry.0 += 1;
+                    entry.1 = entry.1.max(near);
+                    return false;
+                }
+                state.counts.right_only_same_geometry += u64::from(nearest.is_some());
                 // Culled for the left eye: the right eye's pass draws it into its own layer.
                 state.counts.right_only += 1;
                 *state.right_only_by.entry(current).or_default() += 1;
@@ -2048,5 +2130,17 @@ mod tests {
         carried.keep(7, 300, 11, rows(0.4));
         assert_eq!(carried.find(7, 301, 11, &rows(0.9)), None);
         assert_eq!(carried.find(8, 301, 11, &rows(0.4)), None);
+    }
+
+    #[test]
+    fn a_mesh_moved_a_little_between_the_passes_is_near_and_a_repeat_elsewhere_is_not() {
+        let mut carried = Carried::default();
+        carried.keep(7, 100, 5, rows(0.20));
+        // Swayed between the passes: the same geometry, rows a little apart.
+        let near = carried.nearest(7, 100, &rows(0.205)).unwrap();
+        assert!(near > eye_matrix::AGREES * 10.0 && near <= MOVED_BETWEEN, "{near}");
+        // The same mesh repeated metres away, or other geometry: not taken for it.
+        assert!(carried.nearest(7, 100, &rows(3.0)).unwrap() > MOVED_BETWEEN);
+        assert_eq!(carried.nearest(7, 101, &rows(0.205)), None);
     }
 }
