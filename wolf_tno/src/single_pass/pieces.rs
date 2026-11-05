@@ -129,6 +129,15 @@ static PIECES: Mutex<Option<Pieces>> = Mutex::new(None);
 static ON: AtomicBool = AtomicBool::new(false);
 /// The program the game last made current.
 static PROGRAM: AtomicU32 = AtomicU32::new(0);
+/// The render thread (the one that swaps): the game's other threads' GL calls go to other
+/// contexts, where our queries are not, and are not stamped.
+static RENDER_THREAD: AtomicU32 = AtomicU32::new(0);
+
+fn on_render_thread() -> bool {
+    // SAFETY: a plain query of the calling thread's id.
+    RENDER_THREAD.load(Relaxed) == unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
+}
+
 /// Set once the GL calls were looked for and not all found.
 static MISSING: AtomicBool = AtomicBool::new(false);
 
@@ -140,7 +149,7 @@ pub fn program(program: u32) {
 /// Before one of the game's draws goes to the driver (render thread): flushed first if it would
 /// make the piece too long, then stamped.
 pub fn before_draw() {
-    if !ON.load(Relaxed) {
+    if !ON.load(Relaxed) || !on_render_thread() {
         return;
     }
     let program = PROGRAM.load(Relaxed);
@@ -183,6 +192,8 @@ pub fn swap(publishing: bool, name: impl Fn(u32) -> Option<&'static str>) {
         ON.store(false, Relaxed);
         return;
     }
+    // SAFETY: a plain query of the calling thread's id.
+    RENDER_THREAD.store(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }, Relaxed);
     let Ok(mut held) = PIECES.lock() else { return };
     if held.is_none() {
         if MISSING.load(Relaxed) {
@@ -219,7 +230,7 @@ pub fn swap(publishing: bool, name: impl Fn(u32) -> Option<&'static str>) {
 
 /// Before one of the game's GL calls that is not a draw (render thread): stamped, on timed frames.
 pub fn call(name: &'static str) {
-    if !ON.load(Relaxed) {
+    if !ON.load(Relaxed) || !on_render_thread() {
         return;
     }
     let Ok(mut held) = PIECES.lock() else { return };
