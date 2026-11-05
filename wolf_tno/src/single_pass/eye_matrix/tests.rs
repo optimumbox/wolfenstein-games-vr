@@ -92,3 +92,65 @@ fn draws_one_eye_culled_are_paired_by_the_last_matrix_not_their_order() {
     }
     assert!(both.iter().all(|(l, _)| apart(&carry(&measured.matrix, l), &right_only) > AGREES * 10.0));
 }
+
+/// Rows rounded as a single-precision upload would, with one part in `noise` added to each.
+fn noisy(rows: &Rows, seed: u64, noise: f32) -> Rows {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    rows.map(|row| {
+        row.map(|v| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let unit = (state % 2001) as f32 / 1000.0 - 1.0;
+            v * (1.0 + unit / noise)
+        })
+    })
+}
+
+#[test]
+fn the_average_over_many_frames_is_nearer_than_a_frames_own_measure() {
+    let head = multiply(&turn(0.4), &translate(-30.0, -1.6, 20.0));
+    let models: Vec<M> = (0..6).map(|i| multiply(&translate(i as f64 * 7.0 - 20.0, (i % 3) as f64, -40.0 + i as f64 * 3.0), &turn(i as f64))).collect();
+    let truth = {
+        let (left, right) = pair(&head, &models[0]);
+        multiply(&widen(&right), &invert(&widen(&left)).unwrap())
+    };
+    let truth = narrow(&truth);
+    let mut fit = Fit::default();
+    let mut worst_single = 0.0f64;
+    for frame in 0..200u64 {
+        let pairs: Vec<(Rows, Rows)> =
+            models.iter().map(|m| pair(&head, m)).enumerate().map(|(i, (l, r))| (noisy(&l, frame * 31 + i as u64, 3e5), noisy(&r, frame * 37 + i as u64 + 7, 3e5))).collect();
+        let fresh = measure(&pairs);
+        if let Some(fresh) = &fresh {
+            worst_single = worst_single.max(apart(&fresh.matrix, &truth));
+        }
+        fit.add(&pairs, fresh.as_ref().map(|m| &m.matrix));
+    }
+    let averaged = apart(&fit.matrix().unwrap(), &truth);
+    assert!(worst_single > 0.0);
+    assert!(averaged * 4.0 < worst_single, "averaged {averaged:.2e}, a frame's own at worst {worst_single:.2e}");
+}
+
+#[test]
+fn the_average_starts_afresh_when_the_eyes_move_apart() {
+    let head = translate(0.0, -1.6, 0.0);
+    let models = [translate(0.0, 0.0, -5.0), translate(1.0, 0.0, -6.0), translate(-2.0, 1.0, -8.0), multiply(&translate(2.0, 0.0, -9.0), &turn(0.5))];
+    let pairs: Vec<_> = models.iter().map(|m| pair(&head, m)).collect();
+    let mut fit = Fit::default();
+    for _ in 0..10 {
+        fit.add(&pairs, measure(&pairs).as_ref().map(|m| &m.matrix));
+    }
+    let before = fit.matrix().unwrap();
+    // The same draws with the eyes twice as far apart: one frame of it is held, a few start afresh.
+    let wider: Vec<_> = pairs.iter().map(|(l, r)| (*l, narrow(&multiply(&translate(-0.5, 0.0, 0.0), &widen(r))))).collect();
+    let fresh = measure(&wider).unwrap();
+    assert_eq!(fit.add(&wider, Some(&fresh.matrix)), FitStep::Held);
+    assert_eq!(fit.matrix().unwrap(), before);
+    let mut last = FitStep::Nothing;
+    for _ in 1..FIT_SETTLES {
+        last = fit.add(&wider, Some(&fresh.matrix));
+    }
+    assert_eq!(last, FitStep::Reset);
+    assert!(apart(&fit.matrix().unwrap(), &fresh.matrix) < 1e-4);
+}

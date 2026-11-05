@@ -56,7 +56,7 @@
 //! The engine's extension functions are called through its own function table, whose slots are
 //! found in the executable's data by the driver's and OpenGL32's addresses ([`install`]).
 
-use super::eye_matrix::{self, Rows};
+use super::eye_matrix::{self, FitStep, Rows};
 use super::gl_api::{self, Gl};
 use super::layers::Layers;
 use super::programs::{Conversion, Converted, Screen};
@@ -162,6 +162,8 @@ struct Counts {
     /// Frames whose measured matrix was far from the last, and those that kept the last one.
     matrix_jumps: u64,
     matrix_held: u64,
+    /// Pairs added to the averaged eye matrix.
+    fitted: u64,
 }
 
 /// The left eye's stretch draws of a frame made for both eyes, by program and geometry (a key of
@@ -220,12 +222,6 @@ impl Carried {
 /// on): a repeat of the mesh elsewhere is metres away, far beyond it.
 const MOVED_BETWEEN: f64 = 0.02;
 
-/// How far (relative) a frame's measured eye matrix may be from the last one and be taken at once.
-/// The eyes' distance and frustums do not change from frame to frame: a matrix this far off is a
-/// mispairing (draws of other things paired), and one frame of it puts the right eye's whole world
-/// somewhere else. It is taken only once [`MATRIX_SETTLES`] frames in a row measure it.
-const MATRIX_JUMP: f64 = 1e-3;
-const MATRIX_SETTLES: u32 = 3;
 
 /// The frames between checks of the right eye's draws against the left's carried by the matrix.
 const CHECK_EVERY: u64 = 15;
@@ -408,9 +404,9 @@ struct State {
     by_shape_by: HashMap<u32, u64>,
     /// The last matrix measured, to pair the passes' draws by when their order does not.
     last_matrix: Option<Rows>,
-    /// A matrix far from the last measured in the latest frames in a row, and how many.
-    jumped: Option<(Rows, u32)>,
-    /// The farthest a measured matrix has been from the last.
+    /// The eye matrix averaged over many frames ([`eye_matrix::Fit`]).
+    fit: eye_matrix::Fit,
+    /// The farthest a frame's own measured matrix has been from the averaged one.
     largest_jump: f64,
     /// The right eye's draws skipped as moved between the passes, by program, and the farthest.
     moved_by: HashMap<u32, (u64, f64)>,
@@ -468,7 +464,7 @@ fn state() -> State {
         right_only_by: HashMap::new(),
         by_shape_by: HashMap::new(),
         last_matrix: None,
-        jumped: None,
+        fit: eye_matrix::Fit::default(),
         largest_jump: 0.0,
         moved_by: HashMap::new(),
         misfits: Misfits::default(),
@@ -608,34 +604,28 @@ pub fn frame(on: bool) {
     state.size = (size.0 as i32, size.1 as i32);
     let pairs: Vec<(Rows, Rows)> = state.left.iter().zip(&state.right).filter(|(l, r)| l.0 == r.0).map(|(l, r)| (l.1, r.1)).collect();
     let mut measured = if passes == 2 { eye_matrix::measure(&pairs) } else { None };
-    if passes == 2 && measured.is_none() && let Some(last) = state.last_matrix.as_ref() {
-        measured = eye_matrix::measure_with(last, &state.left, &state.right);
+    let mut paired = pairs;
+    if passes == 2 && measured.is_none() && let Some(last) = state.fit.matrix().or(state.last_matrix) {
+        paired = eye_matrix::pairs_with(&last, &state.left, &state.right);
+        measured = eye_matrix::measure(&paired);
         state.counts.rematched += u64::from(measured.is_some());
     }
-    if let Some(m) = measured.as_mut() {
-        match state.last_matrix {
-            Some(last) if eye_matrix::apart(&m.matrix, &last) > MATRIX_JUMP => {
-                let jump = eye_matrix::apart(&m.matrix, &last);
-                state.largest_jump = state.largest_jump.max(jump);
-                state.counts.matrix_jumps += 1;
-                let streak = match state.jumped {
-                    Some((other, n)) if eye_matrix::apart(&m.matrix, &other) <= MATRIX_JUMP => n + 1,
-                    _ => 1,
-                };
-                if streak >= MATRIX_SETTLES {
-                    state.jumped = None;
-                    state.last_matrix = Some(m.matrix);
-                } else {
-                    state.jumped = Some((m.matrix, streak));
-                    state.counts.matrix_held += 1;
-                    m.matrix = last;
-                }
-            }
-            _ => {
-                state.jumped = None;
-                state.last_matrix = Some(m.matrix);
-            }
+    if passes == 2 {
+        match state.fit.add(&paired, measured.as_ref().map(|m| &m.matrix)) {
+            FitStep::Added(n) => state.counts.fitted += n as u64,
+            FitStep::Held => state.counts.matrix_held += 1,
+            FitStep::Reset => state.counts.matrix_jumps += 1,
+            FitStep::Nothing => {}
         }
+    }
+    let fitted = state.fit.matrix().filter(|_| passes == 2);
+    if let (Some(m), Some(fit)) = (measured.as_ref(), fitted.as_ref()) {
+        state.largest_jump = state.largest_jump.max(eye_matrix::apart(&m.matrix, fit));
+    }
+    if fitted.is_some() {
+        state.last_matrix = fitted;
+    } else if let Some(m) = &measured {
+        state.last_matrix = Some(m.matrix);
     }
     if state.matrix.is_some() {
         state.counts.frames_on += 1;
@@ -644,9 +634,11 @@ pub fn frame(on: bool) {
     }
     state.counts.odd_frames += u64::from(passes != 2);
     state.screen.end_frame(state.matrix.as_ref());
-    state.matrix = measured.map(|m| m.matrix);
+    // The average whenever there is one: the matrix does not change, so a frame whose own pairs
+    // gave none still has both eyes in one pass (each eye on its own for a frame is a blink).
+    state.matrix = fitted.or(measured.map(|m| m.matrix));
     state.matrix_number += 1;
-    state.agreeing = measured.map_or((0, pairs.len()), |m| (m.agreeing, m.looked_at));
+    state.agreeing = measured.map_or((0, paired.len()), |m| (m.agreeing, m.looked_at));
     state.left.clear();
     state.misfits.left.clear();
     state.left_queries.clear();
@@ -728,7 +720,7 @@ pub fn frame(on: bool) {
             by.iter().take(12).map(|(n, name, p)| format!("{name} ({p}) {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
         }, c.rematched);
         log!(
-            "single pass: the right eye's stretch draws of a mesh the left eye's drew a little elsewhere (moved between the passes), skipped: {} ({:.1} a frame; by program, farthest: {}); right eye's own draws of a mesh the left eye's drew farther off: {}; eye matrices measured far from the last: {} (kept the last in {}, farthest {:.2e})",
+            "single pass: the right eye's stretch draws of a mesh the left eye's drew a little elsewhere (moved between the passes), skipped: {} ({:.1} a frame; by program, farthest: {}); right eye's own draws of a mesh the left eye's drew farther off: {}; the averaged eye matrix: started afresh {} times, kept while a frame measured far from it in {}, a frame's own measure from it at most {:.2e}, pairs averaged {}",
             c.moved,
             c.moved as f64 / frames,
             {
@@ -739,7 +731,8 @@ pub fn frame(on: bool) {
             c.right_only_same_geometry,
             c.matrix_jumps,
             c.matrix_held,
-            state.largest_jump
+            state.largest_jump,
+            c.fitted
         );
         log!("single pass: the right eye's stretch draws found among the left eye's by shape alone (streamed at another offset), skipped: {} ({:.1} a frame; by program: {})", c.by_shape, c.by_shape as f64 / frames, {
             let mut by: Vec<_> = state.by_shape_by.iter().map(|(p, n)| (*n, state.programs.get(p).map_or("?", |p| p.converted.name), *p)).collect();

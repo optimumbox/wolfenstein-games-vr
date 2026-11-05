@@ -133,11 +133,129 @@ pub fn measure(pairs: &[(Rows, Rows)]) -> Option<Measured> {
 /// (the eyes' distance and frustums) is the same. Each right draw pairs with a left draw of its
 /// program that `previous` carries onto it; the matrix is measured afresh from those pairs.
 pub fn measure_with(previous: &Rows, left: &[(u32, Rows)], right: &[(u32, Rows)]) -> Option<Measured> {
-    let pairs: Vec<(Rows, Rows)> = right
+    measure(&pairs_with(previous, left, right))
+}
+
+/// The passes' recorded draws paired by a known matrix `previous` ([`measure_with`]).
+pub fn pairs_with(previous: &Rows, left: &[(u32, Rows)], right: &[(u32, Rows)]) -> Vec<(Rows, Rows)> {
+    right
         .iter()
         .filter_map(|(program, r)| left.iter().find(|(p, l)| p == program && misfit(previous, l, r) <= AGREES * 10.0).map(|(_, l)| (*l, *r)))
-        .collect();
-    measure(&pairs)
+        .collect()
+}
+
+/// The eye matrix averaged over many frames: each agreeing pair's own matrix
+/// (`right · left⁻¹`) added in. One pair's matrix is only as good as its rows' single precision,
+/// and the pair a frame measures from changes from frame to frame: measured afresh each frame the
+/// right eye's whole world moves by up to a pixel between frames (thin things and lights shimmer,
+/// the right eye's own decals flicker on the carried surfaces). The matrix does not change (the
+/// eyes' distance and frustums), so the average of thousands of pairs stands still and is nearer the
+/// truth. Older pairs fade once [`FIT_KEPT`] are held, and a frame's own measure far from the average
+/// [`FIT_SETTLES`] frames in a row, its pairs agreeing with none of it, starts it afresh (the eye
+/// distance changed).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Fit {
+    sum: M,
+    weight: f64,
+    misses: u32,
+}
+
+/// Pairs' weight the average holds before older ones fade.
+pub const FIT_KEPT: f64 = 2000.0;
+/// Frames in a row whose own measure is far from the average before it starts afresh.
+pub const FIT_SETTLES: u32 = 3;
+/// How far (relative) a frame's own measure may be from the average and still be the same matrix.
+pub const FIT_SAME: f64 = 1e-3;
+/// How far (relative) one pair's own matrix may be from the average and still be added (a pair of
+/// nearly singular rows gives a matrix far off though its rows agree).
+const FIT_PAIR: f64 = 1e-2;
+
+/// What a frame's pairs did to the average.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FitStep {
+    /// This many pairs added.
+    Added(usize),
+    /// None added; the frame's own measure far from the average (kept for now).
+    Held,
+    /// Started afresh from the frame's own measure.
+    Reset,
+    /// Nothing to go on.
+    Nothing,
+}
+
+impl Fit {
+    /// The averaged matrix, none before any pair.
+    pub fn matrix(&self) -> Option<Rows> {
+        (self.weight > 0.0).then(|| self.mean().map(|row| row.map(|v| v as f32)))
+    }
+
+    fn mean(&self) -> M {
+        self.sum.map(|row| row.map(|v| v / self.weight))
+    }
+
+    /// Adds the pairs that agree with the average (or, before one, with `fresh`, the frame's own
+    /// measure).
+    pub fn add(&mut self, pairs: &[(Rows, Rows)], fresh: Option<&Rows>) -> FitStep {
+        if self.weight <= 0.0 {
+            return match fresh {
+                Some(fresh) => {
+                    self.seed(pairs, fresh);
+                    FitStep::Reset
+                }
+                None => FitStep::Nothing,
+            };
+        }
+        let estimate = self.mean();
+        let added = self.add_agreeing(pairs, &estimate);
+        if added > 0 {
+            self.misses = 0;
+            return FitStep::Added(added);
+        }
+        let Some(fresh) = fresh else { return FitStep::Nothing };
+        if apart(fresh, &estimate.map(|row| row.map(|v| v as f32))) <= FIT_SAME {
+            return FitStep::Nothing;
+        }
+        self.misses += 1;
+        if self.misses < FIT_SETTLES {
+            return FitStep::Held;
+        }
+        self.seed(pairs, fresh);
+        FitStep::Reset
+    }
+
+    fn seed(&mut self, pairs: &[(Rows, Rows)], fresh: &Rows) {
+        *self = Self::default();
+        if self.add_agreeing(pairs, &widen(fresh)) == 0 {
+            self.sum = widen(fresh);
+            self.weight = 1.0;
+        }
+    }
+
+    fn add_agreeing(&mut self, pairs: &[(Rows, Rows)], estimate: &M) -> usize {
+        let narrow = estimate.map(|row| row.map(|v| v as f32));
+        let mut added = 0;
+        for (left, right) in pairs {
+            if disagreement(estimate, left, right) > AGREES {
+                continue;
+            }
+            let Some(inverse) = invert(&widen(left)) else { continue };
+            let own = multiply(&widen(right), &inverse);
+            if apart(&own.map(|row| row.map(|v| v as f32)), &narrow) > FIT_PAIR {
+                continue;
+            }
+            for (sum, own) in self.sum.iter_mut().flatten().zip(own.iter().flatten()) {
+                *sum += own;
+            }
+            self.weight += 1.0;
+            added += 1;
+        }
+        if self.weight > FIT_KEPT {
+            let keep = FIT_KEPT / self.weight;
+            self.sum = self.sum.map(|row| row.map(|v| v * keep));
+            self.weight = FIT_KEPT;
+        }
+        added
+    }
 }
 
 #[cfg(test)]
