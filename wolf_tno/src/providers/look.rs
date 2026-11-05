@@ -25,9 +25,16 @@ use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 
 /// The share is held while the game holds it ([`camera_taken::holds`]: a mounted gun, a machine
-/// driven, the wheel) and while another camera has the view ([`TAKEOVER`]).
+/// driven, the wheel) and while another camera has the view ([`TAKEOVER`]: a ladder's mount), but
+/// not under a control camera ([`camera_taken::grabbed`]): the game builds that from the player's
+/// angles, and the head looks around it, so a share held in them turned the view twice over.
 fn holds() -> bool {
-    camera_taken::holds() || camera_taken::controlled()
+    camera_taken::holds() || taken()
+}
+
+/// Another camera has the view, not built from the player's angles.
+fn taken() -> bool {
+    camera_taken::controlled() && !camera_taken::grabbed()
 }
 
 /// The Wolfensteins look by the command: the head the same-frame loop holds, the player's own pitch
@@ -87,7 +94,7 @@ pub unsafe extern "system" fn usercmd_builder(generator: usize, out: usize, play
         let snapped = crate::cooking::body_forward::take_snapped();
         engine::COMMANDS.rewrite(generator, out, player as u32 as usize, scale, |pitch, yaw| {
             let yaw = yaw - snapped;
-            let (pitch, yaw) = TAKEOVER.locked().command(pitch, yaw, camera_taken::controlled() && !camera_taken::mounted(), monaka_body::look::baked::<Wolf>(None));
+            let (pitch, yaw) = TAKEOVER.locked().command(pitch, yaw, taken() && !camera_taken::mounted(), monaka_body::look::baked::<Wolf>(None));
             let built = command::built(pitch, yaw).or((snapped != 0.0).then_some((pitch, yaw)));
             // On a mounted gun, turned toward where the right controller points.
             let (p, y) = built.unwrap_or((pitch, yaw));

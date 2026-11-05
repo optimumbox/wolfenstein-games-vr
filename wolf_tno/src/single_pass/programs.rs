@@ -20,7 +20,7 @@ use super::archive::{self, Renderprog};
 use super::convert;
 use super::gl_api::{self, ActiveUniform, Gl};
 use monaka_producer::log;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -81,6 +81,9 @@ pub struct Screen {
 const LAST_NAME: u32 = 16384;
 /// Programs moved into the engine's per frame (each a binary load and a uniform copy).
 const SWAPS_PER_FRAME: usize = 48;
+/// The render thread's time given to sweeping the engine's programs per frame: a level can hold
+/// thousands, each costing the driver a millisecond or more to answer for.
+const SWEEP_PER_FRAME: Duration = Duration::from_millis(4);
 /// The longest the driver is waited for, per batch of compiles.
 const COMPILE_PATIENCE: Duration = Duration::from_secs(60);
 /// Whether programs reading the scene's maps are converted to read them at the layer they draw
@@ -92,6 +95,7 @@ enum Stage {
     Idle,
     Reading(Receiver<Result<Vec<Renderprog>, String>>),
     Compiling { sources: Vec<Renderprog>, scratch: Vec<u32>, since: Instant },
+    Sweeping(Box<Sweep>),
     Converting { jobs: Vec<Job>, since: Instant },
     Swapping { jobs: Vec<Job>, done: usize },
     Done,
@@ -160,7 +164,14 @@ impl Conversion {
                     Stage::Compiling { sources, scratch, since }
                 } else {
                     self.sources = sources;
-                    let stage = match_and_convert(gl, &self.sources, &scratch, &mut self.converted);
+                    Stage::Sweeping(Box::new(Sweep::new(gl, &scratch)))
+                }
+            }
+            Stage::Sweeping(mut sweep) => {
+                if !sweep.step(gl, &self.sources, &mut self.converted) {
+                    Stage::Sweeping(sweep)
+                } else {
+                    let stage = sweep.finish(self.converted.len());
                     if matches!(stage, Stage::Failed) && !self.converted.is_empty() {
                         self.stage = Stage::Done;
                         return Some(self.converted.clone());
@@ -278,32 +289,90 @@ pub fn engine_name(engine: u32) -> Option<&'static str> {
     NAMES.lock().ok()?.get(&engine).copied()
 }
 
-/// The sources' assembly matched to the engine's programs, and a converted scratch program
-/// started for each engine program that can draw both eyes.
-fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: &mut Vec<Converted>) -> Stage {
-    let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut names = Vec::with_capacity(sources.len());
-    for (index, &program) in scratch.iter().enumerate() {
-        names.push(uniform_names(&gl.uniforms(program)));
-        if gl.linked(program).is_ok()
-            && let Some(key) = gl.binary(program).and_then(|(_, b)| gl_api::assembly_key(&b))
-        {
-            by_key.entry(key).or_default().push(index);
-        }
-        // SAFETY: our own scratch program.
-        unsafe { (gl.delete_program)(program) };
+/// A program's active uniform and attribute counts: those of an engine program made from a render
+/// program are its compiled source's, so a program unlike every source's is passed over without
+/// asking the driver for its binary.
+fn signature(gl: &Gl, program: u32) -> (i32, i32) {
+    let (mut uniforms, mut attributes) = (0, 0);
+    // SAFETY: plain queries into locals.
+    unsafe {
+        (gl.get_program_iv)(program, gl_api::GL_ACTIVE_UNIFORMS, &mut uniforms);
+        (gl.get_program_iv)(program, gl_api::GL_ACTIVE_ATTRIBUTES, &mut attributes);
     }
-    let (mut engine_programs, mut matched, mut flat) = (0, 0, 0);
-    let mut jobs = Vec::new();
-    for engine in 1..=LAST_NAME {
+    (uniforms, attributes)
+}
+
+/// The engine's programs swept over frames ([`SWEEP_PER_FRAME`]): the sources' assembly matched
+/// to them, and a converted scratch program started for each one that can draw both eyes.
+struct Sweep {
+    by_key: HashMap<String, Vec<usize>>,
+    names: Vec<Vec<String>>,
+    signatures: HashSet<(i32, i32)>,
+    next: u32,
+    jobs: Vec<Job>,
+    engine_programs: usize,
+    matched: usize,
+    flat: usize,
+    passed_over: usize,
+    frames: usize,
+    spent: Duration,
+    since: Instant,
+}
+
+impl Sweep {
+    fn new(gl: &Gl, scratch: &[u32]) -> Self {
+        let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut names = Vec::with_capacity(scratch.len());
+        let mut signatures = HashSet::new();
+        for (index, &program) in scratch.iter().enumerate() {
+            names.push(uniform_names(&gl.uniforms(program)));
+            if gl.linked(program).is_ok()
+                && let Some(key) = gl.binary(program).and_then(|(_, b)| gl_api::assembly_key(&b))
+            {
+                by_key.entry(key).or_default().push(index);
+                signatures.insert(signature(gl, program));
+            }
+            // SAFETY: our own scratch program.
+            unsafe { (gl.delete_program)(program) };
+        }
+        Self {
+            by_key,
+            names,
+            signatures,
+            next: 1,
+            jobs: Vec::new(),
+            engine_programs: 0,
+            matched: 0,
+            flat: 0,
+            passed_over: 0,
+            frames: 0,
+            spent: Duration::ZERO,
+            since: Instant::now(),
+        }
+    }
+
+    /// One frame's share of the sweep; whether it is through.
+    fn step(&mut self, gl: &Gl, sources: &[Renderprog], already: &mut Vec<Converted>) -> bool {
+        let start = Instant::now();
+        self.frames += 1;
+        while self.next <= LAST_NAME && start.elapsed() < SWEEP_PER_FRAME {
+            let engine = self.next;
+            self.next += 1;
+            self.one(gl, engine, sources, already);
+        }
+        self.spent += start.elapsed();
+        self.next > LAST_NAME
+    }
+
+    fn one(&mut self, gl: &Gl, engine: u32, sources: &[Renderprog], already: &mut Vec<Converted>) {
         // SAFETY: a plain query.
         if unsafe { (gl.is_program)(engine) } == 0 {
-            continue;
+            return;
         }
-        engine_programs += 1;
+        self.engine_programs += 1;
         // Converted by an earlier run in this process: known by its stereo uniform, its source by
         // its other uniforms' names.
-        if let Some((converted, source)) = converted_before(gl, engine, sources, &names) {
+        if let Some((converted, source)) = converted_before(gl, engine, sources, &self.names) {
             // Converted before its fragment shader read the scene's maps layered: converted again.
             let layered = gl.uniforms(engine).iter().any(|u| u.name.starts_with(convert::LAYERED_PREFIX));
             let fragment = &sources[source].fragment;
@@ -311,39 +380,52 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
             if layered == wanted {
                 already.push(converted);
             } else if let Some(job) = job(gl, engine, &gl.uniforms(engine), source, &sources[source]) {
-                jobs.push(job);
+                self.jobs.push(job);
             }
-            continue;
+            return;
         }
-        let Some(key) = gl.binary(engine).and_then(|(_, b)| gl_api::assembly_key(&b)) else { continue };
-        let Some(candidates) = by_key.get(&key) else { continue };
+        if !self.signatures.contains(&signature(gl, engine)) {
+            self.passed_over += 1;
+            return;
+        }
+        let Some(key) = gl.binary(engine).and_then(|(_, b)| gl_api::assembly_key(&b)) else { return };
+        let Some(candidates) = self.by_key.get(&key) else { return };
         let uniforms = gl.uniforms(engine);
         let own = uniform_names(&uniforms);
-        let Some(&source) = candidates.iter().find(|&&c| names[c] == own).or_else(|| (candidates.len() == 1).then(|| &candidates[0])) else { continue };
-        matched += 1;
+        let Some(&source) = candidates.iter().find(|&&c| self.names[c] == own).or_else(|| (candidates.len() == 1).then(|| &candidates[0])) else { return };
+        self.matched += 1;
         let program = &sources[source];
         remember(engine, &program.name);
         if let Some(fragment) = convert::without_blur_or_grain(&program.name, &program.fragment) {
-            jobs.push(patch(gl, engine, &uniforms, source, program, &fragment));
-            continue;
+            self.jobs.push(patch(gl, engine, &uniforms, source, program, &fragment));
+            return;
         }
         if convert::position_rows(&program.vertex).is_none() {
-            flat += 1;
-            continue;
+            self.flat += 1;
+            return;
         }
         if let Some(job) = job(gl, engine, &uniforms, source, program) {
-            jobs.push(job);
+            self.jobs.push(job);
         }
     }
-    log!(
-        "single pass: {engine_programs} engine programs, {} converted before, {matched} matched to their render program ({flat} full-screen or 2D, left as they are); converting {}",
-        already.len(),
-        jobs.len()
-    );
-    if jobs.is_empty() {
-        return Stage::Failed;
+
+    fn finish(self, already: usize) -> Stage {
+        log!(
+            "single pass: {} engine programs, {already} converted before, {} passed over (unlike every render program), {} matched to their render program ({} full-screen or 2D, left as they are); converting {}; swept over {} frames in {:.1} s ({:.0} ms of the render thread's)",
+            self.engine_programs,
+            self.passed_over,
+            self.matched,
+            self.flat,
+            self.jobs.len(),
+            self.frames,
+            self.since.elapsed().as_secs_f32(),
+            self.spent.as_secs_f32() * 1000.0
+        );
+        if self.jobs.is_empty() {
+            return Stage::Failed;
+        }
+        Stage::Converting { jobs: self.jobs, since: Instant::now() }
     }
-    Stage::Converting { jobs, since: Instant::now() }
 }
 
 /// The converted scratch program for `engine` from its render program `program` (`sources[source]`),

@@ -181,6 +181,8 @@ struct Counts {
     eye_maps_missing: u64,
     /// Of `eye_maps`, those whose map was no eye texture, given the self-shadow as drawn instead.
     eye_maps_drawn: u64,
+    /// Self-shadows kept ([`keep_self_shadow`]).
+    self_shadow_kept: u64,
     /// The engine's copies between textures (`glCopyImageSubData`) of an eye texture, made from or
     /// into the pass's layer.
     copies_layered: u64,
@@ -452,6 +454,8 @@ struct State {
     /// The engine framebuffer the left eye's pass last drew the self-shadow into
     /// (`selfshadowsample*`): its first draw buffer's eye texture holds each eye's at its layer.
     self_shadow_drawn: Option<u32>,
+    /// Self-shadow drawn in this pass and not yet kept ([`keep_self_shadow`]).
+    self_shadow_pending: bool,
     read_framebuffer: u32,
     units: HashMap<u32, (u32, u32)>,
     /// The units given the right eye's scene depth in its pass, with the engine's texture there
@@ -538,6 +542,7 @@ fn state() -> State {
         cut: false,
         draw_framebuffer: 0,
         self_shadow_drawn: None,
+        self_shadow_pending: false,
         read_framebuffer: 0,
         units: HashMap::new(),
         depth_units: HashMap::new(),
@@ -872,7 +877,8 @@ pub fn frame(on: bool) {
         let (shared, own) = state.screen.counts();
         log!("single pass: programs reading the scene's maps: {shared} drawn for both eyes, {own} by each eye, the rest being learnt");
         log!("single pass: carried draws reading maps of each eye's own (the self-shadow), the right eye's copy reading the right eye's: {} ({} whose map was no eye texture)", c.eye_maps, c.eye_maps_missing);
-        log!("single pass: of those, {} read the self-shadow where the left eye's pass drew it (fb {:?}), their own map being no eye texture", c.eye_maps_drawn, state.self_shadow_drawn);
+        log!("single pass: of those, {} read the self-shadow as the left eye's pass drew it in fb {:?} (kept for both eyes), their own map being no eye texture", c.eye_maps_drawn, state.self_shadow_drawn);
+        log!("single pass: the self-shadow kept for each eye {} times", c.self_shadow_kept);
         log!("single pass: the right eye's stretch draws each eye draws itself, per frame by program: {}", {
             let mut by: Vec<_> = state.own_by.iter().map(|(p, n)| (*n, state.programs.get(p).map_or("?", |p| p.converted.name), *p)).collect();
             by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
@@ -1407,9 +1413,46 @@ fn screen_draw(state: &mut State, current: u32, screen: &Screen, rows: &Rows, ch
     map_arrays(state, current, screen, checking)
 }
 
+/// The self-shadow the left eye's pass drew (both layers) copied before anything else goes into its
+/// eye texture: the engine draws it into the scene's colour, copies that for the scene's draws to
+/// read (the left eye's alone), and draws the scene over it.
+fn keep_self_shadow(state: &mut State, why: &str) {
+    if !std::mem::take(&mut state.self_shadow_pending) {
+        return;
+    }
+    let (Some(gl), Some(layers), Some(fb)) = (state.gl.as_ref(), state.layers.as_mut(), state.self_shadow_drawn) else { return };
+    let Some(texture) = layers.first_colour(fb) else {
+        static NONE_LOGGED: AtomicBool = AtomicBool::new(false);
+        if !NONE_LOGGED.swap(true, Relaxed) {
+            log!("single pass: the self-shadow's framebuffer {fb} writes no eye texture: not kept");
+        }
+        return;
+    };
+    let kept = layers.keep(gl, texture);
+    state.counts.self_shadow_kept += 1;
+    static KEPT_LOGGED: AtomicBool = AtomicBool::new(false);
+    if !KEPT_LOGGED.swap(true, Relaxed) {
+        log!("single pass: the self-shadow (eye texture {texture} of fb {fb}) kept, both eyes, before {why} into fb {}: array {kept:?}", state.draw_framebuffer);
+    }
+}
+
+/// Before a draw or clear: the self-shadow kept if it goes into the eye texture holding it.
+fn drawing_over_self_shadow(state: &mut State, why: &str) {
+    let over = match (state.layers.as_ref(), state.self_shadow_drawn) {
+        (Some(layers), Some(fb)) => layers.first_colour(fb).is_some_and(|t| layers.attaches(state.draw_framebuffer, t)),
+        _ => false,
+    };
+    if over {
+        keep_self_shadow(state, why);
+    }
+}
+
 /// The arrays standing in for the textures a layered program's maps read (its units, ours), none
 /// when one is no eye texture.
 fn map_arrays(state: &mut State, current: u32, screen: &Screen, checking: bool) -> Option<Vec<(u32, u32)>> {
+    if screen.right_rows.is_none() {
+        keep_self_shadow(state, "a draw reading it");
+    }
     let gl = state.gl.as_ref()?;
     let program = state.programs.get_mut(&current)?;
     if program.map_units.len() != screen.maps.len() || checking {
@@ -1426,13 +1469,9 @@ fn map_arrays(state: &mut State, current: u32, screen: &Screen, checking: bool) 
     }
     let layers = state.layers.as_ref()?;
     // A map of each eye's own (the self-shadow) read from a texture not ours: the engine's copy of
-    // the left eye's. Each eye's is where the left eye's pass drew it (both layers, carried), so
-    // that is read instead, unless the draw writes it.
-    let drawn = state
-        .self_shadow_drawn
-        .filter(|_| screen.right_rows.is_none())
-        .and_then(|fb| layers.first_colour(fb))
-        .filter(|&texture| !layers.attaches(state.draw_framebuffer, texture));
+    // the left eye's. Each eye's was drawn where the left eye's pass drew it (both layers,
+    // carried) and kept before the scene went over it ([`keep_self_shadow`]): that is read instead.
+    let drawn = if screen.right_rows.is_none() { layers.kept() } else { None };
     let mut fell_back = false;
     let arrays: Option<Vec<(u32, u32)>> = screen
         .maps
@@ -1442,7 +1481,7 @@ fn map_arrays(state: &mut State, current: u32, screen: &Screen, checking: bool) 
             let own = state.units.get(unit).and_then(|&(_, texture)| layers.array(texture));
             let array = own.or_else(|| {
                 fell_back = true;
-                layers.array(drawn?)
+                drawn
             })?;
             Some((ours, array))
         })
@@ -1673,6 +1712,9 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
     let framebuffer = state.draw_framebuffer;
     if state.pass == 1 && state.programs.get(&current).is_some_and(|p| p.converted.name.starts_with("selfshadowsample")) {
         state.self_shadow_drawn = Some(framebuffer);
+        state.self_shadow_pending = true;
+    } else if state.self_shadow_pending {
+        drawing_over_self_shadow(state, "a draw");
     }
     if state.layers.is_none() {
         if perspective && state.pass >= 1 && state.eye_sized(framebuffer) {
@@ -2526,6 +2568,9 @@ unsafe extern "system" fn clear(mask: u32) {
     if let Some(state) = STATE.locked().as_mut() {
         let framebuffer = state.draw_framebuffer;
         traced(state, || format!("clear {mask:#x} fb {framebuffer}"));
+        if state.live && state.self_shadow_pending {
+            drawing_over_self_shadow(state, "a clear");
+        }
     }
     if clear_goes_ahead(mask) {
         // SAFETY: forwards the game's own call.

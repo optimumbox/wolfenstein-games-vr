@@ -64,6 +64,8 @@ pub struct Layers {
     depth_copy: Option<(u32, u32)>,
     /// Both eyes' scene depth side by side (a one-layer array twice the eye's width, and its 2D view).
     depth_pair: Option<(u32, u32)>,
+    /// A copy of an eye texture's both layers ([`Self::keep`]): the eye texture, and the array.
+    kept: Option<(u32, u32)>,
 }
 
 /// An attachment of an engine framebuffer.
@@ -135,7 +137,7 @@ impl Layers {
     /// Stand-ins for the eye textures (`size`) attached to `seen` (the framebuffers the scene was
     /// drawn into), and for every framebuffer drawing into one of them.
     pub fn build(gl: &Gl, seen: &[u32], size: (i32, i32)) -> Result<Self, String> {
-        let mut layers = Self { textures: HashMap::new(), framebuffers: HashMap::new(), drawn: HashMap::new(), depth: None, depth_copy: None, depth_pair: None };
+        let mut layers = Self { textures: HashMap::new(), framebuffers: HashMap::new(), drawn: HashMap::new(), depth: None, depth_copy: None, depth_pair: None, kept: None };
         let made = layers.make(gl, seen, size);
         if made.is_err() {
             layers.release(gl);
@@ -343,6 +345,42 @@ impl Layers {
         Some((view, (eye.size.0 * 2, eye.size.1)))
     }
 
+    /// Both layers of eye texture `texture` copied into an array of ours sampled the same way (the
+    /// self-shadow, kept before the scene is drawn over it): that array.
+    pub fn keep(&mut self, gl: &Gl, texture: u32) -> Option<u32> {
+        let eye = self.textures.get(&texture)?;
+        let array = match self.kept {
+            Some((kept, array)) if kept == texture => array,
+            _ => {
+                if let Some((_, old)) = self.kept.take() {
+                    // SAFETY: our own texture.
+                    unsafe { (gl.delete_textures)(1, &old) };
+                }
+                let mut array = 0;
+                // SAFETY: a new texture of ours, with storage and sampling like the eye texture's array.
+                unsafe {
+                    (gl.create_textures)(GL_TEXTURE_2D_ARRAY, 1, &mut array);
+                    (gl.texture_storage_3d)(array, 1, eye.format, eye.size.0, eye.size.1, 2);
+                    for pname in SAMPLING {
+                        (gl.texture_parameter_i)(array, pname, texture_parameter(gl, eye.array, pname));
+                    }
+                }
+                self.kept = Some((texture, array));
+                array
+            }
+        };
+        // SAFETY: a copy between two arrays of the same format and size, both layers.
+        unsafe {
+            (gl.copy_image_sub_data)(eye.array, GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, array, GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, eye.size.0, eye.size.1, 2);
+        }
+        Some(array)
+    }
+
+    /// The array [`Self::keep`] last copied into, once made.
+    pub fn kept(&self) -> Option<u32> {
+        self.kept.map(|(_, array)| array)
+    }
+
     /// The copy of the scene depth's layer ([`Self::depth_copy`]), once made.
     pub fn depth_copy_view(&self) -> Option<u32> {
         self.depth_copy.map(|(_, view)| view)
@@ -351,7 +389,7 @@ impl Layers {
     /// Every object of ours deleted.
     pub fn release(&mut self, gl: &Gl) {
         let framebuffers: Vec<u32> = self.framebuffers.values().flat_map(|s| s.layered.into_iter().chain(s.layer)).collect();
-        let textures: Vec<u32> = self.textures.values().flat_map(|t| std::iter::once(t.array).chain(t.views)).chain(self.depth_copy.take().into_iter().flat_map(|(a, v)| [v, a])).chain(self.depth_pair.take().into_iter().flat_map(|(a, v)| [v, a])).collect();
+        let textures: Vec<u32> = self.textures.values().flat_map(|t| std::iter::once(t.array).chain(t.views)).chain(self.depth_copy.take().into_iter().flat_map(|(a, v)| [v, a])).chain(self.depth_pair.take().into_iter().flat_map(|(a, v)| [v, a])).chain(self.kept.take().map(|(_, a)| a)).collect();
         // SAFETY: our own objects, unbound by the caller.
         unsafe {
             (gl.delete_framebuffers)(framebuffers.len() as i32, framebuffers.as_ptr());
