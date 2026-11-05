@@ -148,9 +148,14 @@ fn quick_melee(setup: &Setup, hands: usize) -> bool {
 /// What the right hand swings with: its melee weapon, outside the quick melee and while the view is
 /// the player's own; else a gun (no swings). In a cutscene or a grab another camera has the view,
 /// and the game's own attack (a scene's "fight back" prompt) must reach it; while hotwiring the
-/// controllers move the wires.
+/// controllers move the wires; while the left hand holds an item of its own (cuffed, the
+/// captive's escape), the game's own attack is the takedown.
 fn swung(setup: &Setup, hands: usize) -> Kind {
-    let kind = if quick_melee(setup, hands) || crate::providers::camera_taken::controlled() || crate::extras::hotwire::active() { Kind::Gun } else { held_item::right_kind(setup.layout, hands) };
+    let kind = if quick_melee(setup, hands) || crate::providers::camera_taken::controlled() || crate::extras::hotwire::active() || held_item::dual() {
+        Kind::Gun
+    } else {
+        held_item::right_kind(setup.layout, hands)
+    };
     note_change(kind);
     kind
 }
