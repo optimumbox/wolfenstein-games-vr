@@ -122,6 +122,20 @@ fn gpu_decoding(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
     eng_idt::set_int(ledger, exe, cvar, 1, "texture pages are decoded on the CPU");
     let _ = GPU_DECODING.set((*exe, cvar));
     log!("texture streaming: pages decoded on the GPU (vt_useCudaTranscode 1), held on while VR runs");
+    compressed_pages(ledger, exe);
+}
+
+/// The texture cache's pages kept block-compressed (`vt_uncompressedPhysicalImages` 0) rather than
+/// as plain RGBA8: the game's GPU decoder writes them compressed, the cache's images take a quarter
+/// of the memory, and every texture read of the scene (both eyes at the headset's size) reads a
+/// quarter of the bytes. The game keeps them uncompressed for the CPU decoder's sake; the cost of
+/// that grows with the VT cache setting, which is what made any cache above low too heavy for VR.
+/// Set before the level's texture cache is made, and not changed under a cache already made: the
+/// game reads it when it rebuilds the cache (a level load, or its video settings applied).
+fn compressed_pages(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
+    let Some(cvar) = Cvar::find(exe, "vt_uncompressedPhysicalImages", eng_idt::Layout::ID_TECH_5) else { return };
+    eng_idt::set_int(ledger, exe, cvar, 0, "texture cache pages are stored uncompressed (RGBA8)");
+    log!("texture streaming: the texture cache's pages stored compressed (vt_uncompressedPhysicalImages 0)");
 }
 
 /// Every 45th frame on the render thread: a streaming setting changed (the options menu) is logged,
