@@ -70,11 +70,11 @@ fn halfway_runs_between_the_head_and_the_body() {
 }
 
 #[test]
-fn the_head_steers_by_default() {
-    assert_eq!(share_out(&Options::parse("")), 0.0, "unset: where the head looks");
+fn the_body_steers_by_default() {
+    assert_eq!(share_out(&Options::parse("")), 1.0, "unset: where the body faces");
     assert_eq!(share_out(&Options::parse("move_heading=head")), 0.0);
     assert_eq!(share_out(&Options::parse("move_heading=body")), 1.0);
-    assert_eq!(share_out(&Options::parse("move_heading=sideways")), 0.0, "unknown: the default");
+    assert_eq!(share_out(&Options::parse("move_heading=sideways")), 1.0, "unknown: the default (the body)");
 }
 
 #[test]

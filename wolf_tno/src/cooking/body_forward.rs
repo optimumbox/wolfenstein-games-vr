@@ -34,13 +34,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::*};
 use std::time::Instant;
 
-/// Where the left stick moves the player (`move_heading`): where the head looks (the default,
-/// physical turns steer), halfway, or where the body faces (only the right stick steers).
+/// Where the left stick moves the player (`move_heading`): where the body faces (the default, only
+/// the right stick steers), halfway, or where the head looks (physical turns steer; experimental,
+/// offered in developer mode only).
 pub const MOVE_HEADING: Opt = opt(
     "move_heading",
     "Movement direction",
-    "Head: forward is where you look, so physical turns steer. Body: only the right stick turns.",
-    choice(&[("head", "Head"), ("halfway", "Halfway"), ("body", "Body")], "head"),
+    "Body: only the right stick turns. Halfway: between where you look and where the body faces.",
+    choice(&[("head", "Head, experimental"), ("halfway", "Halfway"), ("body", "Body")], "body"),
 )
 .on(Shown::Controls)
 .turns_off("head", BODY_TURN.id, "Movement follows your head already; room-scale movement is its own setting.");
@@ -70,7 +71,7 @@ fn install(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
 /// How much of the head's turn `options` take out of the run's heading (0: where the head looks,
 /// 1: where the body faces).
 pub fn share_out(options: &Options) -> f32 {
-    options.choice("move_heading", &SHARES, 0.0)
+    options.choice("move_heading", &SHARES, 1.0)
 }
 
 /// The run's share taken out ([`MOVE_HEADING_COMPONENT`]).

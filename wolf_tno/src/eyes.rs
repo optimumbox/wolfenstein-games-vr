@@ -16,10 +16,10 @@ pub enum DominantEye {
     Right,
 }
 
-/// How the eyes are made: both in one frame by the engine's side-by-side layout (the default), the
-/// same with both eyes drawn by one pass ([`SINGLE_PASS_STEREO`]), or one per frame with the other
+/// How the eyes are made: both in one frame by the engine's side-by-side layout, the same with both
+/// eyes drawn by one pass ([`SINGLE_PASS_STEREO`], the default), or one per frame with the other
 /// warped from it by its depth (AFW).
-pub const STEREO: Opt = stereo_method(&[StereoMethod::SameFrame.offer(), SINGLE_PASS_STEREO, StereoMethod::Afw.experimental(), STEREO_OFF], StereoMethod::SameFrame);
+pub const STEREO: Opt = stereo_method(&[StereoMethod::SameFrame.offer(), SINGLE_PASS_STEREO, StereoMethod::Afw.experimental(), STEREO_OFF], StereoMethod::SameFrame).default_choice(SINGLE_PASS_STEREO.0);
 
 /// Single pass ([`crate::single_pass`]): same-frame stereo with the engine's scene programs
 /// converted to draw both eyes at once. Everything else takes it as Standard (Same-frame); any other
