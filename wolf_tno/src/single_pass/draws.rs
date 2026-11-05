@@ -179,6 +179,8 @@ struct Counts {
     /// copy reading whatever array its unit last had).
     eye_maps: u64,
     eye_maps_missing: u64,
+    /// Of `eye_maps`, those whose map was no eye texture, given the self-shadow as drawn instead.
+    eye_maps_drawn: u64,
     /// The engine's copies between textures (`glCopyImageSubData`) of an eye texture, made from or
     /// into the pass's layer.
     copies_layered: u64,
@@ -447,6 +449,9 @@ struct State {
     cut: bool,
     /// The framebuffers and eye textures the engine has bound (its names).
     draw_framebuffer: u32,
+    /// The engine framebuffer the left eye's pass last drew the self-shadow into
+    /// (`selfshadowsample*`): its first draw buffer's eye texture holds each eye's at its layer.
+    self_shadow_drawn: Option<u32>,
     read_framebuffer: u32,
     units: HashMap<u32, (u32, u32)>,
     /// The units given the right eye's scene depth in its pass, with the engine's texture there
@@ -532,6 +537,7 @@ fn state() -> State {
         pass: 0,
         cut: false,
         draw_framebuffer: 0,
+        self_shadow_drawn: None,
         read_framebuffer: 0,
         units: HashMap::new(),
         depth_units: HashMap::new(),
@@ -866,6 +872,7 @@ pub fn frame(on: bool) {
         let (shared, own) = state.screen.counts();
         log!("single pass: programs reading the scene's maps: {shared} drawn for both eyes, {own} by each eye, the rest being learnt");
         log!("single pass: carried draws reading maps of each eye's own (the self-shadow), the right eye's copy reading the right eye's: {} ({} whose map was no eye texture)", c.eye_maps, c.eye_maps_missing);
+        log!("single pass: of those, {} read the self-shadow where the left eye's pass drew it (fb {:?}), their own map being no eye texture", c.eye_maps_drawn, state.self_shadow_drawn);
         log!("single pass: the right eye's stretch draws each eye draws itself, per frame by program: {}", {
             let mut by: Vec<_> = state.own_by.iter().map(|(p, n)| (*n, state.programs.get(p).map_or("?", |p| p.converted.name), *p)).collect();
             by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
@@ -1418,7 +1425,32 @@ fn map_arrays(state: &mut State, current: u32, screen: &Screen, checking: bool) 
             .collect();
     }
     let layers = state.layers.as_ref()?;
-    screen.maps.iter().zip(&program.map_units).map(|(&(_, ours), unit)| Some((ours, layers.array(state.units.get(unit)?.1)?))).collect()
+    // A map of each eye's own (the self-shadow) read from a texture not ours: the engine's copy of
+    // the left eye's. Each eye's is where the left eye's pass drew it (both layers, carried), so
+    // that is read instead, unless the draw writes it.
+    let drawn = state
+        .self_shadow_drawn
+        .filter(|_| screen.right_rows.is_none())
+        .and_then(|fb| layers.first_colour(fb))
+        .filter(|&texture| !layers.attaches(state.draw_framebuffer, texture));
+    let mut fell_back = false;
+    let arrays: Option<Vec<(u32, u32)>> = screen
+        .maps
+        .iter()
+        .zip(&program.map_units)
+        .map(|(&(_, ours), unit)| {
+            let own = state.units.get(unit).and_then(|&(_, texture)| layers.array(texture));
+            let array = own.or_else(|| {
+                fell_back = true;
+                layers.array(drawn?)
+            })?;
+            Some((ours, array))
+        })
+        .collect();
+    if arrays.is_some() && fell_back {
+        state.counts.eye_maps_drawn += 1;
+    }
+    arrays
 }
 
 /// The left eye's draw of a program reading the scene's maps made for both eyes: its maps'
@@ -1639,6 +1671,9 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
     state.counts.perspective += u64::from(perspective);
     traced_draw(state, perspective);
     let framebuffer = state.draw_framebuffer;
+    if state.pass == 1 && state.programs.get(&current).is_some_and(|p| p.converted.name.starts_with("selfshadowsample")) {
+        state.self_shadow_drawn = Some(framebuffer);
+    }
     if state.layers.is_none() {
         if perspective && state.pass >= 1 && state.eye_sized(framebuffer) {
             state.seen.insert(framebuffer);

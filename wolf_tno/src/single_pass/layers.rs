@@ -55,6 +55,9 @@ pub struct Stand {
 pub struct Layers {
     textures: HashMap<u32, Layered>,
     framebuffers: HashMap<u32, Stand>,
+    /// For each engine framebuffer stood in for: the eye texture its first draw buffer writes (if
+    /// one), and every eye texture attached.
+    drawn: HashMap<u32, (Option<u32>, Vec<u32>)>,
     /// The engine's scene depth (the eye texture at a depth attachment).
     depth: Option<u32>,
     /// A copy of a layer of the scene depth (a one-layer array, and its 2D view).
@@ -132,7 +135,7 @@ impl Layers {
     /// Stand-ins for the eye textures (`size`) attached to `seen` (the framebuffers the scene was
     /// drawn into), and for every framebuffer drawing into one of them.
     pub fn build(gl: &Gl, seen: &[u32], size: (i32, i32)) -> Result<Self, String> {
-        let mut layers = Self { textures: HashMap::new(), framebuffers: HashMap::new(), depth: None, depth_copy: None, depth_pair: None };
+        let mut layers = Self { textures: HashMap::new(), framebuffers: HashMap::new(), drawn: HashMap::new(), depth: None, depth_copy: None, depth_pair: None };
         let made = layers.make(gl, seen, size);
         if made.is_err() {
             layers.release(gl);
@@ -197,6 +200,9 @@ impl Layers {
             let layered = if all_eye { Some(self.stand_in(gl, &attached, &buffers, None)?) } else { None };
             let layer = [self.stand_in(gl, &attached, &buffers, Some(0))?, self.stand_in(gl, &attached, &buffers, Some(1))?];
             self.framebuffers.insert(framebuffer, Stand { layered, layer });
+            let first = buffers.0.first().and_then(|&point| attached.iter().find(|a| a.point == point && a.kind == gl_api::GL_TEXTURE && a.level == 0)).map(|a| a.name).filter(|t| self.textures.contains_key(t));
+            let eyes = attached.iter().filter(|a| a.kind == gl_api::GL_TEXTURE && self.textures.contains_key(&a.name)).map(|a| a.name).collect();
+            self.drawn.insert(framebuffer, (first, eyes));
         }
         Ok(())
     }
@@ -235,6 +241,16 @@ impl Layers {
     /// The array standing in for an engine eye texture.
     pub fn array(&self, texture: u32) -> Option<u32> {
         self.textures.get(&texture).map(|t| t.array)
+    }
+
+    /// The eye texture engine framebuffer `framebuffer`'s first draw buffer writes, if one.
+    pub fn first_colour(&self, framebuffer: u32) -> Option<u32> {
+        self.drawn.get(&framebuffer)?.0
+    }
+
+    /// Whether engine framebuffer `framebuffer` has eye texture `texture` attached.
+    pub fn attaches(&self, framebuffer: u32, texture: u32) -> bool {
+        self.drawn.get(&framebuffer).is_some_and(|(_, eyes)| eyes.contains(&texture))
     }
 
     /// The view of an engine eye texture's `layer`.
@@ -342,6 +358,7 @@ impl Layers {
             (gl.delete_textures)(textures.len() as i32, textures.as_ptr());
         }
         self.framebuffers.clear();
+        self.drawn.clear();
         self.textures.clear();
     }
 }
