@@ -70,6 +70,144 @@ pub fn stereo_vertex(vertex: &str) -> Option<String> {
     Some(after_version(&out, VIEWPORT_EXTENSIONS))
 }
 
+/// A vertex shader's ray from the eye to the vertex (`vofi_TexCoord4.x = dot4( localPosition,
+/// _va_[8 ] );` .y, .z, then `vofi_TexCoord4.xyz -= _va_[11 ].xyz;`): the vertex placed by rows
+/// `rows` less the eye's origin there. The fragment shader lights its shine and reflections by it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewRay {
+    pub varying: String,
+    pub rows: [usize; 3],
+}
+
+/// The row of `_va_` in `dot4( <anything>, _va_[n ] );` (or `dot`).
+fn dot_row(text: &str) -> Option<usize> {
+    let text = text.trim();
+    let call = text.strip_prefix("dot4").or_else(|| text.strip_prefix("dot"))?.trim_start();
+    let inner = call.strip_prefix('(')?.strip_suffix(';')?.trim_end().strip_suffix(')')?;
+    let (_, row) = inner.rsplit_once(',')?;
+    row.trim().strip_prefix("_va_")?.trim_start().strip_prefix('[')?.trim().strip_suffix(']')?.trim().parse().ok()
+}
+
+/// The vertex shader's [`ViewRay`]s: varyings it declares `out`, each written as three rows' dots
+/// less one row's `.xyz`.
+pub fn view_rays(vertex: &str) -> Vec<ViewRay> {
+    let outs: HashSet<&str> = vertex
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("out vec4 ").and_then(|r| r.strip_suffix(';')).map(str::trim))
+        .collect();
+    let mut parts: std::collections::HashMap<String, [Option<usize>; 3]> = std::collections::HashMap::new();
+    let mut rays = Vec::new();
+    for line in vertex.lines() {
+        let line = line.trim();
+        let Some((target, rest)) = line.split_once('=') else { continue };
+        let target = target.trim();
+        if let Some(name) = target.strip_suffix(".xyz -").map(str::trim) {
+            let origin = rest.trim().strip_prefix("_va_").map(str::trim_start).and_then(|r| r.strip_prefix('['));
+            if outs.contains(name)
+                && origin.is_some_and(|o| o.trim_end().ends_with("].xyz;"))
+                && let Some([Some(x), Some(y), Some(z)]) = parts.get(name).copied()
+                && !rays.iter().any(|r: &ViewRay| r.varying == name)
+            {
+                rays.push(ViewRay { varying: name.to_owned(), rows: [x, y, z] });
+            }
+            continue;
+        }
+        for (i, component) in ["x", "y", "z"].iter().enumerate() {
+            if let Some(name) = target.strip_suffix(&format!(".{component}"))
+                && outs.contains(name)
+            {
+                parts.entry(name.to_owned()).or_default()[i] = dot_row(rest);
+            }
+        }
+    }
+    rays
+}
+
+/// The flat varying giving the fragment shader the ray's correction for the other eye.
+fn eye_shift(varying: &str) -> String {
+    format!("monaka_eye_{varying}")
+}
+
+/// The vertex and fragment shaders of a program with view rays ([`view_rays`]) lit for the eye each
+/// copy is: the other eye's copy shares every varying of the drawn eye's but its position, so its
+/// shine and reflections would be the drawn eye's, in another place than its own eye sees them.
+/// The converted vertex shader (`stereo`, from [`stereo_vertex`]) also works out how far the other
+/// eye's origin is from the drawn eye's along each ray's rows (each eye's origin solved from its
+/// position rows: the point its projection takes to x, y and w of 0; the other eye's rows the eye
+/// matrix times the drawn eye's), sent flat; the fragment shader's ray, where it is normalized as a
+/// direction (`normalize( vofi_TexCoord4.xyz )`, `normalize( -vofi_TexCoord4.xyz.xyz )`), is moved
+/// by it in layer 1. Its other uses (the fragment's place, by adding the eye's origin back) are
+/// left as they are. None when nothing in the fragment shader is moved.
+pub fn eye_rays(vertex: &str, stereo: &str, fragment: &str) -> Option<(String, String)> {
+    let rows = position_rows(vertex)?;
+    let rays = view_rays(vertex);
+    let mut fragment_out = fragment.to_owned();
+    let mut used = Vec::new();
+    for ray in &rays {
+        let v = &ray.varying;
+        if !fragment.lines().any(|l| l.trim() == format!("in vec4 {v};")) {
+            continue;
+        }
+        let shift = format!("( gl_Layer == 1 ? {} : vec3( 0.0 ) )", eye_shift(v));
+        let mut any = false;
+        for (from, to) in [
+            (format!("normalize( {v}.xyz.xyz )"), format!("normalize( ( {v}.xyz + {shift} ) )")),
+            (format!("normalize( -{v}.xyz.xyz )"), format!("normalize( -( {v}.xyz + {shift} ) )")),
+            (format!("normalize( {v}.xyz )"), format!("normalize( ( {v}.xyz + {shift} ) )")),
+            (format!("normalize( -{v}.xyz )"), format!("normalize( -( {v}.xyz + {shift} ) )")),
+        ] {
+            if fragment_out.contains(&from) {
+                fragment_out = fragment_out.replace(&from, &to);
+                any = true;
+            }
+        }
+        if any {
+            fragment_out = fragment_out.replacen(&format!("in vec4 {v};"), &format!("in vec4 {v};\nflat in vec3 {};", eye_shift(v)), 1);
+            used.push(ray);
+        }
+    }
+    if used.is_empty() {
+        return None;
+    }
+    let declared = format!("uniform vec4 {STEREO_UNIFORM}[{STEREO_ROWS}];\n");
+    let at = stereo.rfind(&declared)? + declared.len();
+    let u = STEREO_UNIFORM;
+    let [p0, p1, p2, p3] = rows;
+    let mut code = String::new();
+    for ray in &used {
+        code.push_str(&format!("flat out vec3 {};\n", eye_shift(&ray.varying)));
+    }
+    code.push_str(
+        "vec3 monaka_origin( vec4 x, vec4 y, vec4 w ) {\n\
+         \treturn inverse( transpose( mat3( x.xyz, y.xyz, w.xyz ) ) ) * -vec3( x.w, y.w, w.w );\n\
+         }\n\
+         void monaka_rays() {\n",
+    );
+    code.push_str(&format!("\tvec3 monaka_apart = vec3( 0.0 );\n\tif ( {u}[4].x != 0.0 ) {{\n"));
+    for (name, row) in [("r0", 0), ("r1", 1), ("r3", 3)] {
+        code.push_str(&format!(
+            "\t\tvec4 monaka_{name} = {u}[{row}].x * _va_[{p0}] + {u}[{row}].y * _va_[{p1}] + {u}[{row}].z * _va_[{p2}] + {u}[{row}].w * _va_[{p3}];\n"
+        ));
+    }
+    code.push_str(&format!(
+        "\t\tmonaka_apart = monaka_origin( _va_[{p0}], _va_[{p1}], _va_[{p3}] ) - monaka_origin( monaka_r0, monaka_r1, monaka_r3 );\n\t}}\n"
+    ));
+    for ray in &used {
+        let [a, b, c] = ray.rows;
+        code.push_str(&format!(
+            "\t{} = vec3( dot( _va_[{a}].xyz, monaka_apart ), dot( _va_[{b}].xyz, monaka_apart ), dot( _va_[{c}].xyz, monaka_apart ) );\n",
+            eye_shift(&ray.varying)
+        ));
+    }
+    code.push_str("}\n");
+    let mut vertex_out = stereo.to_owned();
+    vertex_out.insert_str(at, &code);
+    let call = "\tmonaka_main();\n";
+    let main_at = vertex_out.rfind(call)? + call.len();
+    vertex_out.insert_str(main_at, "\tmonaka_rays();\n");
+    Some((vertex_out, after_version(&fragment_out, LAYER_EXTENSION)))
+}
+
 /// Where `void main()` is written (start and end of the signature).
 fn find_main(source: &str) -> Option<(usize, usize)> {
     let mut from = 0;

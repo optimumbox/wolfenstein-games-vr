@@ -301,10 +301,17 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
 fn job(gl: &Gl, engine: u32, uniforms: &[ActiveUniform], source: usize, program: &Renderprog) -> Option<Job> {
     let rows = convert::position_rows(&program.vertex)?;
     let vertex = convert::stereo_vertex(&program.vertex)?;
+    // Shine and reflections lit for the eye each copy is ([`convert::eye_rays`]).
+    let lit = convert::eye_rays(&program.vertex, &vertex, &program.fragment);
+    let (vertex, lit_fragment) = match lit {
+        Some((vertex, fragment)) => (vertex, Some(fragment)),
+        None => (vertex, None),
+    };
+    let fragment_source = lit_fragment.as_deref().unwrap_or(&program.fragment);
     let located = |u: &convert::Uniform| uniforms.iter().find(|a| a.name == u.name).and_then(|a| a.locations.first().copied()).filter(|&l| l >= 0);
     let vertex = convert::with_locations(&vertex, &located);
-    let plain = convert::with_locations(&program.fragment, &located);
-    let layered = (LAYERED_SCREEN && convert::reads_screen(&program.fragment)).then(|| convert::layered_fragment(&program.fragment)).flatten();
+    let plain = convert::with_locations(fragment_source, &located);
+    let layered = (LAYERED_SCREEN && convert::reads_screen(&program.fragment)).then(|| convert::layered_fragment(fragment_source)).flatten();
     // SAFETY: plain queries with NUL-terminated names.
     let outputs = outputs(program, |name| u32::try_from(unsafe { (gl.get_frag_data_location)(engine, gl_api::c_name(name).as_ptr()) }).ok());
     let attributes = gl.attributes(engine);

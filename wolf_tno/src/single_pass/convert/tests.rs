@@ -146,3 +146,29 @@ fn the_games_screen_programs_convert() {
     }
     println!("{layered} of {reading} layered");
 }
+
+const RAY_VERTEX: &str = "#version 150\nuniform vec4 _va_ [12];\nout vec4 vofi_TexCoord4;\nvoid main() {\n\tvec4 localPosition = vec4( 1.0 );\n\tgl_Position.x = dot4( localPosition, _va_[4 ] );\n\tgl_Position.y = dot4( localPosition, _va_[5 ] );\n\tgl_Position.z = dot4( localPosition, _va_[6 ] );\n\tgl_Position.w = dot4( localPosition, _va_[7 ] );\n\t\tvofi_TexCoord4.x = dot4( localPosition, _va_[8 ] );\n\t\tvofi_TexCoord4.y = dot4( localPosition, _va_[9 ] );\n\t\tvofi_TexCoord4.z = dot4( localPosition, _va_[10 ] );\n\t\tvofi_TexCoord4.xyz -= _va_[11 ].xyz;\n\t\tvofi_TexCoord4.w = 0.0;\n}\n";
+const RAY_FRAGMENT: &str = "#version 150\nin vec4 vofi_TexCoord4;\nuniform vec4 _fa_ [16];\nvoid main() {\n\tvec3 a = normalize( vofi_TexCoord4.xyz );\n\tvec3 b = normalize( -vofi_TexCoord4.xyz.xyz );\n\tvec3 c = normalize( vofi_TexCoord4.xyz + _fa_[10 ].xyz - _fa_[11 ].xyz );\n}\n";
+
+#[test]
+fn a_ray_from_the_eye_is_found_by_its_rows_and_origin() {
+    assert_eq!(view_rays(RAY_VERTEX), vec![ViewRay { varying: "vofi_TexCoord4".into(), rows: [8, 9, 10] }]);
+    assert!(view_rays(VERTEX).is_empty());
+}
+
+#[test]
+fn the_other_eyes_copy_moves_the_ray_where_it_is_a_direction_only() {
+    let stereo = stereo_vertex(RAY_VERTEX).unwrap();
+    let (vertex, fragment) = eye_rays(RAY_VERTEX, &stereo, RAY_FRAGMENT).unwrap();
+    assert!(vertex.contains("flat out vec3 monaka_eye_vofi_TexCoord4;"));
+    assert!(vertex.contains("\tmonaka_main();\n\tmonaka_rays();\n"));
+    assert!(vertex.contains("dot( _va_[8].xyz, monaka_apart )"));
+    assert!(vertex.contains("monaka_origin( _va_[4], _va_[5], _va_[7] )"));
+    let shift = "( gl_Layer == 1 ? monaka_eye_vofi_TexCoord4 : vec3( 0.0 ) )";
+    assert!(fragment.contains(&format!("normalize( ( vofi_TexCoord4.xyz + {shift} ) )")));
+    assert!(fragment.contains(&format!("normalize( -( vofi_TexCoord4.xyz + {shift} ) )")));
+    assert!(fragment.contains("normalize( vofi_TexCoord4.xyz + _fa_[10 ].xyz - _fa_[11 ].xyz )"));
+    assert!(fragment.contains("flat in vec3 monaka_eye_vofi_TexCoord4;"));
+    assert!(fragment.contains("GL_ARB_fragment_layer_viewport"));
+    assert_eq!(eye_rays(RAY_VERTEX, &stereo, "#version 150\nin vec4 vofi_TexCoord4;\nvoid main() {}\n"), None);
+}
