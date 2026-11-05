@@ -110,6 +110,8 @@ struct Job {
     plain: Option<Relink>,
     /// Swapped for its fragment shader alone (no stereo rows): [`convert::without_blur_or_grain`].
     patched: bool,
+    /// As an earlier run in this process converted it: kept if this conversion fails.
+    before: Option<Converted>,
 }
 
 struct Relink {
@@ -124,11 +126,13 @@ pub struct Conversion {
     sources: Vec<Renderprog>,
     converted: Vec<Converted>,
     failed: usize,
+    /// Converted before and kept so, their conversion again failing.
+    kept_before: usize,
 }
 
 impl Conversion {
     pub const fn new() -> Self {
-        Self { stage: Stage::Idle, sources: Vec::new(), converted: Vec::new(), failed: 0 }
+        Self { stage: Stage::Idle, sources: Vec::new(), converted: Vec::new(), failed: 0, kept_before: 0 }
     }
 
     /// Whether it ended (converted or given up).
@@ -183,6 +187,10 @@ impl Conversion {
                     match swap(gl, job, &self.sources[job.source]) {
                         Ok(Some(converted)) => self.converted.push(converted),
                         Ok(None) => log!("single pass: program {} ({}) drawn without depth of field or film grain", job.engine, self.sources[job.source].name),
+                        Err(_) if job.before.is_some() => {
+                            self.kept_before += 1;
+                            self.converted.extend(job.before.clone());
+                        }
                         Err(why) => {
                             self.failed += 1;
                             if self.failed <= 10 {
@@ -196,7 +204,7 @@ impl Conversion {
                 if end < jobs.len() {
                     Stage::Swapping { jobs, done: end }
                 } else {
-                    log!("single pass: {} engine programs converted, {} left as they were", self.converted.len(), self.failed);
+                    log!("single pass: {} engine programs converted ({} of them decals as converted before, not converted again), {} left as they were", self.converted.len(), self.kept_before, self.failed);
                     self.stage = Stage::Done;
                     return Some(self.converted.clone());
                 }
@@ -293,7 +301,7 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         // SAFETY: our own scratch program.
         unsafe { (gl.delete_program)(program) };
     }
-    let (mut engine_programs, mut matched, mut flat, mut no_binary) = (0, 0, 0, 0);
+    let (mut engine_programs, mut matched, mut flat) = (0, 0, 0);
     let mut jobs = Vec::new();
     for engine in 1..=LAST_NAME {
         // SAFETY: a plain query.
@@ -310,10 +318,10 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
             let wanted = layered_maps(fragment, fragment).is_some();
             if layered == wanted {
                 already.push(converted);
-            } else if !has_binary(gl, engine) {
-                // Its binary cannot be had to put back: it would stay as it is after a compile.
-                no_binary += 1;
-            } else if let Some(job) = job(gl, engine, &gl.uniforms(engine), source, &sources[source]) {
+            } else if let Some(mut job) = job(gl, engine, &gl.uniforms(engine), source, &sources[source]) {
+                // A decal (unprojecting its pixel) kept as it was converted if it cannot be converted
+                // again; the rest stay as they always have.
+                job.before = converted.unproject.is_some().then_some(converted);
                 jobs.push(job);
             }
             continue;
@@ -339,7 +347,7 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         }
     }
     log!(
-        "single pass: {engine_programs} engine programs, {} converted before ({no_binary} more left as they are, no binary of theirs to be had), {matched} matched to their render program ({flat} full-screen or 2D, left as they are); converting {}",
+        "single pass: {engine_programs} engine programs, {} converted before, {matched} matched to their render program ({flat} full-screen or 2D, left as they are); converting {}",
         already.len(),
         jobs.len()
     );
@@ -347,14 +355,6 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         return Stage::Failed;
     }
     Stage::Converting { jobs, since: Instant::now() }
-}
-
-/// Whether the driver gives `program`'s binary (the swap puts it back if the converted one fails).
-fn has_binary(gl: &Gl, program: u32) -> bool {
-    let mut length = 0;
-    // SAFETY: a plain query into a local.
-    unsafe { (gl.get_program_iv)(program, gl_api::GL_PROGRAM_BINARY_LENGTH, &mut length) };
-    length > 0
 }
 
 /// The converted scratch program for `engine` from its render program `program` (`sources[source]`),
@@ -381,9 +381,9 @@ fn job(gl: &Gl, engine: u32, uniforms: &[ActiveUniform], source: usize, program:
         Some(layered) => {
             let fragment = convert::with_locations(&layered.source, &located);
             let scratch = gl.program(&vertex, &fragment, &attributes, &outputs);
-            Job { engine, source, rows, scratch, maps: layered.maps, plain: Some(Relink { vertex, fragment: plain, attributes, outputs }), patched: false }
+            Job { engine, source, rows, scratch, maps: layered.maps, plain: Some(Relink { vertex, fragment: plain, attributes, outputs }), patched: false, before: None }
         }
-        None => Job { engine, source, rows, scratch: gl.program(&vertex, &plain, &attributes, &outputs), maps: Vec::new(), plain: None, patched: false },
+        None => Job { engine, source, rows, scratch: gl.program(&vertex, &plain, &attributes, &outputs), maps: Vec::new(), plain: None, patched: false, before: None },
     })
 }
 
@@ -397,7 +397,7 @@ fn patch(gl: &Gl, engine: u32, uniforms: &[ActiveUniform], source: usize, progra
     let outputs = outputs(program, |name| u32::try_from(unsafe { (gl.get_frag_data_location)(engine, gl_api::c_name(name).as_ptr()) }).ok());
     let attributes = gl.attributes(engine);
     let scratch = gl.program(&vertex, &fragment, &attributes, &outputs);
-    Job { engine, source, rows: [0; 4], scratch, maps: Vec::new(), plain: None, patched: true }
+    Job { engine, source, rows: [0; 4], scratch, maps: Vec::new(), plain: None, patched: true, before: None }
 }
 
 /// An engine program an earlier run converted: its locations, from the render program with the
