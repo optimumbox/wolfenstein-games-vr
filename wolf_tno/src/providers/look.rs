@@ -79,7 +79,10 @@ pub unsafe extern "system" fn usercmd_builder(generator: usize, out: usize, play
         let snapped = crate::cooking::body_forward::take_snapped();
         engine::COMMANDS.rewrite(generator, out, player as u32 as usize, scale, |pitch, yaw| {
             let yaw = yaw - snapped;
-            command::built(pitch, yaw).or((snapped != 0.0).then_some((pitch, yaw)))
+            let built = command::built(pitch, yaw).or((snapped != 0.0).then_some((pitch, yaw)));
+            // On a mounted gun, turned toward where the right controller points.
+            let (p, y) = built.unwrap_or((pitch, yaw));
+            crate::cooking::turret_aim::steer(p, y).or(built)
         });
     }
     result

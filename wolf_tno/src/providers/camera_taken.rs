@@ -208,6 +208,11 @@ pub fn mounted() -> bool {
     (MOUNTED.load(Acquire) || DRIVING.load(Acquire)) && fresh()
 }
 
+/// Whether that camera is a mounted gun (not a machine the player drives).
+pub fn on_mounted_gun() -> bool {
+    MOUNTED.load(Acquire) && fresh()
+}
+
 /// Whether the look keeps the head's share in the angles as it was: on a mounted gun ([`mounted`]),
 /// while the weapon wheel is open with the game's pad on, or while a menu holds the player's
 /// control with no other camera on the view (the journal). The player's view update then leaves

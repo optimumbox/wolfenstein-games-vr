@@ -710,7 +710,10 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
                 crate::cooking::room_scale::step(&game);
             }
             let position = eyes_position(&setup.shared, pose, sighted);
-            let camera = eyes_camera(own);
+            // On a mounted gun aimed by the right controller, the eyes keep the view the player got
+            // on with (`turret_aim`): the gun turns in a world that stays put.
+            let eyes_on = View { origin_axis: crate::cooking::turret_aim::anchored(player, own.origin_axis), ..own };
+            let camera = eyes_camera(eyes_on);
             let turned = turned_view(&camera, pose, position, &setup.config, &setup.shared, &convention, setup.shared.headset_fov, baked).map(|mut turned| {
                 crate::research::view::with_extra_yaw(&mut turned.origin_axis);
                 turned
@@ -736,7 +739,7 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
                         let shift: [f32; 3] = std::array::from_fn(|k| turned.origin_axis[k] - own.origin_axis[k]);
                         crate::providers::follow_head::set_shift(Some(shift), own_camera);
                         let rows = |v: &View| std::array::from_fn::<f32, 9, _>(|k| v.origin_axis[3 + k]);
-                        crate::providers::follow_head::set_turn(Some((rows(&own), rows(&turned))));
+                        crate::providers::follow_head::set_turn(Some((rows(&eyes_on), rows(&turned))));
                         // Whether the drawn view follows the real head: the tracking space it
                         // gives, while the player's own camera has the view.
                         let space = (!cutscene && !crate::providers::camera_taken::controlled())
