@@ -199,6 +199,7 @@ fn log_video_memory() {
 pub unsafe extern "system" fn tex_sub_image_2d(target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, kind: u32, pixels: *const c_void) {
     let flight = InFlight::enter();
     let started = Instant::now();
+    super::pieces::call("glTexSubImage2D");
     // SAFETY: forwards the game's own call.
     unsafe { TEX_SUB_IMAGE_2D.get(&flight)(target, level, x, y, w, h, format, kind, pixels) };
     count(true, texels(w, h, 1), false, started);
@@ -207,6 +208,7 @@ pub unsafe extern "system" fn tex_sub_image_2d(target: u32, level: i32, x: i32, 
 pub unsafe extern "system" fn compressed_tex_sub_image_2d(target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, size: i32, data: *const c_void) {
     let flight = InFlight::enter();
     let started = Instant::now();
+    super::pieces::call("glCompressedTexSubImage2D");
     // SAFETY: forwards the game's own call.
     unsafe { COMPRESSED_TEX_SUB_IMAGE_2D.get(&flight)(target, level, x, y, w, h, format, size, data) };
     count(true, u64::try_from(size).unwrap_or(0), true, started);
@@ -215,6 +217,7 @@ pub unsafe extern "system" fn compressed_tex_sub_image_2d(target: u32, level: i3
 pub unsafe extern "system" fn tex_sub_image_3d(target: u32, level: i32, x: i32, y: i32, z: i32, w: i32, h: i32, d: i32, format: u32, kind: u32, pixels: *const c_void) {
     let flight = InFlight::enter();
     let started = Instant::now();
+    super::pieces::call("glTexSubImage3D");
     // SAFETY: forwards the game's own call.
     unsafe { TEX_SUB_IMAGE_3D.get(&flight)(target, level, x, y, z, w, h, d, format, kind, pixels) };
     count(true, texels(w, h, d), false, started);
@@ -223,6 +226,7 @@ pub unsafe extern "system" fn tex_sub_image_3d(target: u32, level: i32, x: i32, 
 pub unsafe extern "system" fn compressed_tex_sub_image_3d(target: u32, level: i32, x: i32, y: i32, z: i32, w: i32, h: i32, d: i32, format: u32, size: i32, data: *const c_void) {
     let flight = InFlight::enter();
     let started = Instant::now();
+    super::pieces::call("glCompressedTexSubImage3D");
     // SAFETY: forwards the game's own call.
     unsafe { COMPRESSED_TEX_SUB_IMAGE_3D.get(&flight)(target, level, x, y, z, w, h, d, format, size, data) };
     count(true, u64::try_from(size).unwrap_or(0), true, started);
@@ -231,6 +235,7 @@ pub unsafe extern "system" fn compressed_tex_sub_image_3d(target: u32, level: i3
 pub unsafe extern "system" fn buffer_sub_data(target: u32, offset: isize, size: isize, data: *const c_void) {
     let flight = InFlight::enter();
     let started = Instant::now();
+    super::pieces::call("glBufferSubData");
     // SAFETY: forwards the game's own call.
     unsafe { BUFFER_SUB_DATA.get(&flight)(target, offset, size, data) };
     count(false, u64::try_from(size).unwrap_or(0), false, started);
@@ -239,6 +244,7 @@ pub unsafe extern "system" fn buffer_sub_data(target: u32, offset: isize, size: 
 pub unsafe extern "system" fn texture_sub_image_2d(texture: u32, target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, kind: u32, pixels: *const c_void) {
     let flight = InFlight::enter();
     let started = Instant::now();
+    super::pieces::call("glTextureSubImage2DEXT");
     // SAFETY: forwards the game's own call.
     unsafe { TEXTURE_SUB_IMAGE_2D.get(&flight)(texture, target, level, x, y, w, h, format, kind, pixels) };
     count(true, texels(w, h, 1), false, started);
@@ -247,6 +253,7 @@ pub unsafe extern "system" fn texture_sub_image_2d(texture: u32, target: u32, le
 pub unsafe extern "system" fn compressed_texture_sub_image_2d(texture: u32, target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, size: i32, data: *const c_void) {
     let flight = InFlight::enter();
     let started = Instant::now();
+    super::pieces::call("glCompressedTextureSubImage2DEXT");
     // SAFETY: forwards the game's own call.
     unsafe { COMPRESSED_TEXTURE_SUB_IMAGE_2D.get(&flight)(texture, target, level, x, y, w, h, format, size, data) };
     count(true, u64::try_from(size).unwrap_or(0), true, started);
@@ -255,6 +262,7 @@ pub unsafe extern "system" fn compressed_texture_sub_image_2d(texture: u32, targ
 pub unsafe extern "system" fn named_buffer_sub_data(buffer: u32, offset: isize, size: isize, data: *const c_void) {
     let flight = InFlight::enter();
     let started = Instant::now();
+    super::pieces::call("glNamedBufferSubDataEXT");
     // SAFETY: forwards the game's own call.
     unsafe { NAMED_BUFFER_SUB_DATA.get(&flight)(buffer, offset, size, data) };
     count(false, u64::try_from(size).unwrap_or(0), false, started);
@@ -263,6 +271,7 @@ pub unsafe extern "system" fn named_buffer_sub_data(buffer: u32, offset: isize, 
 pub unsafe extern "system" fn client_wait_sync(sync: *const c_void, flags: u32, timeout: u64) -> u32 {
     let flight = InFlight::enter();
     let started = Instant::now();
+    super::pieces::call("glClientWaitSync");
     // SAFETY: forwards the game's own call.
     let result = unsafe { CLIENT_WAIT_SYNC.get(&flight)(sync, flags, timeout) };
     NOW[7].fetch_add(1, Relaxed);

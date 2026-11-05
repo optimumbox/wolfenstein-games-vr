@@ -1211,6 +1211,22 @@ fn install() -> bool {
         hook!(u::NAMED_BUFFER_SUB_DATA, "glNamedBufferSubDataEXT", u::named_buffer_sub_data as u::NamedBufferSubDataFn, false);
         hook!(u::CLIENT_WAIT_SYNC, "glClientWaitSync", u::client_wait_sync as u::ClientWaitSyncFn, false);
     }
+    {
+        use super::calls as c;
+        hook!(c::READ_PIXELS, "glReadPixels", c::read_pixels, false);
+        hook!(c::GET_TEX_IMAGE, "glGetTexImage", c::get_tex_image, false);
+        hook!(c::MAP_BUFFER, "glMapBuffer", c::map_buffer, false);
+        hook!(c::MAP_BUFFER_RANGE, "glMapBufferRange", c::map_buffer_range, false);
+        hook!(c::UNMAP_BUFFER, "glUnmapBuffer", c::unmap_buffer, false);
+        hook!(c::COPY_BUFFER_SUB_DATA, "glCopyBufferSubData", c::copy_buffer_sub_data, false);
+        hook!(c::GENERATE_MIPMAP, "glGenerateMipmap", c::generate_mipmap, false);
+        hook!(c::FENCE_SYNC, "glFenceSync", c::fence_sync, false);
+        hook!(c::WAIT_SYNC, "glWaitSync", c::wait_sync, false);
+        hook!(c::FINISH, "glFinish", c::finish, false);
+        hook!(c::FLUSH, "glFlush", c::flush, false);
+        hook!(c::DISPATCH_COMPUTE, "glDispatchCompute", c::dispatch_compute, false);
+        hook!(c::CLEAR_BUFFER_FV, "glClearBufferfv", c::clear_buffer_fv, false);
+    }
     let unit = hook!(ACTIVE_TEXTURE, "glActiveTexture", active_texture as CapFn, false);
     let state_kept = [
         hook!(COLOR_MASK, "glColorMask", color_mask as ColorMaskFn, false),
@@ -2437,6 +2453,7 @@ fn close_scissor(flight: &InFlight) {
 
 unsafe extern "system" fn clear(mask: u32) {
     let flight = InFlight::enter();
+    super::pieces::call("glClear");
     if let Some(state) = STATE.locked().as_mut() {
         let framebuffer = state.draw_framebuffer;
         traced(state, || format!("clear {mask:#x} fb {framebuffer}"));
@@ -2685,6 +2702,7 @@ static BLITS_LOGGED: std::sync::Mutex<Vec<(u32, u32, u32)>> = std::sync::Mutex::
 /// for an eye's); the first few logged, with what each framebuffer reads or draws.
 unsafe extern "system" fn blit_framebuffer(sx0: i32, sy0: i32, sx1: i32, sy1: i32, dx0: i32, dy0: i32, dx1: i32, dy1: i32, mask: u32, filter: u32) {
     let flight = InFlight::enter();
+    super::pieces::call("glBlitFramebuffer");
     if let Some(state) = STATE.locked().as_ref().filter(|s| s.live) {
         let key = (state.read_framebuffer, state.draw_framebuffer, mask);
         if let Ok(mut logged) = BLITS_LOGGED.lock()
@@ -2717,6 +2735,7 @@ static FRAMEBUFFER_COPIES_LOGGED: std::sync::Mutex<Vec<(u32, u32, u32)>> = std::
 /// few logged, with what the framebuffer reads and the pass.
 unsafe extern "system" fn copy_tex_sub_image_2d(target: u32, level: i32, dx: i32, dy: i32, x: i32, y: i32, w: i32, h: i32) {
     let flight = InFlight::enter();
+    super::pieces::call("glCopyTexSubImage2D");
     if let Some(state) = STATE.locked().as_ref().filter(|s| s.live) {
         let unit = Shadow::unit();
         let key = (state.read_framebuffer, target, unit);
@@ -2743,6 +2762,7 @@ unsafe extern "system" fn copy_image_sub_data(
     width: i32, height: i32, depth: i32,
 ) {
     let flight = InFlight::enter();
+    super::pieces::call("glCopyImageSubData");
     let (source, destination) = copied(source, source_target, destination, destination_target, (width, height));
     // SAFETY: forwards the game's own call (with a layer's view for an eye texture).
     unsafe { COPY_IMAGE_SUB_DATA.get(&flight)(source, source_target, source_level, sx, sy, sz, destination, destination_target, destination_level, dx, dy, dz, width, height, depth) }
@@ -2754,6 +2774,7 @@ unsafe extern "system" fn copy_image_sub_data_nv(
     width: i32, height: i32, depth: i32,
 ) {
     let flight = InFlight::enter();
+    super::pieces::call("glCopyImageSubDataNV");
     let (source, destination) = copied(source, source_target, destination, destination_target, (width, height));
     // SAFETY: forwards the game's own call (with a layer's view for an eye texture).
     unsafe { COPY_IMAGE_SUB_DATA_NV.get(&flight)(source, source_target, source_level, sx, sy, sz, destination, destination_target, destination_level, dx, dy, dz, width, height, depth) }

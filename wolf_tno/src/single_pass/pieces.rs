@@ -65,6 +65,9 @@ pub enum Mark {
     Swap,
     /// The hand-off done: the next frame's start until its first draw.
     Handed,
+    /// One of the game's GL calls that moves data on the GPU without drawing (an upload, a copy,
+    /// a read back, a buffer mapped, a fence), by name.
+    Call(&'static str),
 }
 
 struct Frame {
@@ -214,6 +217,17 @@ pub fn swap(publishing: bool, name: impl Fn(u32) -> Option<&'static str>) {
     }
 }
 
+/// Before one of the game's GL calls that is not a draw (render thread): stamped, on timed frames.
+pub fn call(name: &'static str) {
+    if !ON.load(Relaxed) {
+        return;
+    }
+    let Ok(mut held) = PIECES.lock() else { return };
+    if let Some(p) = held.as_mut() {
+        p.stamp(Mark::Call(name));
+    }
+}
+
 /// The hand-off done (render thread): what follows is the next frame's start.
 pub fn handed() {
     if !ON.load(Relaxed) {
@@ -314,6 +328,7 @@ fn label(mark: Mark, name: &impl Fn(u32) -> Option<&'static str>) -> String {
         },
         Mark::Swap => "the swap's capture and hand-off".to_owned(),
         Mark::Handed => "the frame's start before its first draw".to_owned(),
+        Mark::Call(name) => name.to_owned(),
     }
 }
 
