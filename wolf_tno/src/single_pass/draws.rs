@@ -27,6 +27,11 @@
 //! with their rows carried by the matrix, and a right eye's stretch draw not among them is drawn
 //! into its layer rather than skipped.
 //!
+//! Both copies of a carried draw share the left eye's viewport, and so its scissor: a rectangle
+//! the engine fits to what the left eye sees would clip the right eye's copy. A carried draw made
+//! with a scissor smaller than its viewport is drawn with the scissor test off (the depth test
+//! hides what the rectangle would have), and the test is put back right after it.
+//!
 //! A draw of the stretch with another depth projection than the world's (the hands and their
 //! weapon, their depth squeezed in front of the world) is not carried by the eye matrix, which
 //! fits the world's: each pass draws it into its own layer ([`depth_ratio`]).
@@ -147,6 +152,9 @@ struct Counts {
     misfit_draws: u64,
     /// Draws of programs reading the scene's maps made for both eyes.
     screen_shared: u64,
+    /// The left eye's carried draws made with the scissor test off, their scissor smaller than the
+    /// viewport.
+    scissor_opened: u64,
     /// The right eye's stretch draws the left eye's pass did not make (culled for the left eye),
     /// drawn by the right eye's pass.
     right_only: u64,
@@ -363,6 +371,8 @@ struct State {
     /// The window's size (both eyes side by side): an eye is half its width.
     size: (i32, i32),
     viewport: [i32; 4],
+    /// The engine's scissor rectangle (none until it sets one).
+    scissor: Option<[i32; 4]>,
     /// The pass this frame is in: 0 before the first, 1 the left eye's, 2 the right's.
     pass: u32,
     /// The pass's scene stretch is over.
@@ -446,6 +456,7 @@ fn state() -> State {
         current: 0,
         size: (0, 0),
         viewport: [0; 4],
+        scissor: None,
         pass: 0,
         cut: false,
         draw_framebuffer: 0,
@@ -757,7 +768,7 @@ pub fn frame(on: bool) {
             by.iter().take(24).map(|(n, name, p)| format!("{name} ({p}) {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
         });
         log!(
-            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch; {} of the right eye's writing neither colour nor depth, drawn; {} with their own depth projection, drawn by each eye (world's {:?}); {} of programs reading the scene's maps or not carried by the eye matrix ({} judged), drawn by each eye; {} of programs reading the scene's maps made for both eyes",
+            "single pass: {} draws, {} with a converted program, {} perspective, {} into a stood-in framebuffer, {} in the scene's stretch; {} of the right eye's writing neither colour nor depth, drawn; {} with their own depth projection, drawn by each eye (world's {:?}); {} of programs reading the scene's maps or not carried by the eye matrix ({} judged), drawn by each eye; {} of programs reading the scene's maps made for both eyes; {} carried with the scissor test off (their scissor smaller than the viewport)",
             c.draws,
             c.converted,
             c.perspective,
@@ -768,7 +779,8 @@ pub fn frame(on: bool) {
             state.world_depth,
             c.misfit_draws,
             state.misfits.misfits.len(),
-            c.screen_shared
+            c.screen_shared,
+            c.scissor_opened
         );
     }
 }
@@ -978,6 +990,9 @@ static BEGIN_CONDITIONAL: Original<BeginQueryFn> = Original::new();
 static BEGIN_CONDITIONAL_NV: Original<BeginQueryFn> = Original::new();
 static ENABLE: Original<CapFn> = Original::new();
 static DISABLE: Original<CapFn> = Original::new();
+static SCISSOR: Original<RectFn> = Original::new();
+/// The scissor test is off for the draw being made, to be put back after it.
+static SCISSOR_OPENED: AtomicBool = AtomicBool::new(false);
 
 /// Where the executable's data holds `address`.
 fn slots(exe: &Module, address: usize) -> Vec<usize> {
@@ -1033,6 +1048,7 @@ fn install() -> bool {
     hook!(UNIFORM_4FV, "glUniform4fv", uniform_4fv as Uniform4fvFn, true);
     hook!(PROGRAM_UNIFORM_4FV, "glProgramUniform4fv", program_uniform_4fv as ProgramUniform4fvFn, false);
     hook!(VIEWPORT, "glViewport", viewport as RectFn, false);
+    hook!(SCISSOR, "glScissor", scissor as RectFn, false);
     hook!(CLEAR, "glClear", clear as ClearFn, true);
     let binds = hook!(BIND_FRAMEBUFFER, "glBindFramebuffer", bind_framebuffer as BindFramebufferFn, false)
         + hook!(BIND_FRAMEBUFFER_EXT, "glBindFramebufferEXT", bind_framebuffer_ext as BindFramebufferFn, false);
@@ -1434,6 +1450,10 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
                 state.counts.screen_shared += 1;
             }
             set_switch(gl, program, true);
+            if scissor_clips(state) {
+                open_scissor();
+                state.counts.scissor_opened += 1;
+            }
             state.counts.stereo += 1;
             state.last_path = "left: carried into the right eye";
             state.carried.keep(current, geometry, shape, eye_matrix::carry(&matrix, &rows));
@@ -1575,7 +1595,7 @@ fn inspect_frame(state: &mut State) {
     *next += 1;
     let lines = vec![
         format!("The draws of {INSPECTED_FRAMES} frames from frame {} on, both passes (1 the left eye's, 2 the right's), as the single pass drew them.", state.live_frames),
-        "Each line: pass, framebuffer, program, how it was drawn, depth projection ratio (world's in the header), GL state (depth test function, depth writes, polygon offset, blend, cull), where the model's origin lands (NDC x y z), for the left eye's carried draws where their copy lands in the right eye, and for the right eye's own the farthest-apart of the left eye's carried copies of the same mesh.".into(),
+        "Each line: pass, framebuffer, program, how it was drawn, depth projection ratio (world's in the header), GL state (depth test function, depth writes, polygon offset, blend, cull, the scissor while its test is on: \"opened\" when turned off for the right eye's copy), where the model's origin lands (NDC x y z), for the left eye's carried draws where their copy lands in the right eye, and for the right eye's own the farthest-apart of the left eye's carried copies of the same mesh.".into(),
         format!("world depth ratio {:?}, eye matrix {:?}", state.world_depth, state.matrix),
     ];
     state.inspect = Some(Inspect { folder: capture, frames: INSPECTED_FRAMES, lines });
@@ -1632,6 +1652,9 @@ fn inspected_draw(state: &mut State, pass: u32, geometry: u64, shape: u64, goes_
         blend,
         cull,
     );
+    if SHADOW.load(Relaxed) & SCISSOR_TEST != 0 {
+        line += &format!(" scissor {:?}{}", state.scissor, if SCISSOR_OPENED.load(Relaxed) { " opened" } else { "" });
+    }
     if let Some(rows) = rows.as_ref() {
         line += &format!(" at {}", origin(rows));
         if pass == 1 && state.last_path.starts_with("left: carried") && let Some(matrix) = state.matrix.as_ref() {
@@ -1696,7 +1719,9 @@ const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_TEST: u32 = 0x20;
 const DISCARD: u32 = 0x40;
 const STENCIL_TEST: u32 = 0x80;
+const SCISSOR_TEST: u32 = 0x100;
 const GL_DEPTH_TEST: u32 = 0x0B71;
+const GL_SCISSOR_TEST: u32 = 0x0C11;
 const GL_STENCIL_TEST: u32 = 0x0B90;
 
 /// The query begun and not yet ended (its target; 0 for none), the pass the frame is in (0 before
@@ -1797,6 +1822,7 @@ impl Shadow {
             GL_DEPTH_TEST => DEPTH_TEST,
             GL_RASTERIZER_DISCARD => DISCARD,
             GL_STENCIL_TEST => STENCIL_TEST,
+            GL_SCISSOR_TEST => SCISSOR_TEST,
             _ => 0,
         }
     }
@@ -1816,6 +1842,7 @@ impl Shadow {
             bits |= if glIsEnabled(GL_DEPTH_TEST) != 0 { DEPTH_TEST } else { 0 };
             bits |= if glIsEnabled(GL_RASTERIZER_DISCARD) != 0 { DISCARD } else { 0 };
             bits |= if glIsEnabled(GL_STENCIL_TEST) != 0 { STENCIL_TEST } else { 0 };
+            bits |= if glIsEnabled(GL_SCISSOR_TEST) != 0 { SCISSOR_TEST } else { 0 };
             glGetIntegerv(0x84E0, &mut unit);
         }
         SHADOW.store(bits, Relaxed);
@@ -2026,6 +2053,41 @@ unsafe extern "system" fn viewport(x: i32, y: i32, w: i32, h: i32) {
     }
     // SAFETY: forwards the game's own call.
     unsafe { VIEWPORT.get(&flight)(x, y, w, h) }
+}
+
+unsafe extern "system" fn scissor(x: i32, y: i32, w: i32, h: i32) {
+    let flight = InFlight::enter();
+    if let Some(state) = STATE.locked().as_mut() {
+        state.scissor = Some([x, y, w, h]);
+    }
+    // SAFETY: forwards the game's own call.
+    unsafe { SCISSOR.get(&flight)(x, y, w, h) }
+}
+
+/// Whether the scissor test is on (as the engine's own calls left it) with a rectangle not
+/// covering the viewport: the right eye's copy of a carried draw would be clipped by it.
+fn scissor_clips(state: &State) -> bool {
+    let Some(s) = state.scissor else { return false };
+    let v = state.viewport;
+    SHADOW_TRUSTED.load(Relaxed)
+        && SHADOW.load(Relaxed) & SCISSOR_TEST != 0
+        && !(s[0] <= v[0] && s[1] <= v[1] && s[0] + s[2] >= v[0] + v[2] && s[1] + s[3] >= v[1] + v[3])
+}
+
+/// The scissor test off for the draw about to be made ([`close_scissor`] puts it back).
+fn open_scissor() {
+    let flight = InFlight::enter();
+    SCISSOR_OPENED.store(true, Relaxed);
+    // SAFETY: a plain GL call on the engine's context, undone after the draw.
+    unsafe { DISABLE.get(&flight)(GL_SCISSOR_TEST) }
+}
+
+/// The scissor test put back after a draw made with it off.
+fn close_scissor(flight: &InFlight) {
+    if SCISSOR_OPENED.swap(false, Relaxed) {
+        // SAFETY: a plain GL call on the engine's context, putting back its state.
+        unsafe { ENABLE.get(flight)(GL_SCISSOR_TEST) }
+    }
 }
 
 unsafe extern "system" fn clear(mask: u32) {
@@ -2285,6 +2347,7 @@ macro_rules! draw_detour {
                 // SAFETY: forwards the game's own call.
                 unsafe { $original.get(&flight)($($arg),*) }
             }
+            close_scissor(&flight);
         }
     };
 }

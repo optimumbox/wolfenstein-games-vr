@@ -7,7 +7,9 @@
 //!   the left eye's clip position times the eye matrix ([`STEREO_UNIFORM`], rows 0 to 3; row 4's
 //!   x is the switch). A framebuffer that is not layered ignores the layer. The
 //!   eye matrix is the right eye's view-projection over the left eye's, the same for every draw of
-//!   a frame, so no per-draw constant changes.
+//!   a frame, so no per-draw constant changes. That position is `precise`: worked out the same way
+//!   in every program, so a depth drawn by one program and tested `EQUAL` by the next, the same
+//!   object's, agrees to the bit in the right eye as it does in the left.
 //! - Every plain uniform gets the location the engine's program gave it ([`with_locations`]), so
 //!   the converted program takes the engine's own uniform calls unchanged.
 //!
@@ -21,7 +23,7 @@ pub const STEREO_UNIFORM: &str = "monaka_sl";
 /// Its rows.
 pub const STEREO_ROWS: usize = 5;
 
-const VIEWPORT_EXTENSIONS: &str = "#extension GL_NV_viewport_array2 : require\n#extension GL_NV_stereo_view_rendering : require\n";
+const VIEWPORT_EXTENSIONS: &str = "#extension GL_NV_viewport_array2 : require\n#extension GL_NV_stereo_view_rendering : require\n#extension GL_ARB_gpu_shader5 : require\n";
 const LOCATION_EXTENSION: &str = "#extension GL_ARB_explicit_uniform_location : require\n";
 
 /// `source` with `lines` put right after its `#version` line.
@@ -57,7 +59,8 @@ pub fn stereo_vertex(vertex: &str) -> Option<String> {
          \tgl_Layer = 0;\n\
          \tgl_ViewportMask[0] = 1;\n\
          \tif ( {u}[4].x != 0.0 ) {{\n\
-         \t\tgl_SecondaryPositionNV = vec4( dot( {u}[0], gl_Position ), dot( {u}[1], gl_Position ), dot( {u}[2], gl_Position ), dot( {u}[3], gl_Position ) );\n\
+         \t\tprecise vec4 monaka_right = vec4( dot( {u}[0], gl_Position ), dot( {u}[1], gl_Position ), dot( {u}[2], gl_Position ), dot( {u}[3], gl_Position ) );\n\
+         \t\tgl_SecondaryPositionNV = monaka_right;\n\
          \t\tgl_SecondaryViewportMaskNV[0] = 1;\n\
          \t}} else {{\n\
          \t\tgl_SecondaryPositionNV = gl_Position;\n\

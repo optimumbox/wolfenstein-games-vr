@@ -39,7 +39,8 @@ fn uniforms_take_the_engines_locations() {
 #[test]
 fn the_stereo_vertex_shader_keeps_main_and_adds_the_other_eye() {
     let out = stereo_vertex(VERTEX).unwrap();
-    assert!(out.starts_with("#version 150\n#extension GL_NV_viewport_array2 : require\n#extension GL_NV_stereo_view_rendering : require\n"));
+    assert!(out.starts_with("#version 150\n#extension GL_NV_viewport_array2 : require\n#extension GL_NV_stereo_view_rendering : require\n#extension GL_ARB_gpu_shader5 : require\n"));
+    assert!(out.contains("precise vec4 monaka_right"), "the right eye's position worked out alike in every program");
     assert!(out.contains("void monaka_main() {\n\tvec4 position"));
     assert_eq!(out.matches("void main()").count(), 1);
     assert!(out.contains("layout( secondary_view_offset = 1 ) out int gl_Layer;"));
