@@ -220,6 +220,8 @@ const VIDEO_FRESH_MS: u64 = 500;
 
 /// Hooks `SwapBuffers` in the game's import table, and watches its open video.
 fn entry(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
+    // A capture of what the headset shows gets the single pass's draws of the frames after it.
+    crate::single_pass::draws::inspect_captures(start.session.dir().join("captures"));
     let flight = monaka_hook::InFlight::enter();
     let Facts { exe, build } = *start.build;
     // SAFETY: the import slot holds GDI32's SwapBuffers, which the detour's type matches.

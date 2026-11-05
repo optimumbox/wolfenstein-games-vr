@@ -422,6 +422,12 @@ struct State {
     logged: Option<Instant>,
     live_frames: u64,
     trace: Option<Trace>,
+    /// Every draw of a few frames, asked for by a capture of what the headset shows ([`Inspect`]).
+    inspect: Option<Inspect>,
+    /// How the last draw went, for [`Inspect`].
+    last_path: &'static str,
+    /// The run's captures folder and the next capture's number looked for in it.
+    captures: Option<(std::path::PathBuf, u32)>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -476,6 +482,9 @@ fn state() -> State {
         logged: None,
         live_frames: 0,
         trace: None,
+        inspect: None,
+        last_path: "",
+        captures: None,
     }
 }
 
@@ -593,6 +602,7 @@ pub fn frame(on: bool) {
         let lines = trace.lines;
         log!("single pass: frame {} traced:\n  {}", state.live_frames - 1, lines.join("\n  "));
     }
+    inspect_frame(state);
     if PROFILING && TRACED_FRAMES.contains(&state.live_frames) {
         state.trace = Some(Trace { lines: Vec::new(), run: None, draws: 0, scene: 0, binds: Vec::new() });
     }
@@ -1318,6 +1328,17 @@ fn draw_locked(geometry: u64, shape: u64) -> bool {
 }
 
 fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
+    if state.inspect.is_none() {
+        return draw_decided(state, geometry, shape);
+    }
+    state.last_path = "?";
+    let pass = state.pass;
+    let goes_ahead = draw_decided(state, geometry, shape);
+    inspected_draw(state, pass, geometry, shape, goes_ahead);
+    goes_ahead
+}
+
+fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
     state.counts.draws += 1;
     let current = state.current;
     let rows = state.programs.get(&current).map(|p| p.rows);
@@ -1344,7 +1365,10 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
         }
     }
     state.counts.in_stretch += u64::from(stretch);
-    let Some(rows) = rows else { return true };
+    let Some(rows) = rows else {
+        state.last_path = "not converted";
+        return true;
+    };
     let ratio = depth_ratio(&rows);
     if stretch && state.pass == 1 && state.depth_ratios.len() < DEPTH_RATIOS {
         state.depth_ratios.extend(ratio);
@@ -1368,6 +1392,7 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
             QUERIES_SHARED.lock().unwrap_or_else(|e| e.into_inner()).insert(right, left);
             PENDING.store(PENDING_SHARED, Relaxed);
             state.counts.queries_shared += 1;
+            state.last_path = "right: its query answered by the left eye's, not made";
             return false;
         }
     }
@@ -1378,6 +1403,7 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
         // the left eye's pass, the right eye's layer in its own).
         set_switch(gl, program, false);
         state.counts.own_projection += 1;
+        state.last_path = if misfit { "each eye its own (a misfit)" } else { "each eye its own (its own depth projection)" };
         if state.pass == 2 {
             *state.own_by.entry(current).or_default() += 1;
         }
@@ -1393,6 +1419,7 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
             }
             let Some(matrix) = state.matrix else {
                 set_switch(gl, program, false);
+                state.last_path = "left: no eye matrix, its own";
                 return true;
             };
             if program.matrix != state.matrix_number {
@@ -1408,6 +1435,7 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
             }
             set_switch(gl, program, true);
             state.counts.stereo += 1;
+            state.last_path = "left: carried into the right eye";
             state.carried.keep(current, geometry, shape, eye_matrix::carry(&matrix, &rows));
             let query = ACTIVE_QUERY_ID.load(Relaxed);
             if query != 0 && state.left_queries.last().is_none_or(|q| q.id != query) {
@@ -1438,6 +1466,7 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
                     state.counts.unwritten_checked += 1;
                     state.counts.unwritten_other_buffers += u64::from(other_buffers_written());
                 }
+                state.last_path = "right: writes neither colour nor depth, drawn";
                 return true;
             }
             if state.matrix.is_some() {
@@ -1450,6 +1479,7 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
                 }
                 if found.is_some() {
                     state.counts.skipped += 1;
+                    state.last_path = if found == Some(Found::Shape) { "right: found carried by shape, skipped" } else { "right: found carried, skipped" };
                     return false;
                 }
                 let nearest = state.carried.nearest(current, geometry, &rows);
@@ -1460,19 +1490,159 @@ fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
                     let entry = state.moved_by.entry(current).or_default();
                     entry.0 += 1;
                     entry.1 = entry.1.max(near);
+                    state.last_path = "right: moved between the passes, skipped";
                     return false;
                 }
                 state.counts.right_only_same_geometry += u64::from(nearest.is_some());
                 // Culled for the left eye: the right eye's pass draws it into its own layer.
                 state.counts.right_only += 1;
                 *state.right_only_by.entry(current).or_default() += 1;
+                state.last_path = "right: not among the left eye's, drawn";
+            } else {
+                state.last_path = "right: no eye matrix, drawn";
             }
             true
         }
         _ => {
             set_switch(gl, program, false);
+            state.last_path = "outside the stretch, each eye its own";
             true
         }
+    }
+}
+
+// ---- Inspected frames ----
+
+/// Every draw of [`INSPECTED_FRAMES`] frames, both passes, written into a capture's folder as
+/// `draws.txt` when the viewer makes a capture of what the headset shows (a new `capture-N` folder
+/// in the run's `captures` folder, looked for every [`CAPTURE_LOOK_EVERY`] frames): how each draw
+/// was drawn (carried into the right eye, skipped as carried, each eye its own...), its program,
+/// framebuffer, depth projection, GL state and where it lands on screen, so a fault seen in the
+/// capture is found among the draws.
+struct Inspect {
+    folder: std::path::PathBuf,
+    frames: u32,
+    lines: Vec<String>,
+}
+
+const INSPECTED_FRAMES: u32 = 3;
+const INSPECTED_LINES: usize = 40_000;
+const CAPTURE_LOOK_EVERY: u64 = 6;
+
+/// The run's captures folder, set by the presenter's install: captures there are inspected.
+static CAPTURES: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Draws of the frames after each capture of what the headset shows into `folder` are written
+/// beside it ([`Inspect`]).
+pub fn inspect_captures(folder: std::path::PathBuf) {
+    *CAPTURES.locked() = Some(folder);
+}
+
+/// At each frame's end: an inspection's frame ends (written once the last is), or a new capture's
+/// folder begins one.
+fn inspect_frame(state: &mut State) {
+    if let Some(mut inspect) = state.inspect.take() {
+        inspect.lines.push(format!("---- frame {} ends ({} passes) ----", state.live_frames - 1, state.pass));
+        inspect.frames -= 1;
+        if inspect.frames > 0 {
+            state.inspect = Some(inspect);
+        } else {
+            let path = inspect.folder.join("draws.txt");
+            let text = inspect.lines.join("\n") + "\n";
+            std::thread::spawn(move || {
+                if let Err(e) = std::fs::write(&path, text) {
+                    log!("single pass: {} not written: {e}", path.display());
+                }
+            });
+            log!("single pass: the draws of {INSPECTED_FRAMES} frames written beside the capture");
+        }
+        return;
+    }
+    if state.live_frames % CAPTURE_LOOK_EVERY != 0 {
+        return;
+    }
+    if state.captures.is_none() {
+        let Some(folder) = CAPTURES.locked().clone() else { return };
+        let next = (1..).find(|n| !folder.join(format!("capture-{n}")).exists()).unwrap_or(1);
+        state.captures = Some((folder, next));
+        return;
+    }
+    let Some((folder, next)) = state.captures.as_mut() else { return };
+    let capture = folder.join(format!("capture-{next}"));
+    if !capture.exists() {
+        return;
+    }
+    *next += 1;
+    let lines = vec![
+        format!("The draws of {INSPECTED_FRAMES} frames from frame {} on, both passes (1 the left eye's, 2 the right's), as the single pass drew them.", state.live_frames),
+        "Each line: pass, framebuffer, program, how it was drawn, depth projection ratio (world's in the header), GL state (depth test function, depth writes, polygon offset, blend, cull), where the model's origin lands (NDC x y z), for the left eye's carried draws where their copy lands in the right eye, and for the right eye's own the farthest-apart of the left eye's carried copies of the same mesh.".into(),
+        format!("world depth ratio {:?}, eye matrix {:?}", state.world_depth, state.matrix),
+    ];
+    state.inspect = Some(Inspect { folder: capture, frames: INSPECTED_FRAMES, lines });
+}
+
+/// Where `rows` put the model's origin, in NDC.
+fn origin(rows: &Rows) -> String {
+    let w = rows[3][3];
+    if w.abs() < 1e-9 {
+        return "(w 0)".into();
+    }
+    format!("({:.4} {:.4} {:.5})", rows[0][3] / w, rows[1][3] / w, rows[2][3] / w)
+}
+
+fn inspected_draw(state: &mut State, pass: u32, geometry: u64, shape: u64, goes_ahead: bool) {
+    let Some(inspect) = state.inspect.as_ref() else { return };
+    if inspect.lines.len() >= INSPECTED_LINES {
+        return;
+    }
+    let current = state.current;
+    let program = state.programs.get(&current);
+    let name = program.map_or("-", |p| p.converted.name);
+    let rows = program.map(|p| p.rows);
+    let (mut depth_func, mut depth_write, mut offset, mut blend, mut cull, mut depth_test) = (0, 0, 0, 0, 0, 0);
+    // SAFETY: state queries into locals (only while inspecting: each waits for the driver).
+    unsafe {
+        glGetIntegerv(0x0B74, &mut depth_func);
+        glGetIntegerv(0x0B72, &mut depth_write);
+        glGetIntegerv(0x8037, &mut offset);
+        glGetIntegerv(0x0BE2, &mut blend);
+        glGetIntegerv(0x0B44, &mut cull);
+        glGetIntegerv(0x0B71, &mut depth_test);
+    }
+    let func = match depth_func {
+        0x0200 => "never",
+        0x0201 => "less",
+        0x0202 => "equal",
+        0x0203 => "lequal",
+        0x0204 => "greater",
+        0x0205 => "notequal",
+        0x0206 => "gequal",
+        0x0207 => "always",
+        _ => "?",
+    };
+    let mut line = format!(
+        "{pass} fb {} {name}({current}) {}{}: ratio {:?} depth {} write {} offset {} blend {} cull {} geometry {geometry:x} shape {shape:x}",
+        state.draw_framebuffer,
+        state.last_path,
+        if goes_ahead { "" } else { " [not drawn]" },
+        rows.as_ref().and_then(depth_ratio),
+        if depth_test != 0 { func } else { "off" },
+        depth_write,
+        offset,
+        blend,
+        cull,
+    );
+    if let Some(rows) = rows.as_ref() {
+        line += &format!(" at {}", origin(rows));
+        if pass == 1 && state.last_path.starts_with("left: carried") && let Some(matrix) = state.matrix.as_ref() {
+            line += &format!(" copy at {}", origin(&eye_matrix::carry(matrix, rows)));
+        }
+        if pass >= 2 && let Some(near) = state.carried.nearest(current, geometry, rows) {
+            line += &format!(" nearest carried {near:.2e}");
+        }
+    }
+    if let Some(inspect) = state.inspect.as_mut() {
+        inspect.lines.push(line);
     }
 }
 
