@@ -21,6 +21,12 @@
 //! the right eye's pass: its culling is its own, and skipped it would cull nearly all of the next
 //! frame's right eye ([`Writes`]).
 //!
+//! Each pass culls for its own eye: a thing only the right eye sees (at its outer edge, past
+//! something that hides it from the left eye) is drawn by the right eye's pass alone. So the left
+//! eye's stretch draws are kept by program and geometry (the draw call's own arguments, [`Carried`])
+//! with their rows carried by the matrix, and a right eye's stretch draw not among them is drawn
+//! into its layer rather than skipped.
+//!
 //! A draw of the stretch with another depth projection than the world's (the hands and their
 //! weapon, their depth squeezed in front of the world) is not carried by the eye matrix, which
 //! fits the world's: each pass draws it into its own layer ([`depth_ratio`]).
@@ -138,6 +144,26 @@ struct Counts {
     misfit_draws: u64,
     /// Draws of programs reading the scene's maps made for both eyes.
     screen_shared: u64,
+    /// The right eye's stretch draws the left eye's pass did not make (culled for the left eye),
+    /// drawn by the right eye's pass.
+    right_only: u64,
+    /// Frames whose matrix came from pairing the passes' draws by the last matrix.
+    rematched: u64,
+}
+
+/// The left eye's stretch draws of a frame made for both eyes, by program and geometry (a key of
+/// the draw call's arguments: the same mesh drawn by both passes makes the same call), with their
+/// rows carried into the right eye.
+#[derive(Default)]
+struct Carried {
+    by: HashMap<(u32, u64), Vec<Rows>>,
+}
+
+impl Carried {
+    /// Whether the right eye's draw of `program` with `geometry` and `rows` is one of them.
+    fn has(&self, program: u32, geometry: u64, rows: &Rows) -> bool {
+        self.by.get(&(program, geometry)).is_some_and(|carried| carried.iter().any(|c| eye_matrix::apart(c, rows) <= eye_matrix::AGREES * 10.0))
+    }
 }
 
 /// The frames between checks of the right eye's draws against the left's carried by the matrix.
@@ -147,6 +173,8 @@ const CHECK_EVERY: u64 = 15;
 /// not found, is carried well; the glows' programs miss all but a few).
 const JUDGED_AFTER: u64 = 12;
 const MISFIT_SHARE: f64 = 0.8;
+/// The right eye's draws of a program seen before judging whether its geometry is its own.
+const CARRIED_JUDGED_AFTER: u64 = 24;
 
 /// The programs the eye matrix does not carry: each one's checked draws and those not found, and
 /// the programs judged misfits (drawn by each pass).
@@ -156,9 +184,24 @@ struct Misfits {
     misfits: HashSet<u32>,
     /// A checked frame's left-eye stretch rows by program.
     left: HashMap<u32, Vec<Rows>>,
+    /// The right eye's stretch draws by program, and those not among the left eye's ([`Carried`]).
+    carried: HashMap<u32, (u64, u64)>,
 }
 
 impl Misfits {
+    /// The right eye's draw of `program`, `found` among the left eye's draws or not. A program whose
+    /// draws mostly are not found draws other geometry in each pass (sprites and particles built
+    /// for each eye's view), not what one eye culled: drawn by each eye from then on, or the right
+    /// eye would show both its own and the left eye's copy.
+    fn carried(&mut self, program: u32, name: &str, found: bool) {
+        let (seen, missed) = self.carried.entry(program).or_default();
+        *seen += 1;
+        *missed += u64::from(!found);
+        if *seen >= CARRIED_JUDGED_AFTER && *missed as f64 > *seen as f64 * MISFIT_SHARE && self.misfits.insert(program) {
+            log!("single pass: program {program} ({name}) draws other geometry in each eye's pass ({missed} of {seen} of the right eye's draws not the left's): each eye draws it");
+        }
+    }
+
     /// The right eye's draw of `program` with `rows`, against the left eye's carried by `matrix`.
     fn check(&mut self, program: u32, name: &str, rows: &Rows, matrix: &Rows) {
         let found = self.left.get(&program).is_some_and(|left| left.iter().any(|l| eye_matrix::misfit(matrix, l, rows) <= eye_matrix::AGREES * 10.0));
@@ -292,6 +335,12 @@ struct State {
     /// where the right eye's pass looks next.
     left_queries: Vec<(u32, Rows)>,
     query_cursor: usize,
+    /// This frame's left-eye stretch draws made for both eyes ([`Carried`]).
+    carried: Carried,
+    /// The right eye's stretch draws the left eye's did not make, by program.
+    right_only_by: HashMap<u32, u64>,
+    /// The last matrix measured, to pair the passes' draws by when their order does not.
+    last_matrix: Option<Rows>,
     misfits: Misfits,
     /// The right eye's rows of the programs reading the scene's maps, learnt.
     screen: Learner,
@@ -342,6 +391,9 @@ fn state() -> State {
         own_by: HashMap::new(),
         left_queries: Vec::new(),
         query_cursor: 0,
+        carried: Carried::default(),
+        right_only_by: HashMap::new(),
+        last_matrix: None,
         misfits: Misfits::default(),
         screen: Learner::default(),
         map_arrays: HashMap::new(),
@@ -478,7 +530,14 @@ pub fn frame(on: bool) {
     let size = monaka_stereo::same_frame::gl::frame_size().unwrap_or((0, 0));
     state.size = (size.0 as i32, size.1 as i32);
     let pairs: Vec<(Rows, Rows)> = state.left.iter().zip(&state.right).filter(|(l, r)| l.0 == r.0).map(|(l, r)| (l.1, r.1)).collect();
-    let measured = if passes == 2 { eye_matrix::measure(&pairs) } else { None };
+    let mut measured = if passes == 2 { eye_matrix::measure(&pairs) } else { None };
+    if passes == 2 && measured.is_none() && let Some(last) = state.last_matrix.as_ref() {
+        measured = eye_matrix::measure_with(last, &state.left, &state.right);
+        state.counts.rematched += u64::from(measured.is_some());
+    }
+    if let Some(m) = &measured {
+        state.last_matrix = Some(m.matrix);
+    }
     if state.matrix.is_some() {
         state.counts.frames_on += 1;
     } else {
@@ -493,6 +552,7 @@ pub fn frame(on: bool) {
     state.misfits.left.clear();
     state.left_queries.clear();
     state.query_cursor = 0;
+    state.carried.by.clear();
     SHARING.store(false, Relaxed);
     state.world_depth = median(&mut state.depth_ratios);
     state.depth_ratios.clear();
@@ -562,6 +622,11 @@ pub fn frame(on: bool) {
             c.queries_shared as f64 / frames,
             queries.collect::<Vec<_>>().join(", ")
         );
+        log!("single pass: the right eye's stretch draws the left eye's pass did not make (culled for the left eye), drawn by the right eye's: {} ({:.1} a frame; by program: {}); the eye matrix paired by the last one in {} frames", c.right_only, c.right_only as f64 / frames, {
+            let mut by: Vec<_> = state.right_only_by.iter().map(|(p, n)| (*n, state.programs.get(p).map_or("?", |p| p.converted.name), *p)).collect();
+            by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            by.iter().take(12).map(|(n, name, p)| format!("{name} ({p}) {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
+        }, c.rematched);
         let (shared, own) = state.screen.counts();
         log!("single pass: programs reading the scene's maps: {shared} drawn for both eyes, {own} by each eye, the rest being learnt");
         log!("single pass: the right eye's stretch draws each eye draws itself, per frame by program: {}", {
@@ -1055,8 +1120,8 @@ fn give_right_eye(gl: &Gl, program: &mut Program, learner: &Learner, map_arrays:
 
 /// Whether the draw about to be made goes ahead (one of the right eye's pass already drawn is
 /// skipped).
-fn draw() -> bool {
-    let goes_ahead = draw_locked();
+fn draw(geometry: u64) -> bool {
+    let goes_ahead = draw_locked(geometry);
     match PENDING.load(Relaxed) {
         // A query of the right eye answered by the left eye's: nothing in it is drawn.
         PENDING_SHARED => false,
@@ -1077,14 +1142,14 @@ fn left_query(left: &[(u32, Rows)], cursor: &mut usize, matrix: &Rows, rows: &Ro
     Some(left[at].0)
 }
 
-fn draw_locked() -> bool {
+fn draw_locked(geometry: u64) -> bool {
     let mut guard = STATE.locked();
     let Some(state) = guard.as_mut() else { return true };
     if !state.live {
         return true;
     }
     if !PROFILING {
-        return draw_in(state);
+        return draw_in(state, geometry);
     }
     let started = Instant::now();
     if matches!(state.profile.part, 2 | 4) {
@@ -1096,7 +1161,7 @@ fn draw_locked() -> bool {
             entry.1 += 1;
         }
     }
-    let goes_ahead = draw_in(state);
+    let goes_ahead = draw_in(state, geometry);
     state.profile.draws[state.profile.part] += 1;
     let now = Instant::now();
     state.profile.ours += now - started;
@@ -1104,7 +1169,7 @@ fn draw_locked() -> bool {
     goes_ahead
 }
 
-fn draw_in(state: &mut State) -> bool {
+fn draw_in(state: &mut State, geometry: u64) -> bool {
     state.counts.draws += 1;
     let current = state.current;
     let rows = state.programs.get(&current).map(|p| p.rows);
@@ -1193,6 +1258,7 @@ fn draw_in(state: &mut State) -> bool {
             }
             set_switch(gl, program, true);
             state.counts.stereo += 1;
+            state.carried.by.entry((current, geometry)).or_default().push(eye_matrix::carry(&matrix, &rows));
             let query = ACTIVE_QUERY_ID.load(Relaxed);
             if query != 0 && state.left_queries.last().is_none_or(|(id, _)| *id != query) {
                 state.left_queries.push((query, rows));
@@ -1225,8 +1291,16 @@ fn draw_in(state: &mut State) -> bool {
                 return true;
             }
             if state.matrix.is_some() {
-                state.counts.skipped += 1;
-                return false;
+                let found = state.carried.has(current, geometry, &rows);
+                let name = state.programs.get(&current).map_or("?", |p| p.converted.name);
+                state.misfits.carried(current, name, found);
+                if found {
+                    state.counts.skipped += 1;
+                    return false;
+                }
+                // Culled for the left eye: the right eye's pass draws it into its own layer.
+                state.counts.right_only += 1;
+                *state.right_only_by.entry(current).or_default() += 1;
             }
             true
         }
@@ -1865,7 +1939,10 @@ macro_rules! draw_detour {
     ($name:ident, $original:ident, $type:ty, ($($arg:ident: $ty:ty),*)) => {
         unsafe extern "system" fn $name($($arg: $ty),*) {
             let flight = InFlight::enter();
-            if draw() {
+            // The draw's geometry: its call and arguments, the same for a mesh in both passes.
+            let mut geometry = stringify!($name).bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
+            $(geometry = (geometry ^ $arg as usize as u64).wrapping_mul(0x0000_0100_0000_01b3);)*
+            if draw(geometry) {
                 // SAFETY: forwards the game's own call.
                 unsafe { $original.get(&flight)($($arg),*) }
             }

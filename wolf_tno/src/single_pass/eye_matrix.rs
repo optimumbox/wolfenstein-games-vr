@@ -81,6 +81,18 @@ fn disagreement(e: &M, left: &Rows, right: &Rows) -> f64 {
     worst / scale
 }
 
+/// `e · left`: the rows a left-eye draw is carried to in the right eye.
+pub fn carry(e: &Rows, left: &Rows) -> Rows {
+    multiply(&widen(e), &widen(left)).map(|row| row.map(|v| v as f32))
+}
+
+/// How far rows `a` are from `b`, relative to `b`'s size.
+pub fn apart(a: &Rows, b: &Rows) -> f64 {
+    let scale = b.iter().flatten().fold(0.0f32, |s, v| s.max(v.abs())).max(1e-12);
+    let worst = a.iter().flatten().zip(b.iter().flatten()).fold(0.0f32, |s, (p, r)| s.max((p - r).abs()));
+    f64::from(worst / scale)
+}
+
 /// The largest disagreement a pair may have and still agree.
 pub const AGREES: f64 = 2e-4;
 /// Agreeing pairs needed for a matrix.
@@ -113,6 +125,19 @@ pub fn measure(pairs: &[(Rows, Rows)]) -> Option<Measured> {
     }
     let (e, agreeing) = best?;
     (agreeing >= LEAST_AGREEING).then(|| Measured { matrix: e.map(|row| row.map(|v| v as f32)), agreeing, looked_at: pairs.len() })
+}
+
+/// [`measure`] from the passes' recorded draws (`(program, rows)` each) paired by a known matrix
+/// `previous` rather than by their order: the passes cull for their own eye, so a draw only one
+/// of them makes shifts every pair after it and the frame's pairs disagree, though the matrix
+/// (the eyes' distance and frustums) is the same. Each right draw pairs with a left draw of its
+/// program that `previous` carries onto it; the matrix is measured afresh from those pairs.
+pub fn measure_with(previous: &Rows, left: &[(u32, Rows)], right: &[(u32, Rows)]) -> Option<Measured> {
+    let pairs: Vec<(Rows, Rows)> = right
+        .iter()
+        .filter_map(|(program, r)| left.iter().find(|(p, l)| p == program && misfit(previous, l, r) <= AGREES * 10.0).map(|(_, l)| (*l, *r)))
+        .collect();
+    measure(&pairs)
 }
 
 #[cfg(test)]
