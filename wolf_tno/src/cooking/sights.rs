@@ -18,13 +18,77 @@ use crate::providers::{camera_taken, held_item};
 use monaka_contract::gamepad::Gamepad;
 use monaka_core::options::Shared;
 use monaka_contract::protocol::HeadPose;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+/// The laser rifle's laser sight is on (the right stick's push up turns it on and off).
+static LASER_ON: AtomicBool = AtomicBool::new(false);
+/// The right stick is pushed up and has not come back yet.
+static LASER_PUSHED: AtomicBool = AtomicBool::new(false);
+/// The right stick's push up past this share of its range turns the laser sight on or off; back
+/// under the second, it can again.
+const LASER_PUSH: f32 = 0.7;
+const LASER_REST: f32 = 0.3;
+
+/// Whether the laser rifle's laser sight is on.
+pub fn laser_switched_on() -> bool {
+    LASER_ON.load(Relaxed)
+}
+
+/// Whether a push of the right stick to `y` (up positive, full 32767) with it `pushed` already turns
+/// the laser sight on or off, and whether it is pushed after it.
+pub fn laser_push(y: i16, pushed: bool) -> (bool, bool) {
+    let share = f32::from(y) / 32767.0;
+    match pushed {
+        false if share > LASER_PUSH => (true, true),
+        true if share < LASER_REST => (false, false),
+        _ => (false, pushed),
+    }
+}
+
+/// In the pad the game reads, with the laser rifle in the right hand: the right stick's push up
+/// turns its laser sight on and off, and goes no further (it would look up). The stick is read as
+/// the controller holds it: the pad the game reads has its up and down taken (the head looks).
+pub fn laser_switch(pad: &mut Gamepad) {
+    if !held_item::right_laser_switched() || camera_taken::controlled() || camera_taken::wheel() {
+        LASER_PUSHED.store(false, Relaxed);
+        return;
+    }
+    let y = monaka_pad::right_stick(250).map_or(pad.thumb_ry, |[_, y]| (y * 32767.0).round() as i16);
+    let (switch, pushed) = laser_push(y, LASER_PUSHED.load(Relaxed));
+    LASER_PUSHED.store(pushed, Relaxed);
+    if switch {
+        let on = !LASER_ON.fetch_xor(true, Relaxed);
+        monaka_producer::log!("sights: the laser rifle's laser sight turned {}", if on { "on" } else { "off" });
+    }
+    if pad.thumb_ry > 0 {
+        pad.thumb_ry = 0;
+    }
+}
 
 /// In the pad the game reads: the left trigger let go while it would only zoom ([`zooms`]).
 pub fn no_zoom(pad: &mut Gamepad) {
+    pad.left_trigger = left_pulled(pad.left_trigger, held_item::dual());
     if zooms(held_item::dual(), camera_taken::controlled() || camera_taken::mounted()) {
         pad.left_trigger = 0;
     }
 }
+
+/// The left trigger rests a little pulled (a finger on it reads ~36 of 255), which the game takes
+/// for a pull: with two guns it fires the left one on its own. With two guns the trigger reads
+/// pulled only past [`LEFT_PULLED`], as pulled from there.
+pub fn left_pulled(trigger: u8, dual: bool) -> u8 {
+    if !dual {
+        return trigger;
+    }
+    if trigger <= LEFT_PULLED {
+        return 0;
+    }
+    let share = f32::from(trigger - LEFT_PULLED) / f32::from(255 - LEFT_PULLED);
+    (share * 255.0).round() as u8
+}
+
+/// With two guns, the left trigger's rest (of 255): below it, not pulled.
+pub const LEFT_PULLED: u8 = 90;
 
 /// Whether the left trigger is the game's zoom: on foot with one gun. With two guns it fires the
 /// left one; on a mounted gun, in the mech or a car (another camera on the view) it is that

@@ -56,6 +56,8 @@ fn install_settings(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
         no_screen_shake(start.ledger, &exe, build);
     }
     no_screen_blur(start.ledger, &exe, build);
+    no_depth_of_field_or_glare(start.ledger, &exe);
+    pages_per_frame(start.ledger, &exe);
     log_streaming(&exe);
     gpu_decoding(start.ledger, &exe);
     hold_unique(start.ledger, &exe);
@@ -125,6 +127,24 @@ fn gpu_decoding(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
     log!("texture streaming: pages decoded on the GPU (vt_useCudaTranscode 1), held on while VR runs");
 }
 
+/// Texture pages streamed a frame while VR runs (`vt_maxPPF`, the game's 64). At 64 the streaming
+/// sat at its cap (about 200 page uploads a frame) whenever the player moved: what came into view,
+/// or nearer, waited at a coarser page, so distant surfaces looked low-resolution while moving and
+/// sharpened once still. The pages are decoded on the GPU ([`gpu_decoding`]); their uploads took
+/// about 0.01 ms a frame at the cap.
+const PAGES_PER_FRAME: i32 = 128;
+
+fn pages_per_frame(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
+    let Some(cvar) = Cvar::find(exe, "vt_maxPPF", eng_idt::Layout::ID_TECH_5) else { return };
+    let Some(was) = cvar.int(exe) else { return };
+    if was >= PAGES_PER_FRAME {
+        return;
+    }
+    if eng_idt::set_int(ledger, exe, cvar, PAGES_PER_FRAME, "texture pages stream at the game's own rate") {
+        log!("texture streaming: up to {PAGES_PER_FRAME} pages a frame while VR runs (vt_maxPPF, was {was})");
+    }
+}
+
 /// The largest `vt_pageImageSizeUnique` (the unique texture cache image) let through, or none.
 /// The game's texture cache on high (Vmtr 4096, Unique 8192) throttled the headset a minute into
 /// every run; Vmtr held at 2048 with Unique 8192 did the same, while Vmtr 4096 with Unique 4096 held
@@ -162,6 +182,14 @@ pub fn watch_streaming() {
     {
         cvar.set_int(exe, *most);
         log!("texture streaming: the game set vt_pageImageSizeUnique above {most}; held at {most} again");
+    }
+    if let Some((exe, held)) = POST_EFFECTS_HELD.get() {
+        for &(cvar, off) in held {
+            if cvar.int(exe).is_some_and(|v| v != off) {
+                cvar.set_int(exe, off);
+                log!("the game set {} back; {off} again", cvar.name);
+            }
+        }
     }
     let Some(w) = WATCHED.get() else { return };
     let Ok(mut seen) = w.seen.lock() else { return };
@@ -231,6 +259,26 @@ fn no_screen_blur(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module, bu
             eng_idt::set_int(ledger, exe, cvar, 0, "the screen blurs when the player is hit");
         }
     }
+}
+
+/// Depth of field off (`r_postProcessDofMode` 0, the mode the game itself starts with; -1, as
+/// guides say, drops the post-process pass and the scene with it, as does `r_skipAdaptiveGlare` 1):
+/// the depth blur is an image a few metres away in the headset. The game's options menu writes the
+/// mode back when its video settings are applied, so it is held ([`watch_streaming`]); the ledger puts the game's own back
+/// at the stop.
+const POST_EFFECTS: [(&str, i32); 1] = [("r_postProcessDofMode", 0)];
+static POST_EFFECTS_HELD: OnceLock<(Module, Vec<(&'static Cvar, i32)>)> = OnceLock::new();
+
+fn no_depth_of_field_or_glare(ledger: &mut monaka_producer::ledger::Ledger, exe: &Module) {
+    let mut held = Vec::new();
+    for (name, off) in POST_EFFECTS {
+        let Some(cvar) = Cvar::find(exe, name, eng_idt::Layout::ID_TECH_5) else { continue };
+        let game = cvar.int(exe);
+        eng_idt::set_int(ledger, exe, cvar, off, "the game's depth of field or adaptive glare stays");
+        log!("{name} {off} (the game's {}), held while VR runs", game.map_or("?".to_owned(), |v| v.to_string()));
+        held.push((cvar, off));
+    }
+    let _ = POST_EFFECTS_HELD.set((*exe, held));
 }
 
 /// The executable and `g_stopTime`, once the ledger holds it.

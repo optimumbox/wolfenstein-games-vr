@@ -243,6 +243,97 @@ pub fn aim_for(pose: &HeadPose) -> Option<[[f32; 2]; 2]> {
     AIMS.locked().iter().flatten().find(|(k, _)| *k == key).map(|&(_, tangents)| tangents)
 }
 
+/// Where a laser sight's beam starts along the barrel from where the hand holds the gun (metres):
+/// at the muzzle; from a known muzzle, just past it.
+pub const LASER_MUZZLE: f32 = 0.55;
+pub const LASER_PAST_MUZZLE: f32 = 0.02;
+/// How far a laser sight's beam reaches where its trace found nothing on the barrel (metres).
+pub const LASER_REACH: f32 = 30.0;
+
+/// A laser sight's beam in each eye: its ends (tangents: x right, y up from the eye's straight
+/// ahead; the muzzle, then where it stops) by eye, and whether it stops on something hit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Beam {
+    pub ends: [[[f32; 2]; 2]; 2],
+    pub hit: bool,
+}
+
+/// Where `point` is in each eye (tangents: x right, y up), seen from the eyes the engine puts
+/// `separation` units either side of the drawn view `drawn` (as [`aim_tangents`]). None if it is
+/// not ahead of an eye.
+pub fn point_tangents(point: [f32; 3], drawn: &[f32; 12], separation: f32) -> Option<[[f32; 2]; 2]> {
+    let dot = |a: [f32; 3], b: &[f32]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let (forward, left, up) = (&drawn[3..6], &drawn[6..9], &drawn[9..12]);
+    let mut tangents = [[0.0; 2]; 2];
+    for (eye, side) in [1.0f32, -1.0].into_iter().enumerate() {
+        let to: [f32; 3] = std::array::from_fn(|k| point[k] - (drawn[k] + side * separation * left[k]));
+        let ahead = dot(to, forward);
+        if !(ahead > 1.0) {
+            return None;
+        }
+        tangents[eye] = [-dot(to, left) / ahead, dot(to, up) / ahead];
+    }
+    tangents.iter().flatten().all(|v| v.is_finite()).then_some(tangents)
+}
+
+/// The beam of a laser sight on the barrel `origin` along unit `forward` (units) in each eye from
+/// the view `drawn`: from `start` metres along it to `hit` (or [`LASER_REACH`]).
+pub fn beam_tangents(origin: [f32; 3], forward: [f32; 3], hit: Option<f32>, start: f32, drawn: &[f32; 12], separation: f32, units_per_metre: f32) -> Option<Beam> {
+    let muzzle = start * units_per_metre;
+    let end = hit.unwrap_or(LASER_REACH * units_per_metre);
+    if !(end > muzzle) {
+        return None;
+    }
+    let at = |d: f32| std::array::from_fn::<f32, 3, _>(|k| origin[k] + d * forward[k]);
+    let (from, to) = (point_tangents(at(muzzle), drawn, separation)?, point_tangents(at(end), drawn, separation)?);
+    Some(Beam { ends: [[from[0], to[0]], [from[1], to[1]]], hit: hit.is_some() })
+}
+
+/// Whether the right gun shows its laser sight now: a weapon with one in hand (the laser rifle's
+/// while turned on, `cooking::sights::laser_switch`), on the player's own camera, its barrel traced
+/// lately.
+pub fn laser_on() -> bool {
+    use crate::providers::held_item;
+    crate::on(crate::GUNS_AT)
+        && (held_item::right_dotted() || (held_item::right_laser_switched() && crate::cooking::sights::laser_switched_on()) || crate::cooking::knife_throw::readied())
+        && !crate::providers::camera_taken::controlled()
+        && !crate::providers::camera_taken::camera_away()
+        && crate::providers::focus::barrel_hit().is_some()
+}
+
+/// The right gun's laser sight in each eye from the view `drawn` ([`beam_tangents`]), while on.
+fn laser_beam(drawn: &[f32; 12], separation: f32, units_per_metre: f32) -> Option<Beam> {
+    if !laser_on() {
+        return None;
+    }
+    let ((origin, axis), hit) = crate::providers::focus::barrel_hit()?;
+    if crate::cooking::knife_throw::readied() {
+        // A readied knife throw: a red dot only, where the blade's line hits.
+        let hit = hit?;
+        let point = std::array::from_fn(|k| origin[k] + hit * axis[k]);
+        let t = point_tangents(point, drawn, separation)?;
+        return Some(Beam { ends: [[t[0], t[0]], [t[1], t[1]]], hit: true });
+    }
+    // The barrel traced from the muzzle where it is known, else from the hand.
+    let start = if crate::providers::held_item::right_muzzle().is_some() { LASER_PAST_MUZZLE } else { LASER_MUZZLE };
+    beam_tangents(origin, [axis[0], axis[1], axis[2]], hit, start, drawn, separation, units_per_metre)
+}
+
+/// The laser sight's beam at the last few view builds, by the frame's pose.
+static BEAMS: Mutex<[Option<(PoseKey, Beam)>; 4]> = Mutex::new([None; 4]);
+static BEAM_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// The laser sight's beam at the view build of the frame with head pose `pose`, if kept and shown.
+pub fn beam_for(pose: &HeadPose) -> Option<Beam> {
+    let key = pose_key(pose);
+    BEAMS.locked().iter().flatten().find(|(k, _)| *k == key).map(|&(_, beam)| beam)
+}
+
+fn keep_beam(pose: &HeadPose, beam: Option<Beam>) {
+    let at = BEAM_NEXT.fetch_add(1, Relaxed) % 4;
+    BEAMS.locked()[at] = beam.map(|b| (pose_key(pose), b));
+}
+
 fn keep_aim(pose: &HeadPose, tangents: Option<[[f32; 2]; 2]>) {
     let at = AIM_NEXT.fetch_add(1, Relaxed) % 4;
     AIMS.locked()[at] = tangents.map(|t| (pose_key(pose), t));
@@ -486,6 +577,9 @@ static DLSS_TICKETS: Mutex<Tickets<Option<GlDlssFrame>>> = Mutex::new(Tickets::n
 static DLSS_SHOWING: Mutex<Option<monaka_core::ticket::Ticket<Option<GlDlssFrame>>>> = Mutex::new(None);
 /// Frames built with DLSS without how both eyes were drawn (logged the first few).
 static DLSS_UNRENDERED: AtomicU64 = AtomicU64::new(0);
+/// How both eyes of the frame the last `SwapBuffers` showed were drawn: a present with no view
+/// build before the last one shows that build's views drawn again (the same cameras and jitter).
+static DLSS_LAST: Mutex<Option<GlDlssFrame>> = Mutex::new(None);
 /// Each frame built with frame warping: its eye, pose and how it was rendered, in step with the
 /// loop's tickets (one each per built frame, taken at the same `SwapBuffers`).
 static WARP_TICKETS: Mutex<Tickets<WarpFacts>> = Mutex::new(Tickets::new(4));
@@ -741,6 +835,8 @@ pub unsafe extern "system" fn view_builder(this: usize, views: usize, a: usize, 
                             .then(|| aim_tangents(&own.origin_axis, &turned.origin_axis, separation, AIM_DISTANCE * setup.config.units_per_metre))
                             .flatten();
                         keep_aim(pose, aim);
+                        // The marksman rifle's laser sight, from its muzzle to where its barrel hits.
+                        keep_beam(pose, laser_beam(&turned.origin_axis, separation, setup.config.units_per_metre));
                         // The head's shift and turn from the camera the eyes are built on, for
                         // what is worn on the view to follow (and the arms, on the player's own).
                         let own_camera = !crate::providers::camera_taken::controlled() && !crate::providers::camera_taken::camera_away();
@@ -848,11 +944,28 @@ pub fn arm_dlss(quality: monaka_dlss11::Quality) {
 /// taken in step with the loop's, as [`warp_shot`]), or none for a frame without that.
 pub fn dlss_frame() -> Option<GlDlssFrame> {
     let newest = DLSS_TICKETS.locked().show().ticket;
-    let ticket = std::mem::replace(&mut *DLSS_SHOWING.locked(), newest)?;
-    let frame = ticket.extra;
-    if frame.is_none() && DLSS_UNRENDERED.fetch_add(1, Relaxed) < 5 {
-        log!("DLSS: a frame without both eyes' cameras and projections; resampled");
-    }
+    let showing = std::mem::replace(&mut *DLSS_SHOWING.locked(), newest);
+    let mut last = DLSS_LAST.locked();
+    let frame = match showing {
+        Some(ticket) => {
+            if ticket.extra.is_none() && DLSS_UNRENDERED.fetch_add(1, Relaxed) < 5 {
+                log!("DLSS: a frame without both eyes' cameras and projections; resampled");
+            }
+            ticket.extra
+        }
+        // The game thread built no views before the last present (it fell behind the render
+        // thread): the engine drew the last build's views again. They were resampled from the
+        // render size (a fifth of the frames while the game thread lagged: a soft picture while
+        // moving); DLSS takes them with the cameras they were drawn with.
+        None => {
+            static AGAIN: AtomicBool = AtomicBool::new(false);
+            if last.is_some() && !AGAIN.swap(true, Relaxed) {
+                log!("DLSS: a frame drawn again from the last view build: upscaled with its cameras (not resampled)");
+            }
+            *last
+        }
+    };
+    *last = frame;
     frame
 }
 

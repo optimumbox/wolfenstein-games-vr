@@ -3,9 +3,12 @@
 pub mod archive;
 pub mod calls;
 pub mod convert;
+pub mod cull;
+pub mod decals;
 pub mod draws;
 pub mod gl_api;
 pub mod layers;
+pub mod motion;
 pub mod pieces;
 pub mod program_cache;
 pub mod eye_matrix;

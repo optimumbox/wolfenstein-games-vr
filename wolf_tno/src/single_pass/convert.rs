@@ -685,5 +685,7 @@ pub fn outputs(fragment: &str) -> Vec<String> {
         .collect()
 }
 
+pub mod motion;
+
 #[cfg(test)]
 mod tests;

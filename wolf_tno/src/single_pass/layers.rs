@@ -65,7 +65,8 @@ pub struct Layers {
     /// Both eyes' scene depth side by side (a one-layer array twice the eye's width, and its 2D view).
     depth_pair: Option<(u32, u32)>,
     /// A copy of an eye texture's both layers ([`Self::keep`]): the eye texture, and the array.
-    kept: Option<(u32, u32)>,
+    /// The kept self-shadow: the eye texture, our array, and the 2D view of its layer 1.
+    kept: Option<(u32, u32, u32)>,
 }
 
 /// An attachment of an engine framebuffer.
@@ -235,6 +236,13 @@ impl Layers {
         Ok(framebuffer)
     }
 
+    /// The scene depth's array and the eye size, when engine framebuffer `framebuffer` draws with it.
+    pub fn scene_depth(&self, framebuffer: u32) -> Option<(u32, (i32, i32))> {
+        let depth = self.depth?;
+        let eye = self.textures.get(&depth)?;
+        self.attaches(framebuffer, depth).then_some((eye.array, eye.size))
+    }
+
     /// The engine framebuffers stood in for, with ours.
     pub fn stand(&self, framebuffer: u32) -> Option<Stand> {
         self.framebuffers.get(&framebuffer).copied()
@@ -350,13 +358,13 @@ impl Layers {
     pub fn keep(&mut self, gl: &Gl, texture: u32) -> Option<u32> {
         let eye = self.textures.get(&texture)?;
         let array = match self.kept {
-            Some((kept, array)) if kept == texture => array,
+            Some((kept, array, _)) if kept == texture => array,
             _ => {
-                if let Some((_, old)) = self.kept.take() {
-                    // SAFETY: our own texture.
-                    unsafe { (gl.delete_textures)(1, &old) };
+                if let Some((_, old, view)) = self.kept.take() {
+                    // SAFETY: our own textures.
+                    unsafe { (gl.delete_textures)(2, [view, old].as_ptr()) };
                 }
-                let mut array = 0;
+                let (mut array, mut view) = (0, 0);
                 // SAFETY: a new texture of ours, with storage and sampling like the eye texture's array.
                 unsafe {
                     (gl.create_textures)(GL_TEXTURE_2D_ARRAY, 1, &mut array);
@@ -364,8 +372,13 @@ impl Layers {
                     for pname in SAMPLING {
                         (gl.texture_parameter_i)(array, pname, texture_parameter(gl, eye.array, pname));
                     }
+                    (gl.gen_textures)(1, &mut view);
+                    (gl.texture_view)(view, GL_TEXTURE_2D, array, eye.format, 0, 1, 1, 1);
+                    for pname in SAMPLING {
+                        (gl.texture_parameter_i)(view, pname, texture_parameter(gl, eye.array, pname));
+                    }
                 }
-                self.kept = Some((texture, array));
+                self.kept = Some((texture, array, view));
                 array
             }
         };
@@ -378,7 +391,12 @@ impl Layers {
 
     /// The array [`Self::keep`] last copied into, once made.
     pub fn kept(&self) -> Option<u32> {
-        self.kept.map(|(_, array)| array)
+        self.kept.map(|(_, array, _)| array)
+    }
+
+    /// The right eye's layer of the kept self-shadow ([`Self::keep`]) as a 2D texture.
+    pub fn kept_right(&self) -> Option<u32> {
+        self.kept.map(|(_, _, view)| view)
     }
 
     /// The copy of the scene depth's layer ([`Self::depth_copy`]), once made.
@@ -389,7 +407,7 @@ impl Layers {
     /// Every object of ours deleted.
     pub fn release(&mut self, gl: &Gl) {
         let framebuffers: Vec<u32> = self.framebuffers.values().flat_map(|s| s.layered.into_iter().chain(s.layer)).collect();
-        let textures: Vec<u32> = self.textures.values().flat_map(|t| std::iter::once(t.array).chain(t.views)).chain(self.depth_copy.take().into_iter().flat_map(|(a, v)| [v, a])).chain(self.depth_pair.take().into_iter().flat_map(|(a, v)| [v, a])).chain(self.kept.take().map(|(_, a)| a)).collect();
+        let textures: Vec<u32> = self.textures.values().flat_map(|t| std::iter::once(t.array).chain(t.views)).chain(self.depth_copy.take().into_iter().flat_map(|(a, v)| [v, a])).chain(self.depth_pair.take().into_iter().flat_map(|(a, v)| [v, a])).chain(self.kept.take().into_iter().flat_map(|(_, a, v)| [v, a])).collect();
         // SAFETY: our own objects, unbound by the caller.
         unsafe {
             (gl.delete_framebuffers)(framebuffers.len() as i32, framebuffers.as_ptr());

@@ -53,16 +53,31 @@ struct Sample {
     at: usize,
     caller: usize,
     phase: u8,
+    /// The single pass's part of the frame, and the draws made so far.
+    part: u8,
+    draws: u64,
 }
+
+/// Whether the sampler runs this run: asked for, or a single-pass profiling build.
+fn wanted() -> bool {
+    super::options().profile || crate::single_pass::draws::profiling()
+}
+
+/// The draws made at each `SwapBuffers` while sampling, in order.
+static SWAPS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+static SAMPLING: AtomicBool = AtomicBool::new(false);
 
 /// The render thread's phase from here on.
 pub fn phase(phase: Phase) {
     PHASE.store(phase as u8, Relaxed);
+    if phase == Phase::Monaka && SAMPLING.load(Relaxed) {
+        SWAPS.locked().push(crate::single_pass::draws::DRAWS_MADE.load(Relaxed));
+    }
 }
 
 /// Each frame on the game thread (the view builder): which thread that is.
 pub fn game_thread() {
-    if super::options().profile && GAME_THREAD.load(Relaxed) == 0 {
+    if wanted() && GAME_THREAD.load(Relaxed) == 0 {
         // SAFETY: the calling thread's own id.
         GAME_THREAD.store(unsafe { GetCurrentThreadId() }, Relaxed);
     }
@@ -70,7 +85,7 @@ pub fn game_thread() {
 
 /// At each SwapBuffers (render thread): starts the sampler once gameplay has run [`SETTLE`].
 pub fn frame() {
-    if !super::options().profile || STARTED.load(Relaxed) || crate::providers::eye_site::builds() == 0 {
+    if !wanted() || STARTED.load(Relaxed) || crate::providers::eye_site::builds() == 0 {
         return;
     }
     let first = *FIRST.locked().get_or_insert_with(Instant::now);
@@ -109,6 +124,8 @@ fn sample(render: u32, game: u32) {
     let mut stack = vec![0u8; STACK_SCAN];
     let mut context = CONTEXT { ContextFlags: CONTEXT_CONTROL_AMD64, ..Default::default() };
     let before = thread_times();
+    SWAPS.locked().reserve(SPAN.as_secs() as usize * 400);
+    SAMPLING.store(true, Relaxed);
     let started = Instant::now();
     'rounds: while started.elapsed() < SPAN {
         for thread in &mut threads {
@@ -120,6 +137,8 @@ fn sample(render: u32, game: u32) {
                 break 'rounds;
             }
             let phase = PHASE.load(Relaxed);
+            let part = crate::single_pass::draws::profile_part() as u8;
+            let draws = crate::single_pass::draws::DRAWS_MADE.load(Relaxed);
             // SAFETY: the stopped thread's context into our local.
             let read = unsafe { GetThreadContext(thread.handle, &mut context) }.is_ok();
             let mut caller = 0;
@@ -136,12 +155,14 @@ fn sample(render: u32, game: u32) {
             // SAFETY: the thread stopped above.
             unsafe { ResumeThread(thread.handle) };
             if read {
-                thread.samples.push(Sample { at: context.Rip as usize, caller, phase });
+                thread.samples.push(Sample { at: context.Rip as usize, caller, phase, part, draws });
             }
         }
         std::thread::sleep(GAP);
     }
     let took = started.elapsed();
+    SAMPLING.store(false, Relaxed);
+    let swaps = std::mem::take(&mut *SWAPS.locked());
     let after = thread_times();
     let names = ModuleNames::now();
     log_threads(&names, &before, &after, took, render, game);
@@ -151,6 +172,9 @@ fn sample(render: u32, game: u32) {
             let _ = CloseHandle(thread.handle);
         }
         report(thread.name, &exe, &names, &thread.samples, took, thread.name == "render");
+        if thread.name == "render" {
+            report_parts(&exe, &names, &thread.samples, &swaps);
+        }
     }
 }
 
@@ -300,6 +324,64 @@ fn log_threads(names: &ModuleNames, before: &HashMap<u32, (Duration, usize)>, af
             None => format!("{start:#x}"),
         };
         log!("  {share:5.1}%  thread {id}{role} from {start}");
+    }
+}
+
+/// The render thread's rendering by the single pass's part of the frame, the right eye's rest
+/// split at its last draw: where the time from the frame's last draw to its `SwapBuffers` goes.
+fn report_parts(exe: &Module, names: &ModuleNames, samples: &[Sample], swaps: &[u64]) {
+    let rendering: Vec<&Sample> = samples.iter().filter(|s| s.phase == Phase::Game as u8).collect();
+    let total = samples.len().max(1) as f64;
+    let share = |count: usize| count as f64 * 100.0 / total;
+    let place = |address: usize| match names.of(address) {
+        Some((m, name)) if m == exe => format!("{name}+{:#x}", address - m.base()),
+        Some((m, name)) => match nearest_export(m, address) {
+            Some((export, offset)) => format!("{name}!{export}+{offset:#x}"),
+            None => format!("{name}+{:#x}", address - m.base()),
+        },
+        None => format!("{address:#x}"),
+    };
+    // After the frame's last draw: no draw made between the sample and the next swap.
+    let after_last = |s: &Sample| {
+        let next = swaps.partition_point(|&at| at < s.draws);
+        swaps.get(next).is_some_and(|&at| at == s.draws)
+    };
+    let labels = ["before the left pass", "left stretch", "left rest", "right stretch", "right rest, to its last draw"];
+    log!("probe_profile: render: the game's rendering by the single pass's part of the frame ({} swaps seen)", swaps.len());
+    let mut gap = Vec::new();
+    let mut by_part = [0usize; 5];
+    for s in &rendering {
+        if after_last(s) {
+            gap.push(*s);
+        } else {
+            by_part[usize::from(s.part).min(4)] += 1;
+        }
+    }
+    for (label, count) in labels.iter().zip(by_part) {
+        log!("  {:5.1}%  {label}", share(count));
+    }
+    let waiting = gap.iter().filter(|s| is_wait(&place(s.at))).count();
+    log!("  {:5.1}%  after the frame's last draw, to its SwapBuffers ({:.1}% of it in a kernel wait)", share(gap.len()), waiting as f64 * 100.0 / gap.len().max(1) as f64);
+    let mut by_module: HashMap<String, usize> = HashMap::new();
+    let mut by_place: HashMap<usize, usize> = HashMap::new();
+    let mut by_caller: HashMap<(String, usize), usize> = HashMap::new();
+    for s in &gap {
+        *by_module.entry(names.name(s.at)).or_default() += 1;
+        *by_place.entry(s.at & !0x3f).or_default() += 1;
+        *by_caller.entry((names.name(s.at), s.caller)).or_default() += 1;
+    }
+    log!("probe_profile: render: after the frame's last draw, by module");
+    for (name, count) in top(by_module, 8) {
+        log!("  {:5.1}%  {name}", share(count));
+    }
+    log!("probe_profile: render: after the frame's last draw, busiest places");
+    for (at, count) in top(by_place, 15) {
+        log!("  {:5.1}%  {}", share(count), place(at));
+    }
+    log!("probe_profile: render: after the frame's last draw, by module and the game's return address");
+    for ((module, caller), count) in top(by_caller, 15) {
+        let caller = if caller == 0 { "(none on the stack)".to_owned() } else { format!("exe+{:#x}", caller - exe.base()) };
+        log!("  {:5.1}%  {module} from {caller}", share(count));
     }
 }
 

@@ -224,6 +224,11 @@ pub fn on_mounted_gun() -> bool {
 /// while the weapon wheel is open with the game's pad on, or while a menu holds the player's
 /// control with no other camera on the view (the journal). The player's view update then leaves
 /// the view angles alone, so the camera keeps the share it had and the head looks around it.
+/// Whether the weapon wheel is open (at the last view camera asked).
+pub fn wheel() -> bool {
+    WHEEL.load(Acquire)
+}
+
 pub fn holds() -> bool {
     let menu = (WHEEL.load(Acquire) && crate::on(crate::GAMEPAD_AT)) || (INHIBITED.load(Acquire) && !CONTROLLED.load(Acquire));
     mounted() || (menu && fresh())

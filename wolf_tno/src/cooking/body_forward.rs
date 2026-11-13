@@ -142,7 +142,10 @@ pub fn pad(pad: &mut Gamepad) {
         menu_stick(pad);
         return;
     }
+    // The stick as pushed, for a ladder's (`ladder::pad`, last).
+    let pushed = (pad.thumb_lx, pad.thumb_ly);
     crate::cooking::sights::no_zoom(pad);
+    crate::cooking::sights::laser_switch(pad);
     crate::cooking::journal::pad(pad);
     // The knife's throw reads the trigger before the swings let go of it.
     crate::cooking::knife_throw::pad(pad);
@@ -150,7 +153,16 @@ pub fn pad(pad: &mut Gamepad) {
     snap(pad);
     let share = look::baked::<Wolf>(None);
     let share_out = head_share_out();
-    let out = match (share_out == 0.0, TURNS.load(Relaxed), share) {
+    // Another camera or a control camera has the view (a rope or ladder climbed, a grab): the
+    // game reads the stick against its own camera, so it goes as pushed (turned by the head's
+    // heading, up the rope became sideways).
+    let controlled = camera_taken::controlled();
+    scene_look(pad, controlled);
+    let out = match (share_out == 0.0 || controlled, TURNS.load(Relaxed), share) {
+        (true, ..) if controlled && share_out != 0.0 => {
+            BODY.locked().reset();
+            None
+        }
         // On the head's heading: as pushed (the head steers, physical turns with it).
         (true, ..) => None,
         (false, true, Some(share)) => Some(BODY.locked().follow(share.yaw, Instant::now())),
@@ -167,6 +179,9 @@ pub fn pad(pad: &mut Gamepad) {
     }
     // Last, on the game camera's own heading: room-scale following's push.
     crate::cooking::room_scale::pad(pad);
+    wheel_stick(pad);
+    // On a ladder: up and down only, as pushed.
+    crate::providers::ladder::pad(pad, pushed);
 }
 
 /// A stick past this share of its range is a menu step, held until it is back under
@@ -258,3 +273,35 @@ pub fn turned_stick(x: i16, y: i16, yaw: f32) -> (i16, i16) {
 
 #[cfg(test)]
 mod tests;
+
+/// Another camera has the view (a scene, not a mounted gun or a machine): the right stick's up and
+/// down go to the game as pushed (the pad the game reads has them taken for the head, which the
+/// scene does not follow): a scene that waits on the player looking (getting up) gets it.
+fn scene_look(pad: &mut Gamepad, controlled: bool) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !controlled || camera_taken::mounted() {
+        return;
+    }
+    if let Some([_, y]) = monaka_pad::right_stick(250) {
+        pad.thumb_ry = (y.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        if pad.thumb_ry != 0 && !LOGGED.swap(true, Relaxed) {
+            monaka_producer::log!("look: another camera has the view: the right stick's up and down go to the game");
+        }
+    }
+}
+
+/// The weapon wheel open: the right stick goes to the game whole, as pushed, every direction picking
+/// (nothing else reads it then: no snap turn, no laser switch, no head's take of its up and down).
+fn wheel_stick(pad: &mut Gamepad) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !camera_taken::wheel() {
+        return;
+    }
+    if let Some([x, y]) = monaka_pad::right_stick(250) {
+        let axis = |v: f32| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        (pad.thumb_rx, pad.thumb_ry) = (axis(x), axis(y));
+        if (x != 0.0 || y != 0.0) && !LOGGED.swap(true, Relaxed) {
+            monaka_producer::log!("weapon wheel: the right stick picks in every direction, as pushed");
+        }
+    }
+}

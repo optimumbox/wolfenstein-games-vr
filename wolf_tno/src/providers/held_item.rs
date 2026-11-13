@@ -62,7 +62,10 @@ impl HeldItems for Wolf {
         let [f0, f1, f2, l0, l1, l2, u0, u1, u2] = gun.axis;
         let [o0, o1, o2] = gun.origin;
         let holder: Mat34 = [f0, l0, u0, o0, f1, l1, u1, o1, f2, l2, u2, o2];
-        let line = WorldLine { from: gun.origin, along: [f0, f1, f2], length: None, edge: None };
+        // From the sights: the beam the game draws from the muzzle runs along the shot.
+        let from = aimed_origin(&gun);
+        let [a0, a1, a2, ..] = aimed_axis(&gun);
+        let line = WorldLine { from, along: [a0, a1, a2], length: None, edge: None };
         Some(InWorld { holder, line: Some(line), posed: gun.at })
     }
 }
@@ -127,6 +130,144 @@ pub fn right_throws_knives() -> bool {
 /// (`engine::AIMED_BY_FOCUS`).
 pub fn right_aimed_by_focus() -> bool {
     RIGHT_NAME.locked().1.as_deref().is_some_and(|n| engine::AIMED_BY_FOCUS.contains(&n))
+}
+
+/// A muzzle offset (units, forward, left, up from the hand tag) that can be one: finite, ahead of
+/// the hand, within 2 m of it and near its forward axis (not the head behind it).
+pub fn muzzle_offset_ok(offset: [f32; 3]) -> bool {
+    let length = offset.iter().map(|v| v * v).sum::<f32>().sqrt();
+    offset.iter().all(|v| v.is_finite()) && offset[0] > 1.0 && length < 80.0 && offset[1].abs() < 20.0 && offset[2].abs() < 20.0
+}
+
+/// `point` in the frame of the placement `origin` with axis rows `axis` (forward, left, up).
+pub fn in_frame(origin: [f32; 3], axis: &[f32; 9], point: [f32; 3]) -> [f32; 3] {
+    let to: [f32; 3] = std::array::from_fn(|k| point[k] - origin[k]);
+    std::array::from_fn(|r| to[0] * axis[3 * r] + to[1] * axis[3 * r + 1] + to[2] * axis[3 * r + 2])
+}
+
+/// Each gun's muzzle (by decl), as its shots showed it: where the game started a shot from it,
+/// from its hand tag (units: forward, left, up).
+static MUZZLES: Mutex<Vec<(usize, [f32; 3])>> = Mutex::new(Vec::new());
+
+/// The game started a shot of the gun placed as `gun` at `start`: where it is from the hand tag
+/// learned as the gun's muzzle, if it can be one (the first time logged).
+pub fn learn_muzzle(gun: &Placed, start: [f32; 3]) {
+    let Some(decl) = mem::read::<usize>(gun.weapon + engine::INVENTORY_ITEM_DECL).filter(|&d| d != 0) else { return };
+    let offset = in_frame(gun.origin, &gun.axis, start);
+    let ok = muzzle_offset_ok(offset);
+    let mut muzzles = MUZZLES.locked();
+    let known = muzzles.iter().position(|&(d, _)| d == decl);
+    if known.is_none() {
+        log!(
+            "guns: {} shoots from {offset:.1?} off its hand tag (forward, left, up): {}",
+            decl_name(decl).as_deref().unwrap_or("a gun"),
+            if ok { "its muzzle, its barrel line starts there" } else { "not its muzzle, its barrel line stays at the hand" }
+        );
+    }
+    match (known, ok) {
+        (Some(i), true) => muzzles[i].1 = offset,
+        (None, true) => muzzles.push((decl, offset)),
+        (None, false) => muzzles.push((decl, [f32::NAN; 3])),
+        (Some(_), false) => {}
+    }
+}
+
+/// Where `offset` (forward, left, up) from the placement `origin` with axis rows `axis` is.
+pub fn offset_point(origin: [f32; 3], axis: &[f32; 9], offset: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|k| origin[k] + offset[0] * axis[k] + offset[1] * axis[3 + k] + offset[2] * axis[6 + k])
+}
+
+/// Where the muzzle of the gun placed as `gun` is, for a gun whose shots and laser leave from it
+/// (`engine::AIMED_BY_FOCUS`: a beam the game draws from it, a laser sight), once its shots showed
+/// it ([`learn_muzzle`]). None before, and for other guns: they go from the hand.
+pub fn muzzle(gun: &Placed) -> Option<[f32; 3]> {
+    let decl = mem::read::<usize>(gun.weapon + engine::INVENTORY_ITEM_DECL).filter(|&d| d != 0)?;
+    let offset = MUZZLES.locked().iter().find(|&&(d, _)| d == decl).map(|&(_, o)| o)?;
+    if !muzzle_offset_ok(offset) || !decl_name(decl).is_some_and(|n| engine::AIMED_BY_FOCUS.contains(&n.as_str())) {
+        return None;
+    }
+    Some(offset_point(gun.origin, &gun.axis, offset))
+}
+
+/// The axis rows (forward, left, up) `axis` turned up by `degrees` about its left axis.
+pub fn pitched(axis: &[f32; 9], degrees: f32) -> [f32; 9] {
+    let (s, c) = degrees.to_radians().sin_cos();
+    let mut out = *axis;
+    for k in 0..3 {
+        out[k] = c * axis[k] + s * axis[6 + k];
+        out[6 + k] = c * axis[6 + k] - s * axis[k];
+    }
+    out
+}
+
+/// The last weapon asked of [`sight_line`] and its answer.
+static SIGHT_LINE_OF: Mutex<(usize, (f32, f32))> = Mutex::new((0, (0.0, 0.0)));
+
+/// How `weapon`'s (an `idWeapon`'s) sights sit off its hand tag's forward axis: degrees above it
+/// they point, metres above it they sit (`engine::SIGHT_LINE`; none: along the axis).
+pub fn sight_line(weapon: usize) -> (f32, f32) {
+    if weapon == 0 {
+        return (0.0, 0.0);
+    }
+    let mut last = SIGHT_LINE_OF.locked();
+    if last.0 != weapon {
+        let name = mem::read::<usize>(weapon + engine::INVENTORY_ITEM_DECL).filter(|&d| d != 0).and_then(decl_name);
+        let line = name.as_deref().and_then(|n| engine::SIGHT_LINE.iter().find(|(w, ..)| *w == n)).map_or((0.0, 0.0), |&(_, p, h)| (p, h));
+        if line != (0.0, 0.0) {
+            log!("guns: {} shoots along its sights: {} degrees up from its hand's axis, {} m above it", name.as_deref().unwrap_or("a gun"), line.0, line.1);
+        }
+        *last = (weapon, line);
+    }
+    last.1
+}
+
+/// How many degrees above its hand tag's forward axis `weapon` aims along its sights.
+pub fn aim_pitch(weapon: usize) -> f32 {
+    sight_line(weapon).0
+}
+
+/// The axis rows the gun placed as `gun` aims along: its sights' ([`sight_line`]).
+pub fn aimed_axis(gun: &Placed) -> [f32; 9] {
+    match aim_pitch(gun.weapon) {
+        0.0 => gun.axis,
+        degrees => pitched(&gun.axis, degrees),
+    }
+}
+
+/// Where the gun placed as `gun` shoots from: its muzzle where known, else its sight line's start
+/// over the hand ([`sight_line`]), else the hand.
+pub fn aimed_origin(gun: &Placed) -> [f32; 3] {
+    if let Some(muzzle) = muzzle(gun) {
+        return muzzle;
+    }
+    let up = sight_line(gun.weapon).1 * SETUP.get().map_or(crate::eyes::UNITS_PER_METRE, |s| s.units_per_metre);
+    std::array::from_fn(|k| gun.origin[k] + up * gun.axis[6 + k])
+}
+
+/// The right gun's muzzle as last placed ([`muzzle`]).
+pub fn right_muzzle() -> Option<[f32; 3]> {
+    PLACED.locked()[RIGHT_HAND].as_ref().and_then(muzzle)
+}
+
+/// Whether the right hand's item, as last placed, has the mod's laser sight (`engine::DOTTED`).
+pub fn right_dotted() -> bool {
+    RIGHT_NAME.locked().1.as_deref().is_some_and(|n| engine::DOTTED.contains(&n))
+}
+
+/// Whether the right hand's item, as last placed, has a laser sight the right stick turns on and
+/// off: every gun (not `engine::NOT_LASER_SWITCHED`).
+pub fn right_laser_switched() -> bool {
+    laser_switched(RIGHT_NAME.locked().1.as_deref())
+}
+
+/// Whether the right hand's item, as last placed, is the weapon named `name` (a decl name).
+pub fn right_named(name: &str) -> bool {
+    RIGHT_NAME.locked().1.as_deref() == Some(name)
+}
+
+/// Whether the weapon named `name` (a decl name) has a laser sight the right stick switches.
+pub fn laser_switched(name: Option<&str>) -> bool {
+    name.is_some_and(|n| n.starts_with("weapon/") && !engine::NOT_LASER_SWITCHED.iter().any(|part| n.contains(part)))
 }
 
 /// Whether the right hand's item is carried in both hands from its middle
@@ -333,7 +474,19 @@ pub fn item_at(setup: &Setup, tracked: &(Mat34, HeadPose), hands: usize, side: u
         let grip = if setup.synthetic { palm(side, head, true) } else { monaka_body::controllers::grip(side) };
         return melee_at(&gun_in_world(space, &grip?, setup.units_per_metre)?);
     }
-    gun_at(setup, tracked, side)
+    let placed = gun_at(setup, tracked, side)?;
+    if side != RIGHT_HAND {
+        return Some(placed);
+    }
+    Some(lowered(placed, right_decl(setup.layout, hands).and_then(decl_name).as_deref(), setup.units_per_metre))
+}
+
+/// A gun placed at `(origin, axis)` moved down its own up axis by its [`engine::LOWERED`] drop,
+/// for the weapon named `name`, in an engine of `units_per_metre`.
+pub fn lowered((origin, axis): ([f32; 3], [f32; 9]), name: Option<&str>, units_per_metre: f32) -> ([f32; 3], [f32; 9]) {
+    let Some(&(_, metres)) = name.and_then(|n| engine::LOWERED.iter().find(|(w, _)| *w == n)) else { return (origin, axis) };
+    let down = metres * units_per_metre;
+    (std::array::from_fn(|k| origin[k] - down * axis[6 + k]), axis)
 }
 
 /// Where a melee weapon goes, held by the controller grip whose frame is `(origin, axis)` (world
@@ -491,7 +644,14 @@ pub unsafe extern "system" fn place_item(item: usize, hands: usize) {
     // along the player's view: along the gun instead, the view's axis is the gun's for the placement.
     let gun = moved.filter(|_| weapon != 0).zip(SETUP.get());
     match (tag_side, gun) {
-        (Some(_), Some(((_, (_, axis)), setup))) => along_gun(setup.layout, hands, &axis, place),
+        (Some(_), Some(((_, (_, axis)), setup))) => {
+            // Along its sights where they point off its axis (`aim_pitch`).
+            let axis = match aim_pitch(weapon) {
+                0.0 => axis,
+                degrees => pitched(&axis, degrees),
+            };
+            along_gun(setup.layout, hands, &axis, place)
+        }
         (Some(_), None) => place(),
         // On no hand's tag (goggles worn): placed on the player's view, which follows the head.
         (None, _) => {

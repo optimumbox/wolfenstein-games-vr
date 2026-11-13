@@ -12,6 +12,7 @@ pub(crate) mod follow_head;
 pub(crate) mod head_conformance;
 pub(crate) mod held_item;
 pub(crate) mod hud_pieces;
+pub(crate) mod ladder;
 pub(crate) mod look;
 pub(crate) mod melee;
 pub(crate) mod pad_connected;

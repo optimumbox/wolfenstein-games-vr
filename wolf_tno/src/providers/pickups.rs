@@ -28,6 +28,15 @@ const LABEL: &[u8] = b"monaka: pickups\0";
 /// The executable's base, this build's pickup facts and its entities, from the install.
 static FACTS: OnceLock<(usize, &'static Pickups, Entities)> = OnceLock::new();
 
+/// The soldiers' armour pieces (`idProp_AIArmor`) found in the entity table: (number, entity),
+/// looked for again every [`ARMOR_SCAN_THINKS`] thinks.
+static ARMOR_PIECES: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+static ARMOR_SCANS: AtomicU64 = AtomicU64::new(0);
+static ARMOR_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const ARMOR_SCAN_THINKS: u64 = 30;
+/// Half the size of an armour piece's box where its physics gives no bounds (units).
+const ARMOR_PIECE_HALF: f32 = 8.0;
+
 /// The most gathered entities read in one think, and the most items in one inventory.
 const GATHERED: usize = 1024;
 const MOST_ITEMS: i32 = 64;
@@ -42,13 +51,32 @@ pub struct Item {
 }
 
 /// What an item's inventory holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Holds {
     /// Ammo and guns only (what the use prompt shows as ammo: a gun the player has gives its ammo),
     /// none of them a gun carried in both hands; whether any of it fits in the player's inventory.
     Ammo { fits: bool },
-    /// Anything else (a carried gun, health, armour, a note), or nothing.
+    /// Health only: how much it gives in all.
+    Health { amount: f32 },
+    /// Armour only: the most armour its items allow (0 when not read).
+    Armor { max: f32 },
+    /// Anything else (a carried gun, a note, a mix), or nothing.
     Other,
+}
+
+/// The player's health and armour, each `(current, most)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vitals {
+    pub health: (f32, f32),
+    pub armor: (f32, f32),
+}
+
+/// The player's (`idPlayer`) health and armour, if they read as such.
+pub fn vitals(player: usize) -> Option<Vitals> {
+    let at = player + engine::PLAYER_HEALTH_COMPONENTS;
+    let [health, health_max, armor, armor_max] = mem::read::<[f32; 4]>(at)?;
+    let sane = |v: f32| v.is_finite() && (0.0..=10_000.0).contains(&v);
+    ([health, health_max, armor, armor_max].into_iter().all(sane) && health_max > 0.0).then_some(Vitals { health: (health, health_max), armor: (armor, armor_max) })
 }
 
 /// Hooks the player's think: after each, [`auto_pickup::think`](crate::cooking::auto_pickup::think).
@@ -106,6 +134,9 @@ pub fn items(player: usize, own: &[f32; 6], around: f32, mut each: impl FnMut(It
     {
         read(base, pickups, entities, clip, game, key, player, &mut each);
     }
+    if let Some(game) = mem::read::<usize>(base + entities.game_local).filter(|&g| g != 0) {
+        armor_pieces(base, pickups, entities, game, player, &mut each);
+    }
     let bounds: [f32; 6] = std::array::from_fn(|k| if k < 3 { own[k] - around } else { own[k] + around });
     let number = mem::read::<u16>(player + pickups.entity_number).unwrap_or(0);
     let mut asked = 0u64;
@@ -135,12 +166,49 @@ fn read(base: usize, pickups: &Pickups, entities: Entities, clip: usize, game: u
     }
 }
 
+/// The soldiers' armour pieces (`idProp_AIArmor`, outside the gather) the player could use now, as
+/// armour items; the entity table scanned for them every [`ARMOR_SCAN_THINKS`] thinks.
+fn armor_pieces(base: usize, pickups: &Pickups, entities: Entities, game: usize, player: usize, each: &mut impl FnMut(Item)) {
+    let Some(vtable) = pickups.ai_armor_vtable.map(|v| base + v) else { return };
+    let Ok(mut pieces) = ARMOR_PIECES.try_lock() else { return };
+    let at = |number: usize| mem::read::<usize>(game + entities.entities + number * 8).filter(|&e| e != 0);
+    if ARMOR_SCANS.fetch_add(1, Relaxed) % ARMOR_SCAN_THINKS == 0 {
+        pieces.clear();
+        pieces.extend((0..1usize << entities.bits).filter_map(|n| at(n).filter(|&e| mem::read::<usize>(e) == Some(vtable)).map(|e| (n, e))));
+    }
+    // Each still in its place in the table, as an armour piece.
+    pieces.retain(|&(n, e)| at(n) == Some(e) && mem::read::<usize>(e) == Some(vtable));
+    for &(_, entity) in pieces.iter() {
+        // SAFETY: this build's vtable slots (its fingerprint checked), on a live entity from the
+        // game's table, on the game thread inside the player's think.
+        let usable = unsafe {
+            let ever = method::<UsableFn>(entity, pickups.ever_usable);
+            let now = method::<UsableFn>(entity, pickups.usable_now);
+            ever.zip(now).is_some_and(|(ever, now)| ever(entity, player) != 0 && now(entity, player) != 0)
+        };
+        if !ARMOR_LOGGED.swap(true, Relaxed) {
+            monaka_producer::log!("auto pickup: soldiers' armor pieces found in the entity table ({}), usable now: {usable}", pieces.len());
+        }
+        if !usable {
+            continue;
+        }
+        let bounds = bounds(entity).or_else(|| {
+            let o = mem::read::<[f32; 3]>(entity + pickups.ai_armor_origin).filter(|o| o.iter().all(|v| v.is_finite()))?;
+            Some(std::array::from_fn(|k| if k < 3 { o[k] - ARMOR_PIECE_HALF } else { o[k - 3] + ARMOR_PIECE_HALF }))
+        });
+        if let Some(bounds) = bounds {
+            each(Item { entity, bounds, holds: Holds::Armor { max: 0.0 } });
+        }
+    }
+}
+
 /// `entity` as an item on the ground the player could use now, asked as the usables update asks.
 fn item(base: usize, pickups: &Pickups, entity: usize, player: usize) -> Option<Item> {
     // SAFETY (each call below): this build's functions and vtable slots (its fingerprint checked),
     // on a live entity from the game's table, on the game thread inside the player's think.
     let is_moveable = unsafe { function::<TypeTestFn>(base + pickups.is_moveable) };
-    if unsafe { is_moveable(entity) } == 0 {
+    // Armour pieces are read apart ([`armor_pieces`]).
+    if unsafe { is_moveable(entity) } == 0 || pickups.ai_armor_vtable.is_some_and(|v| mem::read::<usize>(entity) == Some(base + v)) {
         return None;
     }
     let ever = unsafe { method::<UsableFn>(entity, pickups.ever_usable)? };
@@ -153,8 +221,28 @@ fn item(base: usize, pickups: &Pickups, entity: usize, player: usize) -> Option<
     let is_ammo = unsafe { function::<TypeTestFn>(base + pickups.is_ammo) };
     let is_weapon = unsafe { function::<TypeTestFn>(base + pickups.is_weapon) };
     let (mut ammo, mut any_fits) = (0, false);
+    let (mut healths, mut heals, mut armors, mut armor_max) = (0, 0.0f32, 0, 0.0f32);
     for i in 0..count {
         let Some(it) = mem::read::<usize>(items + i * 8).filter(|&it| it != 0) else { continue };
+        let decl = || mem::read::<usize>(it + engine::INVENTORY_ITEM_DECL).filter(|&d| d != 0);
+        match type_name(it).as_deref() {
+            Some(engine::HEALTH_ITEM_TYPE) => {
+                let amount = decl().and_then(|d| mem::read::<f32>(d + engine::HEALTH_ITEM_AMOUNT)).filter(|a| a.is_finite() && *a > 0.0);
+                let times = mem::read::<i32>(it + engine::INVENTORY_ITEM_COUNT).unwrap_or(1).clamp(1, 16);
+                if let Some(amount) = amount {
+                    healths += 1;
+                    heals += amount * times as f32;
+                }
+                continue;
+            }
+            Some(engine::ARMOR_ITEM_TYPE) => {
+                armors += 1;
+                let most = decl().and_then(|d| mem::read::<f32>(d + engine::ARMOR_ITEM_MAX)).filter(|m| m.is_finite() && *m > 0.0);
+                armor_max = armor_max.max(most.unwrap_or(0.0));
+                continue;
+            }
+            _ => {}
+        }
         let gun = unsafe { is_weapon(it) } != 0;
         let carried = gun && mem::read::<usize>(it + engine::INVENTORY_ITEM_DECL).filter(|&d| d != 0).and_then(|d| mem::read::<u8>(d + pickups.carried_gun)).is_none_or(|c| c != 0);
         if (unsafe { is_ammo(it) } != 0 || gun) && !carried {
@@ -163,7 +251,12 @@ fn item(base: usize, pickups: &Pickups, entity: usize, player: usize) -> Option<
             any_fits |= unsafe { fits(it, player, 0) } != 0;
         }
     }
-    let holds = if count > 0 && ammo == count { Holds::Ammo { fits: any_fits } } else { Holds::Other };
+    let holds = match () {
+        _ if count > 0 && ammo == count => Holds::Ammo { fits: any_fits },
+        _ if count > 0 && healths == count => Holds::Health { amount: heals },
+        _ if count > 0 && armors == count => Holds::Armor { max: armor_max },
+        _ => Holds::Other,
+    };
     Some(Item { entity, bounds, holds })
 }
 
@@ -212,4 +305,88 @@ pub fn type_name(entity: usize) -> Option<String> {
     let get = unsafe { method::<TypeFn>(entity, 0)? };
     let info = Some(unsafe { get(entity) }).filter(|&i| i != 0)?;
     mem::read_c_string(mem::read::<usize>(info + engine::TYPE_NAME)?, 64)
+}
+
+/// What the use button can reach from far (`focus`): an interaction the player can use now (a
+/// scene's "press X", as on the London Monitor once it kneels) up to [`FAR_USE_METRES`] off and
+/// within [`FAR_USE_DEGREES`] of where the player looks, however small its own spot.
+pub const FAR_USE_METRES: f32 = 50.0;
+pub const FAR_USE_DEGREES: f32 = 35.0;
+/// The entity types reached from far: the game's interactions (not its doors, switches or items).
+pub const FAR_USE_TYPES: &[&str] = &["idProp_PlayerInteraction", "idVolume_PlayerInteraction", "idAnimatedInteractable", "idTrigger_AIInteraction", "idAIInteraction", "idInteractiveMarker", "idRobot"];
+/// The interactions in the entity table: (number, entity), looked for again every
+/// [`ARMOR_SCAN_THINKS`] updates.
+static FAR: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+static FAR_SCANS: AtomicU64 = AtomicU64::new(0);
+static FAR_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a thing at `at` is within reach from far of a look from `origin` along unit `forward`
+/// (`units` a metre).
+pub fn far_reached(origin: [f32; 3], forward: [f32; 3], at: [f32; 3], units: f32) -> Option<f32> {
+    let to: [f32; 3] = std::array::from_fn(|k| at[k] - origin[k]);
+    let distance = to.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if !(distance <= FAR_USE_METRES * units) {
+        return None;
+    }
+    if distance < 1.0 {
+        return Some(0.0);
+    }
+    let cosine = (0..3).map(|k| to[k] * forward[k]).sum::<f32>() / distance;
+    (cosine >= FAR_USE_DEGREES.to_radians().cos()).then(|| cosine.clamp(-1.0, 1.0).acos())
+}
+
+/// The interaction the player (`idPlayer`) can use now nearest where it looks, from `origin` along
+/// unit `forward` ([`far_reached`]), as an entity handle (spawn id over number). On the game thread.
+pub fn far_usable(player: usize, origin: [f32; 3], forward: [f32; 3], units: f32) -> Option<u32> {
+    let &(base, pickups, entities) = FACTS.get()?;
+    let game = mem::read::<usize>(base + entities.game_local).filter(|&g| g != 0)?;
+    let at = |n: usize| mem::read::<usize>(game + entities.entities + n * 8).filter(|&e| e != 0);
+    let mut far = FAR.try_lock().ok()?;
+    let scan = FAR_SCANS.fetch_add(1, Relaxed) % ARMOR_SCAN_THINKS == 0;
+    if scan {
+        far.clear();
+        for n in 0..1usize << entities.bits {
+            let Some(e) = at(n) else { continue };
+            let Some(name) = type_name(e) else { continue };
+            if FAR_USE_TYPES.contains(&name.as_str()) {
+                far.push((n, e));
+            }
+        }
+    }
+    far.retain(|&(n, e)| at(n) == Some(e));
+    let mut best: Option<(f32, usize, usize)> = None;
+    for &(n, entity) in far.iter() {
+        let Some(b) = bounds(entity) else { continue };
+        let middle = std::array::from_fn(|k| 0.5 * (b[k] + b[k + 3]));
+        let Some(angle) = far_reached(origin, forward, middle, units) else { continue };
+        // SAFETY: this build's vtable slots (its fingerprint checked), on a live entity from the
+        // game's table, on the game thread in the player's focus update.
+        let (ever, now) = unsafe {
+            let ever = method::<UsableFn>(entity, pickups.ever_usable).is_some_and(|f| f(entity, player) != 0);
+            let now = method::<UsableFn>(entity, pickups.usable_now).is_some_and(|f| f(entity, player) != 0);
+            (ever, now)
+        };
+        if scan && ever && FAR_LOGGED.fetch_add(1, Relaxed) < 12 {
+            monaka_producer::log!("far use: {} {:.0} m off, {:.0} degrees from the look, usable now {now}", type_name(entity).unwrap_or_default(), (0..3).map(|k| (middle[k] - origin[k]).powi(2)).sum::<f32>().sqrt() / units, angle.to_degrees());
+        }
+        if ever && now && best.is_none_or(|(a, ..)| angle < a) {
+            best = Some((angle, n, entity));
+        }
+    }
+    let (_, n, _) = best?;
+    handle(game, entities, n)
+}
+
+/// Whether the entity handle `handle` is a live entity's.
+pub fn handle_live(live: u32) -> bool {
+    let Some(&(base, _, entities)) = FACTS.get() else { return false };
+    let Some(game) = mem::read::<usize>(base + entities.game_local).filter(|&g| g != 0) else { return false };
+    let n = (live & ((1 << entities.bits) - 1)) as usize;
+    handle(game, entities, n) == Some(live) && mem::read::<usize>(game + entities.entities + n * 8).is_some_and(|e| e != 0)
+}
+
+/// The handle of entity number `n` now.
+fn handle(game: usize, entities: Entities, n: usize) -> Option<u32> {
+    let spawn = mem::read::<u32>(game + entities.spawn_ids + n * 4)?;
+    Some((spawn << entities.bits) | n as u32)
 }

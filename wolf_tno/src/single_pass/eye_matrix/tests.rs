@@ -197,3 +197,21 @@ fn the_average_holds_through_frames_measuring_different_wrong_matrices() {
     }
     assert_eq!(fit.matrix().unwrap(), before);
 }
+
+#[test]
+fn a_view_projection_is_told_from_the_other_eyes_by_its_unprojection() {
+    let view = [[0.8, 0.0, -0.6, 300.0], [0.0, 1.0, 0.0, -200.0], [0.6, 0.0, 0.8, 500.0], [0.0, 0.0, 0.0, 1.0]];
+    let shift = |x: f64| [[1.0, 0.0, 0.0, -x], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+    let left = multiply(&frustum(-0.14, 0.09, -0.13, 0.095, 0.1, 1000.0), &multiply(&shift(-2.5), &view));
+    let right = multiply(&frustum(-0.09, 0.14, -0.13, 0.095, 0.1, 1000.0), &multiply(&shift(2.5), &view));
+    // The engine's left-eye rows, at a scale of their own.
+    let engine = narrow(&invert(&multiply(&TO_WINDOW, &left)).unwrap().map(|row| row.map(|v| v * -3.0)));
+    let own_left = window_unprojection(&narrow(&left)).unwrap();
+    let own_right = window_unprojection(&narrow(&right)).unwrap();
+    let (scale, apart) = scaled_apart(&engine, &own_left);
+    assert!(apart < 1e-3, "{apart}");
+    assert!((scale + 3.0).abs() < 1e-3, "{scale}");
+    let (_, apart) = scaled_apart(&engine, &own_right);
+    assert!(apart > 0.05, "{apart}");
+}
+

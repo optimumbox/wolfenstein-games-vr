@@ -91,12 +91,32 @@ pub fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
-/// The knife's recent places, the trigger, the last let-go (with its swing) and the tap's end.
+/// The knife's recent places, the trigger, the last let-go (with where the knife pointed then:
+/// origin, aim axis rows) and the tap's end.
 struct State {
     samples: Vec<Sample>,
     trigger: Trigger,
-    let_go: Option<(u64, Option<(f32, Vec3)>)>,
+    let_go: Option<(u64, Option<(Vec3, [f32; 9])>)>,
     tap_until: u64,
+}
+
+/// The aim of a knife placed with axis rows `axis` (the game's: blade along its up): forward along
+/// the blade, left kept, up the placement's back.
+pub fn knife_axis(axis: &[f32; 9]) -> [f32; 9] {
+    let [f0, f1, f2, l0, l1, l2, u0, u1, u2] = *axis;
+    [u0, u1, u2, l0, l1, l2, -f0, -f1, -f2]
+}
+
+/// The knife in the right hand's aim now (origin, axis rows: [`knife_axis`]), as last placed.
+pub fn knife_aim() -> Option<(Vec3, [f32; 9])> {
+    let placed = crate::providers::held_item::placed()[monaka_contract::protocol::RIGHT_HAND]?;
+    Some((placed.origin, knife_axis(&placed.axis)))
+}
+
+/// Whether a throw is readied: the knife in the right hand, the trigger held (the red dot shows
+/// where it goes).
+pub fn readied() -> bool {
+    crate::providers::held_item::right_throws_knives() && STATE.try_lock().is_ok_and(|s| s.trigger.ready)
 }
 
 static STATE: Mutex<State> = Mutex::new(State { samples: Vec::new(), trigger: Trigger { ready: false }, let_go: None, tap_until: 0 });
@@ -123,13 +143,13 @@ pub fn pad(pad: &mut Gamepad) {
     if knife && state.trigger.step(pad.right_trigger) {
         let units = crate::providers::held_item::setup().map_or(1.0, |s| s.units_per_metre());
         let swung = swing(&state.samples, now, units);
-        state.let_go = Some((now, swung));
+        state.let_go = Some((now, knife_aim()));
         state.tap_until = now + TAP_MS;
         let n = LET_GOS.fetch_add(1, Relaxed) + 1;
         if n <= 20 {
             match swung {
-                Some((speed, _)) => log!("knife throw: let go {n}, swung at {:.1} m/s: the right stick pressed", speed / units),
-                None => log!("knife throw: let go {n}, no swing: the right stick pressed, the knife goes as the game aims it"),
+                Some((speed, _)) => log!("knife throw: let go {n}, swung at {:.1} m/s: thrown where the knife points", speed / units),
+                None => log!("knife throw: let go {n}: thrown where the knife points"),
             }
         }
     }
@@ -142,22 +162,22 @@ pub fn pad(pad: &mut Gamepad) {
 }
 
 /// A shot from a weapon no hand's gun was placed with, leaving now: if a knife throw was let go
-/// lately with a swing, where it leaves (the knife's last place) and its fire axis (along the swing).
+/// lately, where it leaves (the knife at the let-go) and its fire axis (where the blade pointed
+/// then: the red dot's line).
 pub fn thrown_now() -> Option<(Vec3, [f32; 9])> {
     let mut state = STATE.locked();
-    let (at, swung) = state.let_go?;
+    let (at, aim) = state.let_go?;
+    state.let_go = None;
     if now_ms().saturating_sub(at) > THROW_WINDOW_MS {
-        state.let_go = None;
         return None;
     }
-    state.let_go = None;
-    let (_, way) = swung?;
-    let from = state.samples.last()?.position;
-    let axis = fire_axis(way)?;
+    let (from, axis) = aim?;
+    let way = [axis[0], axis[1], axis[2]];
+    let fire = fire_axis(way)?;
     if THROWN.fetch_add(1, Relaxed) < 20 {
-        log!("knife throw: the knife leaves the hand along the swing {:?}", scale(way, 1.0));
+        log!("knife throw: the knife leaves the hand where it pointed {:.2?}", scale(way, 1.0));
     }
-    Some((from, axis))
+    Some((from, fire))
 }
 
 #[cfg(test)]

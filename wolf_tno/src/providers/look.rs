@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 /// the view points up as it begins (the ladder's mount is one; a crate's latch cut looks down),
 /// nor past [`HOLD_FOR`] (a scene): those are as they always were.
 fn holds() -> bool {
-    camera_taken::holds() || TAKEOVER.locked().holding()
+    camera_taken::holds() || TAKEOVER.locked().holding() || crate::providers::ladder::on()
 }
 
 /// A take of the view the share is held through: another camera's, or a control camera's (a
@@ -55,6 +55,7 @@ impl Looks for Wolf {
         let Facts { exe, build } = *start.build;
         install(&exe, build).map_err(Rejection::revision)?;
         camera_taken::install(&exe, build);
+        crate::providers::ladder::install(build.ladder);
         start.hooks.site(&USERCMD_BUILDER_ORIGINAL, &exe, &build.usercmd_builder, usercmd_builder)?;
         start.hooks.site(&camera_taken::VIEW_CAMERA_ORIGINAL, &exe, &build.view_camera, camera_taken::view_camera)?;
         crate::providers::focus::install(start.hooks, &exe, build)?;
@@ -101,7 +102,9 @@ pub unsafe extern "system" fn usercmd_builder(generator: usize, out: usize, play
         engine::COMMANDS.rewrite(generator, out, player as u32 as usize, scale, |pitch, yaw| {
             let yaw = yaw - snapped;
             let taken = camera_taken::controlled() && !camera_taken::mounted();
-            let (pitch, yaw) = TAKEOVER.locked().command(pitch, yaw, taken, taken && held_take(), monaka_body::look::baked::<Wolf>(None));
+            // On a ladder the share is held throughout, however long the climb.
+            let ladder = crate::providers::ladder::on();
+            let (pitch, yaw) = TAKEOVER.locked().command(pitch, yaw, taken, taken && (held_take() || ladder), ladder, monaka_body::look::baked::<Wolf>(None));
             let built = command::built(pitch, yaw).or((snapped != 0.0).then_some((pitch, yaw)));
             // On a mounted gun, turned toward where the right controller points.
             let (p, y) = built.unwrap_or((pitch, yaw));
@@ -154,8 +157,12 @@ impl Takeover {
     /// A command's angles as built (pitch, yaw) with another camera on the view (`taken`) or not,
     /// whether the share is held through it if it begins now (`hold`), the look's share now
     /// (`share`): as the look should take them.
-    pub fn command(&mut self, pitch: f32, yaw: f32, taken: bool, hold: bool, share: Option<Share>) -> (f32, f32) {
+    pub fn command(&mut self, pitch: f32, yaw: f32, taken: bool, hold: bool, ladder: bool, share: Option<Share>) -> (f32, f32) {
         let was = std::mem::replace(&mut self.taken, taken);
+        if taken && was && ladder && self.hold {
+            // On a ladder: the take is as short as its last moment.
+            self.since = Some(std::time::Instant::now());
+        }
         if taken {
             if !was {
                 self.since = Some(std::time::Instant::now());
@@ -213,23 +220,23 @@ mod tests {
     fn a_takeover_keeps_the_share_and_puts_it_back_on_angles_the_game_set() {
         let share = Share { yaw: 0.5, pitch: 0.3 };
         let mut t = Takeover::new();
-        assert_eq!(t.command(-10.0, 40.0, false, false, Some(share)), (-10.0, 40.0));
+        assert_eq!(t.command(-10.0, 40.0, false, false, false, Some(share)), (-10.0, 40.0));
         t.sent((-10.0, 40.0));
         // Taken: the angles go through as they are.
-        assert_eq!(t.command(-10.0, 40.0, true, true, None), (-10.0, 40.0));
+        assert_eq!(t.command(-10.0, 40.0, true, true, false, None), (-10.0, 40.0));
         assert!(t.holding());
         t.sent((-10.0, 40.0));
         // Let go with the angles as left: the share is still in them.
-        assert_eq!(t.command(-10.0, 40.0, false, false, Some(share)), (-10.0, 40.0));
+        assert_eq!(t.command(-10.0, 40.0, false, false, false, Some(share)), (-10.0, 40.0));
         t.sent((-10.0, 40.0));
         // A take not held (a crate's latch cut): nothing put back at its end.
-        t.command(-10.0, 40.0, true, false, None);
+        t.command(-10.0, 40.0, true, false, false, None);
         assert!(!t.holding());
-        assert_eq!(t.command(5.0, 90.0, false, false, None), (5.0, 90.0));
+        assert_eq!(t.command(5.0, 90.0, false, false, false, None), (5.0, 90.0));
         t.sent((-10.0, 40.0));
         // Let go with the angles the game set: the held share is put in for the look to take out.
-        t.command(-10.0, 40.0, true, true, None);
-        let (pitch, yaw) = t.command(5.0, 90.0, false, false, None);
+        t.command(-10.0, 40.0, true, true, false, None);
+        let (pitch, yaw) = t.command(5.0, 90.0, false, false, false, None);
         let (held_yaw, held_pitch) = (share.yaw.to_degrees(), -share.pitch.to_degrees());
         assert!((pitch - (5.0 + held_pitch)).abs() < 1e-3 && (yaw - (90.0 + held_yaw)).abs() < 1e-3, "{pitch} {yaw}");
     }

@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn a_muzzle_sits_ahead_of_the_hand_on_its_axes() {
+    assert!(muzzle_offset_ok([30.0, 0.0, 4.0]));
+    assert!(!muzzle_offset_ok([0.0, 0.0, 0.0]));
+    assert!(!muzzle_offset_ok([-30.0, 0.0, 4.0]));
+    assert!(!muzzle_offset_ok([500.0, 0.0, 0.0]));
+    assert!(!muzzle_offset_ok([30.0, 0.0, 40.0]));
+    assert!(!muzzle_offset_ok([f32::NAN, 0.0, 0.0]));
+    // Facing +y (forward), left -x, up +z: 30 ahead, 4 up.
+    let axis = [0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+    assert_eq!(offset_point([10.0, 0.0, 0.0], &axis, [30.0, 0.0, 4.0]), [10.0, 30.0, 4.0]);
+    assert_eq!(in_frame([10.0, 0.0, 0.0], &axis, [10.0, 30.0, 4.0]), [30.0, 0.0, 4.0]);
+}
+
+#[test]
+fn a_gun_aims_up_along_its_sights() {
+    let axis = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let up = pitched(&axis, 90.0);
+    let near = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+    // Forward turns to up, up to back, left stays.
+    assert!(near(&up, &[0.0, 0.0, 1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0]));
+    let ten = pitched(&axis, 10.0);
+    assert!((ten[2] - 10f32.to_radians().sin()).abs() < 1e-6);
+    assert_eq!(pitched(&axis, 0.0), axis);
+}
+
+#[test]
 fn hand_tags_are_sides() {
     assert_eq!(side_of_tag(0), Some(RIGHT_HAND));
     assert_eq!(side_of_tag(1), Some(LEFT_HAND));
@@ -104,4 +130,19 @@ fn an_item_is_fresh_for_the_build_after_its_placement_only() {
     assert!(!fresh_for(5, 7));
     let gun = Placed { weapon: 1, origin: [1.0, 2.0, 3.0], axis: [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0], at: 0, build: 0 };
     assert_eq!(origin_axis(&gun), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+}
+
+#[test]
+fn every_gun_switches_a_laser_sight() {
+    assert!(laser_switched(Some("weapon/assaultrifle1960")) && laser_switched(Some("weapon/laserkraftwerk")));
+    assert!(!laser_switched(Some("weapon/knife")) && !laser_switched(Some("weapon/handgrenadeemp")) && !laser_switched(None));
+}
+
+#[test]
+fn the_marksman_rifle_sits_two_inches_lower() {
+    use super::lowered;
+    let axis = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let (o, _) = lowered(([0.0, 0.0, 10.0], axis), Some("weapon/ar60marksman"), 100.0);
+    assert!((o[2] - (10.0 - 5.08)).abs() < 1e-4);
+    assert_eq!(lowered(([0.0, 0.0, 10.0], axis), Some("weapon/shotgun"), 100.0).0, [0.0, 0.0, 10.0]);
 }

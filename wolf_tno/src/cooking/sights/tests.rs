@@ -34,3 +34,28 @@ fn the_left_trigger_zooms_only_on_foot_with_one_gun() {
     assert!(!zooms(true, false), "two guns: it fires the left one");
     assert!(!zooms(false, true), "a mounted gun, the mech or a car: theirs");
 }
+
+#[test]
+fn a_push_up_turns_the_laser_once_until_the_stick_comes_back() {
+    // Pushed up past 70%: switches once.
+    assert_eq!(laser_push(30000, false), (true, true));
+    // Held up: no more.
+    assert_eq!(laser_push(32767, true), (false, true));
+    // Halfway back: still held.
+    assert_eq!(laser_push(15000, true), (false, true));
+    // Back under 30%: ready again.
+    assert_eq!(laser_push(5000, true), (false, false));
+    // Down or a light push: nothing.
+    assert_eq!(laser_push(-32767, false), (false, false));
+    assert_eq!(laser_push(15000, false), (false, false));
+}
+
+#[test]
+fn a_resting_left_trigger_fires_no_left_gun() {
+    use super::left_pulled;
+    assert_eq!(left_pulled(36, true), 0);
+    assert_eq!(left_pulled(90, true), 0);
+    assert_eq!(left_pulled(255, true), 255);
+    assert!(left_pulled(200, true) > 100);
+    assert_eq!(left_pulled(36, false), 36);
+}

@@ -32,7 +32,10 @@ use monaka_hook::{InFlight, Original, mem};
 use monaka_producer::game::{Component, Lack, Need, On, Start};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering::*};
-use windows::Win32::Graphics::OpenGL::{GL_VIEWPORT, glGetIntegerv, glViewport};
+use windows::Win32::Graphics::OpenGL::{
+    GL_COLOR_BUFFER_BIT, GL_COLOR_CLEAR_VALUE, GL_COLOR_WRITEMASK, GL_SCISSOR_BOX, GL_SCISSOR_TEST, GL_VIEWPORT, glClear, glClearColor, glColorMask, glDisable, glEnable,
+    glGetBooleanv, glGetFloatv, glGetIntegerv, glIsEnabled, glScissor, glViewport,
+};
 
 /// The 2D layer at a depth in each eye: drawn through its own viewport, placed per eye.
 pub const HUD: Component<Wolf> = Component {
@@ -68,7 +71,13 @@ pub fn install(shared: Shared) {
 }
 
 pub fn summary() -> String {
-    format!("{} of {} 2D layer draws placed, {} of them flat (no world drawn)", PLACED.load(Relaxed), DRAWS.load(Relaxed), FLAT.load(Relaxed))
+    format!(
+        "{} of {} 2D layer draws placed, {} of them flat (no world drawn); the laser sight drawn {} times",
+        PLACED.load(Relaxed),
+        DRAWS.load(Relaxed),
+        FLAT.load(Relaxed),
+        BEAMS_DRAWN.load(Relaxed)
+    )
 }
 
 /// The viewport for one eye's 2D layer: `eye` 0 left, 1 right; `rect` the eye's own viewport.
@@ -98,6 +107,86 @@ pub fn aim_shift(rect: [i32; 4], eye: usize, frustum: &Frustum, ipd: f32, hud: &
     shift.iter().all(|v| v.is_finite() && v.abs() < 32768.0).then(|| shift.map(|v| v.round() as i32))
 }
 
+/// The laser sight's colour (linear RGB).
+const LASER_COLOUR: [f32; 3] = [1.0, 0.06, 0.03];
+/// The beam's width in pixels at the muzzle and at its end, the spot's where it hits, and the
+/// pixels between the beam's squares.
+const BEAM_WIDE: f32 = 4.0;
+const BEAM_THIN: f32 = 2.0;
+const SPOT: f32 = 8.0;
+const BEAM_STEP: f32 = 1.5;
+/// The most squares a beam is drawn with.
+const BEAM_SQUARES: usize = 2400;
+
+static BEAMS_DRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// The squares (GL scissor boxes: x, y up from the bottom, width, height) that draw a laser sight's
+/// beam with ends `ends` (tangents: the muzzle, then where it stops) in an eye viewport `rect`
+/// drawn with `frustum`: tapering from the muzzle, a spot at its end where it hits something.
+pub fn beam_boxes(rect: [i32; 4], frustum: &Frustum, ends: [[f32; 2]; 2], hit: bool) -> Option<Vec<[i32; 4]>> {
+    let [x, y, w, h] = rect.map(|v| v as f32);
+    let (span_x, span_y) = (frustum.right - frustum.left, frustum.up - frustum.down);
+    if !(w > 0.0 && h > 0.0 && span_x > 0.0 && span_y > 0.0) {
+        return None;
+    }
+    let pixel = |t: [f32; 2]| [x + (t[0] - frustum.left) / span_x * w, y + (t[1] - frustum.down) / span_y * h];
+    let (a, b) = (pixel(ends[0]), pixel(ends[1]));
+    let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+    if !length.is_finite() {
+        return None;
+    }
+    let steps = ((length / BEAM_STEP).ceil() as usize).clamp(1, BEAM_SQUARES);
+    let square = |c: [f32; 2], size: f32| {
+        let (x0, y0) = ((c[0] - size / 2.0).round(), (c[1] - size / 2.0).round());
+        let (x1, y1) = ((x0 + size.round()).min(x + w), (y0 + size.round()).min(y + h));
+        let (x0, y0) = (x0.max(x), y0.max(y));
+        (x1 > x0 && y1 > y0).then(|| [x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32])
+    };
+    let mut boxes: Vec<[i32; 4]> = (0..=steps)
+        .filter_map(|i| {
+            let s = i as f32 / steps as f32;
+            square([a[0] + s * (b[0] - a[0]), a[1] + s * (b[1] - a[1])], BEAM_WIDE + s * (BEAM_THIN - BEAM_WIDE))
+        })
+        .collect();
+    boxes.dedup();
+    if hit && let Some(spot) = square(b, SPOT) {
+        boxes.push(spot);
+    }
+    (!boxes.is_empty()).then_some(boxes)
+}
+
+/// The beam's squares cleared to the laser's colour in the eye's render target, the GL state it
+/// touches put back.
+fn draw_beam(boxes: &[[i32; 4]]) {
+    if BEAMS_DRAWN.fetch_add(1, Relaxed) == 0 {
+        monaka_producer::log!("hud: a laser sight drawn into the eyes ({} squares)", boxes.len());
+    }
+    let mut scissor = [0i32; 4];
+    let mut clear = [0f32; 4];
+    let mut mask = [0u8; 4];
+    // SAFETY: state queries and plain GL calls on the render thread, the game's context current;
+    // the state is put back as it was.
+    unsafe {
+        let scissoring = glIsEnabled(GL_SCISSOR_TEST) != 0;
+        glGetIntegerv(GL_SCISSOR_BOX, scissor.as_mut_ptr());
+        glGetFloatv(GL_COLOR_CLEAR_VALUE, clear.as_mut_ptr());
+        glGetBooleanv(GL_COLOR_WRITEMASK, mask.as_mut_ptr());
+        glEnable(GL_SCISSOR_TEST);
+        glColorMask(1, 1, 1, 1);
+        glClearColor(LASER_COLOUR[0], LASER_COLOUR[1], LASER_COLOUR[2], 1.0);
+        for &[x, y, w, h] in boxes {
+            glScissor(x, y, w, h);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+        glClearColor(clear[0], clear[1], clear[2], clear[3]);
+        glColorMask(mask[0], mask[1], mask[2], mask[3]);
+        glScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
+        if !scissoring {
+            glDisable(GL_SCISSOR_TEST);
+        }
+    }
+}
+
 /// The viewport for a 2D layer going to the flat screen, the same in each eye: the eye's whole
 /// width and the layer's own shape (two eye halves wide, so half the eye's height), centred.
 pub fn flat_rect(rect: [i32; 4]) -> Option<[i32; 4]> {
@@ -125,6 +214,7 @@ pub unsafe extern "system" fn gui_draw(backend: usize, guis: usize, count: i32, 
     let mut base = [0i32; 4];
     let mut placed = None;
     let mut crosshair = None;
+    let mut beam = None;
     // With frame warping the one view is the eye of the frame being drawn, wherever it sits.
     let eye = record_eye(record).filter(|_| count > 0).map(|eye| crate::providers::eye_site::drawing_eye().unwrap_or(eye));
     if crate::on(crate::HUD_AT)
@@ -137,6 +227,8 @@ pub unsafe extern "system" fn gui_draw(backend: usize, guis: usize, count: i32, 
             true => head::rendering().or_else(|| head::HEAD.current()).and_then(|pose| {
                 let frustum = Frustum::from_fov(pose.fov[eye])?;
                 let ipd = shared.separation_for(&pose);
+                // The marksman rifle's laser sight, under the HUD.
+                beam = eye_site::beam_for(&pose).and_then(|b| beam_boxes(base, &frustum, b.ends[eye], b.hit));
                 // A driven machine's crosshair goes where it aims in this eye.
                 crosshair = eye_site::aim_for(&pose).and_then(|aim| aim_shift(base, eye, &frustum, ipd, &shared.hud, aim[eye]));
                 placed_rect(base, eye, &frustum, ipd, &shared.hud)
@@ -146,6 +238,9 @@ pub unsafe extern "system" fn gui_draw(backend: usize, guis: usize, count: i32, 
                 FLAT.fetch_add(1, Relaxed);
             }),
         };
+    }
+    if let Some(boxes) = beam {
+        draw_beam(&boxes);
     }
     if let Some([x, y, w, h]) = placed {
         // SAFETY: GL call on the render thread with the game's context current.

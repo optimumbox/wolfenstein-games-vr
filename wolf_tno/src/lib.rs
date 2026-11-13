@@ -96,6 +96,7 @@ impl Game for Wolf {
             &PRESENT,
             &eye_site::EYES,
             &SINGLE_PASS,
+            &TWO_PASS_DECALS,
             &LOOK,
             &cooking::body_forward::MOVE_HEADING_COMPONENT,
             &GUNS,
@@ -127,6 +128,7 @@ impl Game for Wolf {
             return Err(Rejection::not_ready("the engine is not up yet (or is in another layout)"));
         }
         log!("{}", build.game);
+        log!("game's command line: {}", std::env::args().skip(1).collect::<Vec<_>>().join(" "));
         research::PROBES.configure(options);
         research::view::PLAYER_FIELDS.store(research::options().player && build.exe == "WolfOldBlood_x64.exe", Ordering::Relaxed);
         Ok(Facts { exe, build })
@@ -141,6 +143,7 @@ fn eyes(start: &Start<'_, Wolf>) -> EyeSettings {
 /// The components' places, for the detours to ask whether each is on.
 pub(crate) const EYES_AT: usize = place::<Wolf>(&eye_site::EYES);
 pub(crate) const SINGLE_PASS_AT: usize = place::<Wolf>(&SINGLE_PASS);
+pub(crate) const TWO_PASS_DECALS_AT: usize = place::<Wolf>(&TWO_PASS_DECALS);
 pub(crate) const GUNS_AT: usize = place::<Wolf>(&GUNS);
 pub(crate) const GUN_AT: usize = place::<Wolf>(&GUN);
 pub(crate) const HUD_AT: usize = place::<Wolf>(&hud::HUD);
@@ -172,6 +175,8 @@ pub const SINGLE_PASS: Component<Wolf> = Component {
     },
     on: |run| {
         let on = eyes::single_pass_on(run.options);
+        single_pass::draws::surface_draw_site(run.build.build.surface_draw);
+        single_pass::cull::sites(run.build.build.cull_bounds, run.build.build.view_setup);
         // Both eyes framed alike up and down: the hardware keeps only the left eye's height.
         eye_site::share_vertical(on);
         On::when(on, "the stereo method is not Single-pass (Same-frame)")
@@ -179,6 +184,16 @@ pub const SINGLE_PASS: Component<Wolf> = Component {
     give_back: single_pass::draws::give_back,
     let_go: Some(single_pass::draws::let_go),
     summary: Some(single_pass::draws::summary),
+    ..Component::NONE
+};
+
+/// Decals (blood, bullet holes) in both eyes with each eye drawn in its own pass: each eye's decals
+/// given that eye's unprojection ([`single_pass::decals`]). Single pass does this itself.
+pub const TWO_PASS_DECALS: Component<Wolf> = Component {
+    name: "two_pass_decals",
+    needs: &[Need::On(&eye_site::EYES)],
+    on: |run| On::when(!eyes::single_pass_on(run.options), "the stereo method is Single-pass, which gives the decals each eye's rows itself"),
+    let_go: Some(single_pass::decals::let_go),
     ..Component::NONE
 };
 

@@ -84,7 +84,12 @@ fn install_crosshair(start: &mut Start<'_, Wolf>) -> Result<(), Lack> {
 
 /// Whether the crosshair is hidden now: out of a driven machine, with `crosshair=hide`.
 fn hiding_crosshair() -> bool {
-    HIDE_CROSSHAIR.load(Relaxed) && !crate::providers::camera_taken::driving()
+    HIDE_CROSSHAIR.load(Relaxed) && !aiming_crosshair()
+}
+
+/// Whether the crosshair shows where something aims (moved in each eye): a driven machine's aim.
+fn aiming_crosshair() -> bool {
+    crate::providers::camera_taken::driving()
 }
 
 /// The item checklists' piece, after the guns' ammo (by side).
@@ -187,7 +192,7 @@ fn is_crosshair(sprite: usize) -> bool {
 /// drawn for a while.
 fn forget_stale_crosshair() {
     let unseen = CROSSHAIR_UNSEEN.fetch_add(1, Relaxed) + 1;
-    let stale = !(crate::providers::camera_taken::driving() || HIDE_CROSSHAIR.load(Relaxed))
+    let stale = !(aiming_crosshair() || HIDE_CROSSHAIR.load(Relaxed))
         || CROSSHAIR_DRIVE.load(Relaxed) != crate::providers::camera_taken::drives()
         || unseen > CROSSHAIR_UNSEEN_FRAMES;
     if stale && CROSSHAIR.swap(0, Relaxed) != 0 {
@@ -364,7 +369,7 @@ unsafe extern "system" fn render_sprite(swf: usize, gui: usize, sprite: usize, s
     let original = || unsafe { RENDER_SPRITE_ORIGINAL.get(&flight)(swf, gui, sprite, state, a5, a6) };
     let piece = hud_panels::active().then(|| piece_of_sprite(sprite)).flatten();
     let hiding = hiding_crosshair();
-    let crosshair = piece.is_none() && sprite != 0 && (hiding || crate::providers::camera_taken::driving()) && is_crosshair(sprite);
+    let crosshair = piece.is_none() && sprite != 0 && (hiding || aiming_crosshair()) && is_crosshair(sprite);
     if crosshair && hiding {
         CROSSHAIR_HIDDEN.fetch_add(1, Relaxed);
         return;

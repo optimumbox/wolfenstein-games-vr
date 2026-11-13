@@ -1,5 +1,20 @@
 use super::*;
 
+#[test]
+fn a_beam_runs_from_the_muzzle_to_a_spot_where_it_hits() {
+    let frustum = Frustum::centred([1.0, 1.0]).unwrap();
+    // From the middle of a 200x200 eye to its right edge's middle, ahead.
+    let boxes = beam_boxes([0, 0, 200, 200], &frustum, [[0.0, 0.0], [0.5, 0.0]], true).unwrap();
+    let first = boxes[0];
+    assert!((first[0] - 98).abs() <= 1 && (first[1] - 98).abs() <= 1, "{first:?}");
+    let spot = *boxes.last().unwrap();
+    assert_eq!((spot[2], spot[3]), (8, 8));
+    assert!((spot[0] + 4 - 150).abs() <= 1, "{spot:?}");
+    // Nothing hit: no spot. Off the eye: clipped to it.
+    let missed = beam_boxes([0, 0, 200, 200], &frustum, [[0.0, 0.0], [3.0, 0.0]], false).unwrap();
+    assert!(missed.iter().all(|b| b[0] >= 0 && b[0] + b[2] <= 200));
+}
+
 const HUD: Hud = Hud { shown: true, world: false, scale: 0.5, distance: 2.0, markers: false };
 
 #[test]

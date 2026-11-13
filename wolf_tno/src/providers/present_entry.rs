@@ -157,6 +157,7 @@ fn dlss(start: &Start<'_, Wolf>) -> Option<GlDlss> {
     };
     log!("DLSS model from {}", dlls.display());
     eye_site::arm_dlss(settings.quality);
+    crate::single_pass::motion::wanted();
     crate::providers::window_size::arm_dlss(settings.quality, display);
     let leak = |p: std::path::PathBuf| -> &'static std::path::Path { Box::leak(p.into_boxed_path()) };
     Some(GlDlss {
@@ -165,6 +166,7 @@ fn dlss(start: &Start<'_, Wolf>) -> Option<GlDlss> {
         display,
         frame: eye_site::dlss_frame,
         depth: eye_site::scene_depth,
+        motion: Some(crate::single_pass::motion::pair),
         dlls: leak(dlls),
         data: leak(start.session.dir().join("ngx")),
         jitter_sign: settings.jitter_sign,
@@ -268,7 +270,12 @@ pub unsafe extern "system" fn swap_buffers(dc: HDC) -> BOOL {
         }
     }
     crate::providers::window_size::seen(dc);
-    crate::single_pass::draws::frame(crate::on(crate::SINGLE_PASS_AT));
+    let single_pass = crate::on(crate::SINGLE_PASS_AT);
+    // Before single pass's: its hooks and these take the same functions.
+    crate::single_pass::decals::frame(!single_pass && crate::on(crate::TWO_PASS_DECALS_AT));
+    crate::single_pass::draws::frame(single_pass);
+    // Each eye in its own pass: depth of field and film grain left out all the same.
+    crate::single_pass::programs::without_blur(!single_pass);
     vsync::follow(PAIRS.publishing());
     crate::single_pass::pieces::swap(PAIRS.publishing(), crate::single_pass::draws::program_name);
     gl::present(dc);

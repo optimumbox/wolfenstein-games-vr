@@ -84,6 +84,41 @@ pub fn right_unprojection(e: &Rows, left: &Rows) -> Option<Rows> {
     out.iter().flatten().all(|v| v.is_finite()).then_some(out)
 }
 
+/// A fragment shader's unprojection (window position and depth to the world) from the
+/// view-projection `vp` that drew it: `(T · VP)⁻¹`.
+pub fn window_unprojection(vp: &Rows) -> Option<Rows> {
+    let out = invert(&multiply(&TO_WINDOW, &widen(vp)))?.map(|row| row.map(|v| v as f32));
+    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+}
+
+/// How far apart `engine` and `own` put the same pixels: the scale that fits `engine` to `own`
+/// best (rows to a homogeneous point are the same at any scale), and the largest distance between
+/// their world points, relative to that point's distance from the near plane's (a few pixels across
+/// the window, at a depth near the viewer). The same view's rows land within float error; the other
+/// eye's are off by its frustum and place.
+pub fn scaled_apart(engine: &Rows, own: &Rows) -> (f32, f64) {
+    let (e, o) = (widen(engine), widen(own));
+    let dot: f64 = e.iter().flatten().zip(o.iter().flatten()).map(|(a, b)| a * b).sum();
+    let norm: f64 = o.iter().flatten().map(|v| v * v).sum();
+    if norm == 0.0 || !dot.is_finite() {
+        return (1.0, f64::INFINITY);
+    }
+    let point = |m: &M, x: f64, y: f64, z: f64| -> Option<[f64; 3]> {
+        let w = m[3][0] * x + m[3][1] * y + m[3][2] * z + m[3][3];
+        (w.abs() > 1e-12).then(|| std::array::from_fn(|i| (m[i][0] * x + m[i][1] * y + m[i][2] * z + m[i][3]) / w))
+    };
+    let distance = |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt();
+    let mut worst = 0.0f64;
+    for (x, y) in [(0.2, 0.2), (0.8, 0.3), (0.5, 0.5), (0.3, 0.8)] {
+        let (Some(near), Some(at_e), Some(at_o)) = (point(&e, x, y, 0.0), point(&e, x, y, 0.5), point(&o, x, y, 0.5)) else {
+            return (1.0, f64::INFINITY);
+        };
+        let reach = distance(near, at_e).max(1e-9);
+        worst = worst.max(distance(at_e, at_o) / reach);
+    }
+    ((dot / norm) as f32, worst)
+}
+
 /// How far `e · left` is from `right`, relative to `right`'s size.
 pub fn misfit(e: &Rows, left: &Rows, right: &Rows) -> f64 {
     disagreement(&widen(e), left, right)
@@ -98,6 +133,12 @@ fn disagreement(e: &M, left: &Rows, right: &Rows) -> f64 {
     worst / scale
 }
 
+/// The inverse of `rows`, if they have one.
+pub fn inverse(rows: &Rows) -> Option<Rows> {
+    let out = invert(&widen(rows))?.map(|row| row.map(|v| v as f32));
+    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+}
+
 /// `e · left`: the rows a left-eye draw is carried to in the right eye.
 pub fn carry(e: &Rows, left: &Rows) -> Rows {
     multiply(&widen(e), &widen(left)).map(|row| row.map(|v| v as f32))
@@ -108,6 +149,17 @@ pub fn apart(a: &Rows, b: &Rows) -> f64 {
     let scale = b.iter().flatten().fold(0.0f32, |s, v| s.max(v.abs())).max(1e-12);
     let worst = a.iter().flatten().zip(b.iter().flatten()).fold(0.0f32, |s, (p, r)| s.max((p - r).abs()));
     f64::from(worst / scale)
+}
+
+/// Whether rows `a` are within `tolerance` of `b` ([`apart`]), giving up at the first element
+/// that is not: the translation column first, where one surface's rows differ from another's
+/// sharing the view (the rest the same view and projection). The right eye's matches look through
+/// hundreds of the left eye's rows a draw; [`apart`] read all of each.
+pub fn close(a: &Rows, b: &Rows, tolerance: f64) -> bool {
+    let scale = b.iter().flatten().fold(0.0f32, |s, v| s.max(v.abs())).max(1e-12);
+    let limit = (tolerance * f64::from(scale)) as f32;
+    let near = |i: usize, j: usize| (a[i][j] - b[i][j]).abs() <= limit;
+    (0..4).all(|i| near(i, 3)) && (0..4).all(|i| (0..3).all(|j| near(i, j)))
 }
 
 /// The largest disagreement a pair may have and still agree.

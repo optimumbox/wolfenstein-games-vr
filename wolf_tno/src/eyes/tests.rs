@@ -16,6 +16,7 @@ fn read_all(options: &Options, manifest: &Manifest) {
     (crate::cooking::room_scale::ROOM_SCALE.settings)(options, manifest);
     crate::providers::held_item::arms(options);
     crate::cooking::auto_pickup::SWITCH.on(options, manifest);
+    crate::cooking::auto_pickup::HEALTH_SWITCH.on(options, manifest);
     crate::extras::mech_levers::SWITCH.on(options, manifest);
 }
 

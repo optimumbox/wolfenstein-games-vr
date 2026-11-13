@@ -124,6 +124,8 @@ pub struct Build {
     /// (`idProp_WeaponStatic::Think`: times its own factor, then clamped to its limits); its view
     /// is the gun's, not the player's.
     pub mounted_gun_vtable: usize,
+    /// The player's contextual ladder ([`Ladder`]; none: not mapped for this build).
+    pub ladder: Option<Ladder>,
     /// A machine the player drives ([`Driven`]); None where not mapped.
     pub driven: Option<Driven>,
     /// How the mech turns its aim ([`MechAim`]); None where there is no mech or it is not mapped.
@@ -177,7 +179,21 @@ pub struct Build {
     pub fullscreen: Option<Cvar>,
     /// The damage handlers of what the laser cuts ([`Cutting`]; None where not mapped).
     pub cutting: Option<Cutting>,
+    /// The renderer's draw of one surface ([`SurfaceDrawFn`]; None where not mapped): single
+    /// pass skips the right eye's scene draws there, before the engine's own work for them
+    /// (`crate::single_pass::draws`).
+    pub surface_draw: Option<Site<SurfaceDrawFn>>,
+    /// The renderer's bounds cull and view setup ([`crate::single_pass::cull`]; None where not
+    /// mapped): single pass culls the left eye's scene for both eyes there.
+    pub cull_bounds: Option<Site<crate::single_pass::cull::CullBoundsFn>>,
+    pub view_setup: Option<Site<crate::single_pass::cull::ViewSetupFn>>,
 }
+
+/// `(geometry, vertex layout or 0, flag) -> ?` (the result unused): binds one surface's vertex
+/// arrays and makes its GL draw (`glDrawElementsInstancedBaseVertex`); its program, uniforms and
+/// render state are set by its caller. Both of the backend's surface draws (the world's and the
+/// entities', skinned) come through it.
+pub type SurfaceDrawFn = unsafe extern "system" fn(usize, usize, u8) -> usize;
 
 /// `(idCommonLocal) -> ?`.
 pub type FrameFn = unsafe extern "system" fn(usize) -> usize;
@@ -278,7 +294,24 @@ pub struct Pickups {
     /// ([`AbsBoundsFn`]).
     pub physics: usize,
     pub abs_bounds: usize,
+    /// `idProp_AIArmor`'s vtable (rva): the armour pieces a soldier drops, which the clip gather
+    /// never finds (no clip contents); its physics origin (3 floats).
+    pub ai_armor_vtable: Option<usize>,
+    pub ai_armor_origin: usize,
 }
+
+/// `idPlayer::behaviors.contextualLadder` (`idPlayerBehaviorContextualLadder`): its state (i32,
+/// `CONTEXTUAL_LADDER_STATE_*`) and whether its stick reads turned over (`invertInput`, u8).
+#[derive(Clone, Copy, Debug)]
+pub struct Ladder {
+    pub state: usize,
+    pub invert_input: usize,
+}
+
+/// The laser rifle's own recharge (`idBatteryWeapon`, without the mobile reactor) stops at a share
+/// of its battery: the share is loaded (`movss xmm7, [rip+disp]`) at `at` (rva, these bytes), and
+/// a 1.0 lies at `one` (rva) to point it at instead, so it charges back to full.
+pub const BATTERY_RECHARGE_SHARE: (usize, [u8; 8], usize) = (0x9a6740, [0xf3, 0x0f, 0x10, 0x3d, 0x40, 0xca, 0x67, 0x00], 0xbed840);
 
 /// `(idPlayer)`.
 pub type PlayerThinkFn = unsafe extern "system" fn(usize);
@@ -659,6 +692,7 @@ pub static ROWS: [Build; 2] = unsafe { [
         entities: Entities { game_local: 0x1da60e0, spawn_ids: 0x261d0, entities: 0x161d0, bits: 13 },
         minigame: Minigame { hud: 0xbd10, handle: 0x100 },
         mounted_gun_vtable: 0xf53728,
+        ladder: Some(Ladder { state: 0x2088, invert_input: 0x2238 }),
         driven: Some(Driven { entity: 0x4c8, cast: 0x31670 }),
         mech_aim: Some(MechAim {
             view_angles: Site::new("mech view angles", 0x74bfe0, &[
@@ -724,6 +758,8 @@ pub static ROWS: [Build; 2] = unsafe { [
             inventory: 0x398,
             physics: 0x310,
             abs_bounds: 0x58,
+            ai_armor_vtable: Some(0xfa43a8),
+            ai_armor_origin: 0xea4,
         }),
         focus_update: Some(Site::new("player focus", 0x8f9ad0, &[
             Instruction::plain(&[0x48, 0x85, 0xd2]),                             // test rdx, rdx
@@ -731,6 +767,18 @@ pub static ROWS: [Build; 2] = unsafe { [
         ])),
         frame: Site::new("frame", 0x13dff0, &FRAME_PROLOGUE),
         sync_to_time: Cvar::id5(0x16ae1e0, "com_syncToTime"),
+        surface_draw: Some(Site::new("surface draw", 0x3f8dc0, &[
+            Instruction::plain(&[0x40, 0x55]), // push rbp
+            Instruction::plain(&[0x57]),       // push rdi
+            Instruction::plain(&[0x41, 0x55]), // push r13
+        ])),
+        cull_bounds: Some(Site::new("bounds cull", 0xa21dd0, &[
+            Instruction::plain(&[0x4c, 0x8b, 0xdc]),                         // mov r11, rsp
+            Instruction::plain(&[0x48, 0x81, 0xec, 0xa8, 0x00, 0x00, 0x00]), // sub rsp, 0xa8
+        ])),
+        view_setup: Some(Site::new("view setup", 0x474130, &[
+            Instruction::plain(&[0x48, 0x89, 0x5c, 0x24, 0x18]), // mov [rsp+0x18], rbx
+        ])),
         fullscreen: Some(Cvar::id5(0x1d1f240, "r_fullscreen")),
         cutting: Some(Cutting {
             chain: Site::new("chain damage", 0x6b5bd0, &[
@@ -871,6 +919,7 @@ pub static ROWS: [Build; 2] = unsafe { [
         entities: Entities { game_local: 0x1fabdc0, spawn_ids: 0x361d0, entities: 0x161d0, bits: 14 },
         minigame: Minigame { hud: 0x7ed8, handle: 0x108 },
         mounted_gun_vtable: 0xf32ce8,
+        ladder: None,
         driven: None,
         mech_aim: None,
         hotwire: None,
@@ -899,6 +948,10 @@ pub static ROWS: [Build; 2] = unsafe { [
         focus_update: None,
         frame: Site::new("frame", 0x1371a0, &FRAME_PROLOGUE),
         sync_to_time: Cvar::id5(0x187fd70, "com_syncToTime"),
+        // Not mapped yet.
+        surface_draw: None,
+        cull_bounds: None,
+        view_setup: None,
         fullscreen: None,
         // Not mapped yet.
         cutting: None,
@@ -1230,6 +1283,18 @@ pub const ITEM_TAG: usize = 0x90;
 pub const ITEM_WEAPON: usize = 0x48;
 /// `idInventoryItem` (an `idWeapon`'s base): its decl (for a weapon an `idDeclWeapon`).
 pub const INVENTORY_ITEM_DECL: usize = 0x18;
+/// `idInventoryItem.count` (i32).
+pub const INVENTORY_ITEM_COUNT: usize = 0x20;
+/// The New Order's `idPlayer.playerHealth` (an `idTungstenHealth`) components, by the game's own
+/// type tables: health then armour, each `{ cur, max }` (two f32).
+pub const PLAYER_HEALTH_COMPONENTS: usize = 0x3ee0 + 0x8;
+/// `idDeclHealthItem.healthAmount` (f32) and `idDeclPlayerArmor.maxArmor` (f32), in an inventory
+/// item's decl ([`INVENTORY_ITEM_DECL`]).
+pub const HEALTH_ITEM_AMOUNT: usize = 0x310;
+pub const ARMOR_ITEM_MAX: usize = 0x31c;
+/// The inventory items' types that give health and armour.
+pub const HEALTH_ITEM_TYPE: &str = "idHealthItem";
+pub const ARMOR_ITEM_TYPE: &str = "idPlayerArmor";
 /// A decl's name (a pointer to a C string, as `weapon/...`: what the console's `testWeapon` takes).
 pub const DECL_NAME: usize = 0x8;
 /// The weapons (by decl name) the game throws by the right stick's press, as a shot of their own
@@ -1239,7 +1304,45 @@ pub const THROWS_KNIVES: &[&str] = &["weapon/knife"];
 /// The weapons (by decl name) whose target is the player's focus (what the crosshair is on: the
 /// laser that cuts chains finds what it cuts there): while one is held the focus traces along its
 /// barrel.
-pub const AIMED_BY_FOCUS: &[&str] = &["weapon/lasercutter"]; // monaka-lint: allow
+/// The laser rifle's beam ends where the focus is too, and the marksman rifle's laser sight
+/// ([`DOTTED`]) ends where its focus trace hits.
+pub const AIMED_BY_FOCUS: &[&str] = &["weapon/lasercutter", "weapon/laserkraftwerk", "weapon/ar60marksman"]; // monaka-lint: allow
+
+/// The weapons (by decl name) given a laser sight of the mod's own: a beam from the muzzle to where
+/// the barrel's focus trace hits (`cooking::hud`): the marksman rifle, whose scope is no use with
+/// the gun in the hand.
+pub const DOTTED: &[&str] = &["weapon/ar60marksman"]; // monaka-lint: allow
+
+/// The weapons (by a part of their decl name) with no laser sight the right stick's push up turns
+/// on and off (`cooking::sights::laser_switch`): every other gun has one, its shots along the beam.
+/// The laser cutter's decl name: handed to the player in scenes to cut with, aimed by its barrel.
+pub const LASER_CUTTER: &str = "weapon/lasercutter"; // monaka-lint: allow
+
+/// The weapons (by a part of their decl name) with no laser sight; see [`NOT_LASER_SWITCHED`].
+pub const NOT_LASER_SWITCHED: &[&str] = &["knife", "grenade", "pipe"]; // monaka-lint: allow
+
+/// The weapons (by decl name) whose sights sit off their hand tag's forward axis: how many degrees
+/// above it they point, and how far above it they sit (metres). Their shots, focus trace and lasers
+/// go along the sights instead (the laser rifle's measured from the right eye's view down it: its
+/// laser 1.5 degrees under the front post along the hand's axis, 7 over it turned 12 up).
+pub const SIGHT_LINE: &[(&str, f32, f32)] = &[("weapon/laserkraftwerk", 2.0, 0.10)]; // monaka-lint: allow
+
+/// The weapons (by decl name) held lower on the controller than the game's grip (metres, down the
+/// gun's own up axis; the hand with it): the marksman rifle, its sights level with the eye.
+pub const LOWERED: &[(&str, f32)] = &[("weapon/ar60marksman", 0.0508)]; // monaka-lint: allow
+
+/// `idFocusTracker_Player`: its view trace (`idFocusTrace`), and in that its start, its end (as far
+/// as it reaches) and its trace result (`trace_t`: where it stopped at [`TRACE_END_POS`], the hit
+/// point at [`TRACE_POINT`]).
+pub const FOCUS_TRACE: usize = 0xb0;
+/// `idFocusTracker::focusEntityOverride` (an entity handle): while live, the focus update takes it
+/// as what the player looks at, close enough, at no distance.
+pub const FOCUS_ENTITY_OVERRIDE: usize = 0x68;
+pub const FOCUS_TRACE_START: usize = 0x0;
+pub const FOCUS_TRACE_END: usize = 0x18;
+pub const FOCUS_TRACE_RESULT: usize = 0xb4;
+/// A trace result's end position (3 floats, after its fraction).
+pub const TRACE_END_POS: usize = 0x4;
 
 /// The weapons (by decl name) carried in both hands from the middle: the right hand's tag is the
 /// item's centre, each hand on an edge (the tea tray). They go between both controllers.

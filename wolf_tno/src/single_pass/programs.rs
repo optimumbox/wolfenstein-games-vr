@@ -43,6 +43,16 @@ pub struct Converted {
     /// Its fragment shader unprojects its pixel with four `_fa_` rows ([`convert::unprojection_row`]):
     /// the first one's location, and the unit its scene depth (`samp_viewdepthmap`) is read from.
     pub unproject: Option<(i32, Option<u32>)>,
+    /// What it draws for the frame's own motion ([`convert::motion`]), if anything.
+    pub motion: Option<convert::motion::Kind>,
+}
+
+/// What `engine` (linked from `source`) draws for the motion pass: none unless it was linked with it.
+fn motion_of(gl: &Gl, engine: u32, source: &Renderprog) -> Option<convert::motion::Kind> {
+    let kind = convert::motion::kind(&source.name, &source.vertex)?;
+    // SAFETY: a plain query with a NUL-terminated name.
+    let at = unsafe { (gl.get_uniform_location)(engine, gl_api::c_name(convert::motion::SWITCH).as_ptr()) };
+    (at >= 0).then_some(kind)
 }
 
 /// [`Converted::unproject`] for `engine`, linked from `source`.
@@ -131,11 +141,21 @@ pub struct Conversion {
     kept_before: usize,
     /// The programs kept for the next run ([`program_cache::save`]).
     saved: bool,
+    /// Only the programs [`convert::without_blur_or_grain`] patches, none converted for stereo:
+    /// [`without_blur`], each eye drawn in its own pass.
+    patches_only: bool,
 }
 
 impl Conversion {
     pub const fn new() -> Self {
-        Self { stage: Stage::Idle, sources: Vec::new(), converted: Vec::new(), failed: 0, kept_before: 0, saved: false }
+        Self { stage: Stage::Idle, sources: Vec::new(), converted: Vec::new(), failed: 0, kept_before: 0, saved: false, patches_only: false }
+    }
+
+    /// [`Self::patches_only`].
+    const fn patches() -> Self {
+        let mut conversion = Self::new();
+        conversion.patches_only = true;
+        conversion
     }
 
     /// Whether it ended (converted or given up).
@@ -149,7 +169,11 @@ impl Conversion {
         self.stage = match stage {
             Stage::Idle => start_reading(),
             Stage::Reading(receiver) => match receiver.try_recv() {
-                Ok(Ok(sources)) => {
+                Ok(Ok(mut sources)) => {
+                    if self.patches_only {
+                        // And the decals: [`super::decals`].
+                        sources.retain(|s| convert::without_blur_or_grain(&s.name, &s.fragment).is_some() || convert::unprojection_row(&s.fragment).is_some());
+                    }
                     log!("single pass: {} render programs read from the game's archive; compiling them for their assembly", sources.len());
                     parallel_compiles();
                     let scratch = sources.iter().map(|s| program_cache::program(gl, &s.vertex, &s.fragment, &[], &outputs(s, |_| None))).collect();
@@ -167,7 +191,7 @@ impl Conversion {
                     Stage::Compiling { sources, scratch, since }
                 } else {
                     self.sources = sources;
-                    let stage = match_and_convert(gl, &self.sources, &scratch, &mut self.converted);
+                    let stage = match_and_convert(gl, &self.sources, &scratch, &mut self.converted, self.patches_only);
                     if matches!(stage, Stage::Failed) && !self.converted.is_empty() {
                         self.stage = Stage::Done;
                         self.save_once();
@@ -287,6 +311,35 @@ fn uniform_names(uniforms: &[ActiveUniform]) -> Vec<String> {
     names
 }
 
+/// Depth of field and film grain left out with each eye drawn in its own pass (single pass leaves
+/// them out in its own conversion): at each `SwapBuffers` on the render thread, from the first
+/// built view (the engine's programs are made by then) until it ended. Patched programs stay so for
+/// the process: the effect is never wanted.
+pub fn without_blur(on: bool) {
+    struct Patching {
+        gl: Option<Gl>,
+        conversion: Conversion,
+        given_up: bool,
+    }
+    static PATCHING: Mutex<Patching> = Mutex::new(Patching { gl: None, conversion: Conversion::patches(), given_up: false });
+    let Ok(mut patching) = PATCHING.lock() else { return };
+    if !on || patching.given_up || patching.conversion.finished() || crate::providers::eye_site::builds() == 0 {
+        return;
+    }
+    if patching.gl.is_none() {
+        match Gl::load() {
+            Ok(gl) => patching.gl = Some(gl),
+            Err(missing) => {
+                log!("depth of field: left as it is: the driver has no {missing}");
+                patching.given_up = true;
+                return;
+            }
+        }
+    }
+    let Patching { gl: Some(gl), conversion, .. } = &mut *patching else { return };
+    conversion.step(gl);
+}
+
 /// Each matched engine program's render program name, converted or not (for the logs).
 static NAMES: LazyLock<Mutex<HashMap<u32, &'static str>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -304,7 +357,7 @@ pub fn engine_name(engine: u32) -> Option<&'static str> {
 
 /// The sources' assembly matched to the engine's programs, and a converted scratch program
 /// started for each engine program that can draw both eyes.
-fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: &mut Vec<Converted>) -> Stage {
+fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: &mut Vec<Converted>, patches_only: bool) -> Stage {
     let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
     let mut names = Vec::with_capacity(sources.len());
     for (index, &program) in scratch.iter().enumerate() {
@@ -319,6 +372,7 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
     }
     let (mut engine_programs, mut matched, mut flat) = (0, 0, 0);
     let mut jobs = Vec::new();
+    let mut decals = Vec::new();
     for engine in 1..=LAST_NAME {
         // SAFETY: a plain query.
         if unsafe { (gl.is_program)(engine) } == 0 {
@@ -327,7 +381,7 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         engine_programs += 1;
         // Converted by an earlier run in this process: known by its stereo uniform, its source by
         // its other uniforms' names.
-        if let Some((converted, source)) = converted_before(gl, engine, sources, &names) {
+        if !patches_only && let Some((converted, source)) = converted_before(gl, engine, sources, &names) {
             // Converted before its fragment shader read the scene's maps layered: converted again.
             let layered = gl.uniforms(engine).iter().any(|u| u.name.starts_with(convert::LAYERED_PREFIX));
             let fragment = &sources[source].fragment;
@@ -354,6 +408,10 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
             jobs.push(patch(gl, engine, &uniforms, source, program, &fragment));
             continue;
         }
+        if patches_only {
+            decals.extend(super::decals::decal(gl, engine, program));
+            continue;
+        }
         if convert::position_rows(&program.vertex).is_none() {
             flat += 1;
             continue;
@@ -367,6 +425,9 @@ fn match_and_convert(gl: &Gl, sources: &[Renderprog], scratch: &[u32], already: 
         already.len(),
         jobs.len()
     );
+    if patches_only {
+        super::decals::found(decals);
+    }
     if jobs.is_empty() {
         return Stage::Failed;
     }
@@ -386,10 +447,23 @@ fn job(gl: &Gl, engine: u32, uniforms: &[ActiveUniform], source: usize, program:
         None => (vertex, None),
     };
     let fragment_source = lit_fragment.as_deref().unwrap_or(&program.fragment);
+    // Drawn for the frame's own motion too, where both shaders take it ([`convert::motion`]).
+    let motion = convert::motion::kind(&program.name, &program.vertex).filter(|&kind| convert::motion::fragment(fragment_source, kind).is_some());
+    let moved_vertex = match motion {
+        Some(kind @ convert::motion::Kind::Character { .. }) => convert::motion::vertex(&vertex, kind),
+        _ => None,
+    };
+    let motion = motion.filter(|kind| !matches!(kind, convert::motion::Kind::Character { .. }) || moved_vertex.is_some());
+    let vertex = moved_vertex.unwrap_or(vertex);
+    let moving = |fragment: &str| motion.and_then(|kind| convert::motion::fragment(fragment, kind)).unwrap_or_else(|| fragment.to_owned());
+    let moved_fragment = moving(fragment_source);
     let located = |u: &convert::Uniform| uniforms.iter().find(|a| a.name == u.name).and_then(|a| a.locations.first().copied()).filter(|&l| l >= 0);
     let vertex = convert::with_locations(&vertex, &located);
-    let plain = convert::with_locations(fragment_source, &located);
-    let layered = layered_maps(&program.fragment, fragment_source);
+    let plain = convert::with_locations(&moved_fragment, &located);
+    let layered = layered_maps(&program.fragment, fragment_source).map(|mut l| {
+        l.source = moving(&l.source);
+        l
+    });
     // SAFETY: plain queries with NUL-terminated names.
     let outputs = outputs(program, |name| u32::try_from(unsafe { (gl.get_frag_data_location)(engine, gl_api::c_name(name).as_ptr()) }).ok());
     let attributes = gl.attributes(engine);
@@ -433,6 +507,7 @@ fn converted_before(gl: &Gl, engine: u32, sources: &[Renderprog], names: &[Vec<S
         name: leak(&source.name),
         screen: screen(gl, engine, &maps),
         unproject: unproject(gl, engine, source),
+        motion: motion_of(gl, engine, source),
     };
     Some((converted, index))
 }
@@ -551,7 +626,16 @@ fn swap(gl: &Gl, job: &Job, source: &Renderprog) -> Result<Option<Converted>, St
     if rows.iter().chain(&stereo).any(|&l| l < 0) {
         return Err(put_back(format!("{} has no _va_ rows or stereo uniform", source.name)));
     }
-    Ok(Some(Converted { program: engine, rows, stereo, reads_screen: convert::reads_screen(&source.fragment), name: leak(&source.name), screen: screen(gl, engine, &job.maps), unproject: unproject(gl, engine, source) }))
+    Ok(Some(Converted {
+        program: engine,
+        rows,
+        stereo,
+        reads_screen: convert::reads_screen(&source.fragment),
+        name: leak(&source.name),
+        screen: screen(gl, engine, &job.maps),
+        unproject: unproject(gl, engine, source),
+        motion: motion_of(gl, engine, source),
+    }))
 }
 
 fn restore(gl: &Gl, program: u32, uniforms: &[ActiveUniform], values: &[Option<Vec<gl_api::Values>>], blocks: &[u32]) {

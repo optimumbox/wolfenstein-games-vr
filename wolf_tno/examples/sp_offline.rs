@@ -79,6 +79,36 @@ fn main() {
         let located = |u: &convert::Uniform| uniforms.iter().find(|a| a.name == u.name).and_then(|a| a.locations.first().copied()).filter(|&l| l >= 0);
         let vertex = convert::with_locations(&vertex, &located);
         let fragment = convert::with_locations(&program.fragment, &located);
+        // The motion pass's conversion (as `programs::job` makes it), linked on its own.
+        if let Some(kind) = convert::motion::kind(&program.name, &program.vertex) {
+            let stereo = convert::stereo_vertex(&program.vertex).expect("converted above");
+            let (lit_vertex, lit_fragment) = convert::eye_rays(&program.vertex, &stereo, &program.fragment).unwrap_or((stereo, program.fragment.clone()));
+            let moved_vertex = match kind {
+                convert::motion::Kind::Character { .. } => convert::motion::vertex(&lit_vertex, kind),
+                convert::motion::Kind::Particle => Some(lit_vertex),
+            };
+            match (moved_vertex, convert::motion::fragment(&lit_fragment, kind)) {
+                (Some(v), Some(f)) => {
+                    let (v, f) = (convert::with_locations(&v, &located), convert::with_locations(&f, &located));
+                    let moved = gl.program(&v, &f, &gl.attributes(original), &outputs(program));
+                    match gl.linked(moved) {
+                        Ok(()) => println!("{}: motion ({kind:?}) links", program.name),
+                        Err(log) => {
+                            converted_failed += 1;
+                            println!("{}: motion ({kind:?}) does not link: {}", program.name, first_lines(&log));
+                            if let Some(out) = &out {
+                                let _ = std::fs::create_dir_all(out);
+                                let _ = std::fs::write(out.join(format!("{}.motion.vert", program.name)), &v);
+                                let _ = std::fs::write(out.join(format!("{}.motion.frag", program.name)), &f);
+                            }
+                        }
+                    }
+                    // SAFETY: a program of our own.
+                    unsafe { (gl.delete_program)(moved) };
+                }
+                (v, f) => println!("{}: motion ({kind:?}) not converted (vertex {}, fragment {})", program.name, v.is_some(), f.is_some()),
+            }
+        }
         let converted = gl.program(&vertex, &fragment, &gl.attributes(original), &outputs(program));
         match gl.linked(converted) {
             Ok(()) => {

@@ -36,6 +36,15 @@
 //! weapon, their depth squeezed in front of the world) is not carried by the eye matrix, which
 //! fits the world's: each pass draws it into its own layer ([`depth_ratio`]).
 //!
+//! The right eye's carried draws are skipped where the engine makes them, not only at their GL
+//! call: its draw of one surface ([`surface_draw`]) returns at once for a draw the left eye's pass
+//! carried (found by the engine's own surface and its rows), so neither the engine's work for it
+//! (binding its vertex arrays) nor ours at its GL draw is done (RDRVR's lesson: skipping a draw's
+//! API call leaves its cost; skipping the engine's draw method removes it). What the surface draw
+//! cannot tell before its GL draw (culling boxes, queries not answered by the left eye's, misfits,
+//! draws found only by shape or moved) goes on to the GL draw's own decision, which also checks a
+//! share of the skips ([`Entry`]).
+//!
 //! The detours ask the driver nothing per call: a state query waits for the driver's own thread.
 //! The active texture unit and what draws write are kept from the engine's own calls ([`Shadow`]),
 //! checked against queries now and then.
@@ -68,7 +77,8 @@ use super::programs::{Conversion, Converted, Screen};
 use super::screen::{self, Drawn, Learner, Row};
 use monaka_core::sync::Locked;
 use monaka_hook::module::Module;
-use monaka_hook::{Hooks, InFlight, Original};
+use crate::providers::engine::SurfaceDrawFn;
+use monaka_hook::{Hooks, InFlight, Original, Site};
 use monaka_producer::log;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -226,6 +236,8 @@ struct Counts {
 struct Carried {
     by: HashMap<(u32, u64), Vec<Rows>>,
     by_shape: HashMap<(u32, u64), Vec<Rows>>,
+    /// By program and the engine's surface draw ([`surface_key`]; those made through it).
+    by_surface: HashMap<(u32, u64), Vec<Rows>>,
 }
 
 /// How a right eye's draw was found among the left eye's carried draws.
@@ -236,14 +248,29 @@ enum Found {
 }
 
 impl Carried {
-    fn keep(&mut self, program: u32, geometry: u64, shape: u64, carried: Rows) {
+    fn keep(&mut self, program: u32, geometry: u64, shape: u64, surface: u64, carried: Rows) {
         self.by.entry((program, geometry)).or_default().push(carried);
         self.by_shape.entry((program, shape)).or_default().push(carried);
+        if surface != 0 {
+            self.by_surface.entry((program, surface)).or_default().push(carried);
+        }
+    }
+
+    /// Whether the right eye's surface draw `surface` of `program` with `rows` is one of them.
+    fn found_surface(&self, program: u32, surface: u64, rows: &Rows) -> bool {
+        self.by_surface.get(&(program, surface)).is_some_and(|carried| {
+            carried.iter().any(|c| {
+                if PROFILING {
+                    SCAN_SURFACES.fetch_add(1, Relaxed);
+                }
+                eye_matrix::close(c, rows, eye_matrix::AGREES * 10.0)
+            })
+        })
     }
 
     /// Whether the right eye's draw of `program` with `geometry`, `shape` and `rows` is one of them.
     fn find(&mut self, program: u32, geometry: u64, shape: u64, rows: &Rows) -> Option<Found> {
-        let agrees = |c: &Rows| eye_matrix::apart(c, rows) <= eye_matrix::AGREES * 10.0;
+        let agrees = |c: &Rows| eye_matrix::close(c, rows, eye_matrix::AGREES * 10.0);
         if self.by.get(&(program, geometry)).is_some_and(|carried| carried.iter().any(agrees)) {
             return Some(Found::Geometry);
         }
@@ -262,6 +289,7 @@ impl Carried {
     fn clear(&mut self) {
         self.by.clear();
         self.by_shape.clear();
+        self.by_surface.clear();
     }
 }
 
@@ -273,6 +301,8 @@ const MOVED_BETWEEN: f64 = 0.02;
 
 /// The frames between checks of the right eye's draws against the left's carried by the matrix.
 const CHECK_EVERY: u64 = 15;
+/// The right eye's draws checked against the left eye's on a checking frame, at most.
+const CHECKS_A_FRAME: usize = 96;
 /// Checked draws needed before a program is judged, and the share not found that makes it a misfit:
 /// most of them, as a draw the left eye culled is not found either (the world's depth pass, half
 /// not found, is carried well; the glows' programs miss all but a few).
@@ -297,14 +327,24 @@ const FRAME_FOUND_SHARE: f64 = 0.33;
 struct Misfits {
     checked: HashMap<u32, (u64, u64)>,
     misfits: HashSet<u32>,
-    /// A checked frame's left-eye stretch rows by program.
+    /// A checked frame's left-eye stretch rows by program, carried into the right eye.
     left: HashMap<u32, Vec<Rows>>,
+    /// The checking frame's checks so far ([`CHECKS_A_FRAME`]).
+    checks: usize,
     /// The right eye's stretch draws by program, and those not among the left eye's ([`Carried`]),
     /// with the frames they came from; counted from frames the matrix carried ([`Self::end_frame`]).
     carried: HashMap<u32, (u64, u64, u64)>,
     /// The frame's own count, by program, before it is known whether the frame counts.
     frame: HashMap<u32, (u64, u64)>,
     frame_names: HashMap<u32, &'static str>,
+}
+
+/// A program of solid props reading the virtual texture (`outside`: chairs, ropes, cuffs): never a
+/// misfit, always carried from the left eye's pass, and the right eye's own draws of it skipped. Its
+/// skinned draws are rarely found among the left eye's (judged a misfit), and drawn in the right
+/// eye's own pass they read the virtual texture's pages mid-update: flickering neon.
+fn carried_prop(name: &str) -> bool {
+    name.starts_with("outside")
 }
 
 impl Misfits {
@@ -336,20 +376,27 @@ impl Misfits {
             *seen += frame_seen;
             *missed += frame_missed;
             *frames += 1;
-            if *seen >= CARRIED_JUDGED_AFTER && *frames >= CARRIED_JUDGED_FRAMES && *missed as f64 > *seen as f64 * CARRIED_MISFIT_SHARE && self.misfits.insert(program) {
-                let name = self.frame_names.get(&program).copied().unwrap_or("?");
+            let name = self.frame_names.get(&program).copied().unwrap_or("?");
+            if !carried_prop(name) && *seen >= CARRIED_JUDGED_AFTER && *frames >= CARRIED_JUDGED_FRAMES && *missed as f64 > *seen as f64 * CARRIED_MISFIT_SHARE && self.misfits.insert(program) {
                 log!("single pass: program {program} ({name}) draws other geometry in each eye's pass ({missed} of {seen} of the right eye's draws over {frames} frames not the left's): each eye draws it");
             }
         }
     }
 
-    /// The right eye's draw of `program` with `rows`, against the left eye's carried by `matrix`.
-    fn check(&mut self, program: u32, name: &str, rows: &Rows, matrix: &Rows) {
-        let found = self.left.get(&program).is_some_and(|left| left.iter().any(|l| eye_matrix::misfit(matrix, l, rows) <= eye_matrix::AGREES * 10.0));
+    /// The right eye's draw of `program` with `rows`, against the left eye's carried. At most
+    /// [`CHECKS_A_FRAME`] a checking frame: each looks through the left eye's draws of its program
+    /// (hundreds), and a frame checking all of a thousand skips took 30 ms (a hitch every
+    /// [`CHECK_EVERY`] frames).
+    fn check(&mut self, program: u32, name: &str, rows: &Rows) {
+        if self.checks >= CHECKS_A_FRAME {
+            return;
+        }
+        self.checks += 1;
+        let found = self.left.get(&program).is_some_and(|left| left.iter().any(|l| eye_matrix::close(l, rows, eye_matrix::AGREES * 10.0)));
         let (checked, missed) = self.checked.entry(program).or_default();
         *checked += 1;
         *missed += u64::from(!found);
-        if *checked >= JUDGED_AFTER && *missed as f64 > *checked as f64 * MISFIT_SHARE && self.misfits.insert(program) {
+        if !carried_prop(name) && *checked >= JUDGED_AFTER && *missed as f64 > *checked as f64 * MISFIT_SHARE && self.misfits.insert(program) {
             log!("single pass: program {program} ({name}) is not carried by the eye matrix ({missed} of {checked} draws not found): each eye draws it");
         }
     }
@@ -365,6 +412,8 @@ struct Profile {
     times: [Duration; 5],
     draws: [u64; 5],
     ours: Duration,
+    /// The draw detour's own work by part.
+    ours_by: [Duration; 5],
     frames: u64,
     /// The frame's last draw, and the time from it to the swap.
     last_draw: Option<Instant>,
@@ -376,6 +425,7 @@ struct Profile {
 
 impl Profile {
     fn enter(&mut self, part: usize) {
+        PROFILE_PART.store(part, Relaxed);
         let now = Instant::now();
         if let Some(since) = self.since {
             self.times[self.part] += now - since;
@@ -406,7 +456,18 @@ impl Profile {
         let mut targets: Vec<_> = self.by_target.drain().collect();
         targets.sort_by(|a, b| b.1.0.cmp(&a.1.0));
         let targets = targets.iter().take(14).map(|(name, (time, draws))| format!("{name} {:.2} ms ({:.0})", ms(*time), *draws as f64 / frames)).collect::<Vec<_>>().join(", ");
-        let text = format!("{text}; the rests by framebuffer: {targets}; the draw detour's own work {:.2} ms; from the last draw to the swap {:.2} ms; in the engine's waits and reads: {waits}", ms(self.ours), ms(self.after_last));
+        let by_part = |f: &dyn Fn(usize) -> String| (0..5).map(f).collect::<Vec<_>>().join("/");
+        let nanos = |a: &[AtomicU64; 5], i: usize| a[i].swap(0, Relaxed) as f64 / 1e6 / frames;
+        let ours = by_part(&|i| format!("{:.2}", ms(self.ours_by[i])));
+        let driver = by_part(&|i| format!("{:.2}", nanos(&DRIVER_NS, i)));
+        let motion = by_part(&|i| format!("{:.2}", nanos(&MOTION_NS, i)));
+        let redraws = by_part(&|i| format!("{:.0}", MOTION_DRAWS[i].swap(0, Relaxed) as f64 / frames));
+        let text = format!(
+            "{text}; the rests by framebuffer: {targets}; the draw detour's own work {:.2} ms; from the last draw to the swap {:.2} ms; in the engine's waits and reads: {waits}; by part (before/left stretch/left rest/right stretch/right rest): the detour's own {ours} ms, the engine's draws in the driver {driver} ms, DLSS motion redraws {motion} ms ({redraws})",
+            ms(self.ours),
+            ms(self.after_last)
+        );
+        let text = format!("{text}; the right eye's stretch draws by caller (exe offsets, the draw call's first): {}", callers_report(frames));
         *self = Self { part: self.part, since: self.since, ..Self::default() };
         text
     }
@@ -414,10 +475,13 @@ impl Profile {
 
 /// The live frames whose passes are written to the log: each run of draws into one framebuffer
 /// and viewport as a line, with the clears between them.
-const TRACED_FRAMES: std::ops::Range<u64> = 600..602;
+const TRACED_FRAMES: std::ops::Range<u64> = 0..0;
 /// Whether the render thread is profiled (by part, by framebuffer, the engine's waits timed) and
 /// frames [`TRACED_FRAMES`] traced: research only, it costs the render thread time per draw.
 const PROFILING: bool = false;
+/// Whether the render thread is sampled once a run ([`crate::research::profile`]: 10 s, a little
+/// after play starts), whatever [`PROFILING`] is: the sampler costs nothing per draw.
+const SAMPLED: bool = true;
 const TRACED_LINES: usize = 600;
 
 /// A traced frame: its lines and the run of draws being counted.
@@ -461,6 +525,9 @@ struct State {
     /// The units given the right eye's scene depth in its pass, with the engine's texture there
     /// (bound again after the pass), and whether this frame's copy was made.
     depth_units: HashMap<u32, u32>,
+    /// The units given the right eye's kept self-shadow in its own draws ([`right_self_shadow`]),
+    /// with the engine's texture there before.
+    shadow_units: HashMap<u32, u32>,
     depth_copied: bool,
     layers: Option<Layers>,
     /// The stand-ins could not be made (not tried again this run).
@@ -487,6 +554,10 @@ struct State {
     /// draw's geometry, answered for the right eye yet), and where the right eye's pass looks next.
     left_queries: Vec<LeftQuery>,
     query_cursor: usize,
+    /// [`Self::left_queries`] by their draw's geometry and by their surface draw: each right query
+    /// looks only at the left ones of its own mesh (a scan of them all cost 1.2 ms a frame).
+    queries_by_geometry: HashMap<u64, QueryIndex>,
+    queries_by_surface: HashMap<u64, QueryIndex>,
     /// This frame's left-eye stretch draws made for both eyes ([`Carried`]).
     carried: Carried,
     /// The right eye's stretch draws the left eye's did not make, by program.
@@ -502,6 +573,8 @@ struct State {
     /// The right eye's draws skipped as moved between the passes, by program, and the farthest.
     moved_by: HashMap<u32, (u64, f64)>,
     misfits: Misfits,
+    /// The shadow maps the right eye's pass takes from the left eye's.
+    shadow_maps: ShadowMaps,
     /// The right eye's rows of the programs reading the scene's maps, learnt.
     screen: Learner,
     /// The arrays bound to the units of the layered maps' samplers.
@@ -509,6 +582,8 @@ struct State {
     /// The rows kept from the engine's uploads disagreed with the driver's: read from it always.
     rows_untrusted: bool,
     profile: Profile,
+    /// The right eye's draws skipped at the engine's surface draw ([`surface_draw`]).
+    entry: Entry,
     agreeing: (usize, usize),
     logged: Option<Instant>,
     live_frames: u64,
@@ -522,6 +597,27 @@ struct State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+/// The profile's part now ([`Profile::enter`]), and per part the time in the engine's draw calls
+/// (the driver's own work for them) and in the DLSS motion redraws after them, with their count.
+static PROFILE_PART: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The draws that reached the detours so far, for the render thread's sampler
+/// ([`crate::research::profile`]): a sample with no draw between it and the next `SwapBuffers` was
+/// taken after the frame's last draw.
+pub static DRAWS_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// The render thread's part of the frame now (before the left pass, left stretch, left rest,
+/// right stretch, right rest).
+pub fn profile_part() -> usize {
+    PROFILE_PART.load(Relaxed)
+}
+
+/// Whether this build samples the render thread ([`SAMPLED`]).
+pub const fn profiling() -> bool {
+    SAMPLED
+}
+static DRIVER_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static MOTION_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static MOTION_DRAWS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static HOOKS: Mutex<Option<Hooks>> = Mutex::new(None);
 /// Set by the render thread once every converted program's switch is off after the stop began.
 static LET_GO: AtomicBool = AtomicBool::new(false);
@@ -546,6 +642,7 @@ fn state() -> State {
         read_framebuffer: 0,
         units: HashMap::new(),
         depth_units: HashMap::new(),
+        shadow_units: HashMap::new(),
         depth_copied: false,
         layers: None,
         layers_failed: false,
@@ -562,6 +659,8 @@ fn state() -> State {
         own_by: HashMap::new(),
         left_queries: Vec::new(),
         query_cursor: 0,
+        queries_by_geometry: HashMap::new(),
+        queries_by_surface: HashMap::new(),
         carried: Carried::default(),
         right_only_by: HashMap::new(),
         by_shape_by: HashMap::new(),
@@ -570,9 +669,11 @@ fn state() -> State {
         largest_jump: 0.0,
         moved_by: HashMap::new(),
         misfits: Misfits::default(),
+        shadow_maps: ShadowMaps::default(),
         screen: Learner::default(),
         map_arrays: HashMap::new(),
         rows_untrusted: false,
+        entry: Entry::default(),
         profile: Profile::default(),
         agreeing: (0, 0),
         logged: None,
@@ -731,6 +832,7 @@ pub fn frame(on: bool) {
         _ => None,
     };
     set_pair_depth(pair.and_then(|(view, (w, h))| Some((view, u32::try_from(w).ok()?, u32::try_from(h).ok()?))));
+    super::motion::frame_end(passes == 2 && state.layers.is_some());
     if let (Some(layers), Some(gl)) = (state.layers.as_ref(), state.gl.as_ref()) {
         layers.copy_back(gl, state.layer());
     }
@@ -771,13 +873,18 @@ pub fn frame(on: bool) {
     // The average whenever there is one: the matrix does not change, so a frame whose own pairs
     // gave none still has both eyes in one pass (each eye on its own for a frame is a blink).
     state.matrix = fitted.or(measured.map(|m| m.matrix));
+    super::cull::eye_matrix(state.matrix);
     state.matrix_number += 1;
     state.agreeing = measured.map_or((0, paired.len()), |m| (m.agreeing, m.looked_at));
     state.left.clear();
     state.misfits.left.clear();
+    state.misfits.checks = 0;
     state.misfits.end_frame();
+    state.shadow_maps.end_frame();
     state.left_queries.clear();
     state.query_cursor = 0;
+    state.queries_by_geometry.clear();
+    state.queries_by_surface.clear();
     state.carried.clear();
     SHARING.store(false, Relaxed);
     state.world_depth = median(&mut state.depth_ratios);
@@ -826,6 +933,10 @@ pub fn frame(on: bool) {
         if PROFILING {
             log!("single pass: render thread per frame: {}", state.profile.report());
         }
+        let frames = c.frames_on.saturating_sub(state.entry.frames_at).max(1) as f64;
+        log!("single pass: {}", super::cull::report(frames));
+        log!("single pass: {}", state.shadow_maps.report(frames));
+        log!("single pass: {}", state.entry.report(c.frames_on, &state.programs));
         let frames = c.frames_on.max(1) as f64;
         let queries = QUERIES.iter().map(|(target, by_pass)| {
             let by_pass: Vec<String> = by_pass.iter().map(|n| format!("{:.1}", n.load(Relaxed) as f64 / frames)).collect();
@@ -849,7 +960,7 @@ pub fn frame(on: bool) {
             c.queries_rows_only as f64 / frames,
             queries.collect::<Vec<_>>().join(", ")
         );
-        log!("single pass: the right eye's stretch draws the left eye's pass did not make (culled for the left eye), drawn by the right eye's: {} ({:.1} a frame; by program: {}); the eye matrix paired by the last one in {} frames", c.right_only, c.right_only as f64 / frames, {
+        log!("single pass: the right eye's stretch draws not found among the left eye's pass's (skipped all the same): {} ({:.1} a frame; by program: {}); the eye matrix paired by the last one in {} frames", c.right_only, c.right_only as f64 / frames, {
             let mut by: Vec<_> = state.right_only_by.iter().map(|(p, n)| (*n, state.programs.get(p).map_or("?", |p| p.converted.name), *p)).collect();
             by.sort_unstable_by(|a, b| b.0.cmp(&a.0));
             by.iter().take(12).map(|(n, name, p)| format!("{name} ({p}) {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
@@ -911,6 +1022,7 @@ pub fn frame(on: bool) {
 fn stop(state: &mut State) {
     SHARING.store(false, Relaxed);
     set_pair_depth(None);
+    super::motion::stop();
     forward_pending();
     depth_given_back(state);
     if let Some(gl) = state.gl.as_ref() {
@@ -1059,6 +1171,30 @@ static DRAW_ELEMENTS_INSTANCED_BASE_VERTEX_BASE_INSTANCE: Original<DrawElementsI
 static DRAW_ARRAYS_INSTANCED_BASE_INSTANCE: Original<DrawArraysInstancedBaseInstanceFn> = Original::new();
 static MULTI_DRAW_ELEMENTS_INDIRECT_BINDLESS: Original<MultiDrawElementsIndirectBindlessFn> = Original::new();
 static ACTIVE_TEXTURE: Original<CapFn> = Original::new();
+type BindBufferRangeFn = unsafe extern "system" fn(u32, u32, u32, isize, isize);
+type BindBufferBaseFn = unsafe extern "system" fn(u32, u32, u32);
+static BIND_BUFFER_RANGE: Original<BindBufferRangeFn> = Original::new();
+static BIND_BUFFER_BASE: Original<BindBufferBaseFn> = Original::new();
+const GL_UNIFORM_BUFFER: u32 = 0x8A11;
+
+/// The engine's uniform buffer binds, kept for the motion's character draws.
+unsafe extern "system" fn bind_buffer_range(target: u32, index: u32, buffer: u32, offset: isize, size: isize) {
+    let flight = InFlight::enter();
+    if target == GL_UNIFORM_BUFFER {
+        super::motion::uniform_buffer_bound(index, buffer, offset, size);
+    }
+    // SAFETY: forwards the game's own call.
+    unsafe { BIND_BUFFER_RANGE.get(&flight)(target, index, buffer, offset, size) }
+}
+
+unsafe extern "system" fn bind_buffer_base(target: u32, index: u32, buffer: u32) {
+    let flight = InFlight::enter();
+    if target == GL_UNIFORM_BUFFER {
+        super::motion::uniform_buffer_bound(index, buffer, 0, 0);
+    }
+    // SAFETY: forwards the game's own call.
+    unsafe { BIND_BUFFER_BASE.get(&flight)(target, index, buffer) }
+}
 static READ_PIXELS: Original<ReadPixelsFn> = Original::new();
 static FINISH: Original<VoidFn> = Original::new();
 static FLUSH: Original<VoidFn> = Original::new();
@@ -1132,7 +1268,7 @@ static SCISSOR: Original<RectFn> = Original::new();
 static SCISSOR_OPENED: AtomicBool = AtomicBool::new(false);
 
 /// Where the executable's data holds `address`.
-fn slots(exe: &Module, address: usize) -> Vec<usize> {
+pub(super) fn slots(exe: &Module, address: usize) -> Vec<usize> {
     let Some(code) = exe.kept_code() else { return Vec::new() };
     let mut out = Vec::new();
     for section in code.sections().iter().filter(|s| !s.executable) {
@@ -1247,6 +1383,11 @@ fn install() -> bool {
         hook!(c::CLEAR_BUFFER_FV, "glClearBufferfv", c::clear_buffer_fv, false);
     }
     let unit = hook!(ACTIVE_TEXTURE, "glActiveTexture", active_texture as CapFn, false);
+    let ranges = hook!(BIND_BUFFER_RANGE, "glBindBufferRange", bind_buffer_range as BindBufferRangeFn, false);
+    let bases = hook!(BIND_BUFFER_BASE, "glBindBufferBase", bind_buffer_base as BindBufferBaseFn, false);
+    if ranges > 0 || bases > 0 {
+        super::motion::uniform_buffers_hooked();
+    }
     let state_kept = [
         hook!(COLOR_MASK, "glColorMask", color_mask as ColorMaskFn, false),
         hook!(DEPTH_MASK, "glDepthMask", depth_mask as DepthMaskFn, false),
@@ -1262,19 +1403,13 @@ fn install() -> bool {
     hook!(BEGIN_CONDITIONAL, "glBeginConditionalRender", begin_conditional as BeginQueryFn, false);
     hook!(BEGIN_CONDITIONAL_NV, "glBeginConditionalRenderNV", begin_conditional_nv as BeginQueryFn, false);
     if PROFILING {
-        hook!(READ_PIXELS, "glReadPixels", read_pixels as ReadPixelsFn, false);
-        hook!(FINISH, "glFinish", finish as VoidFn, false);
-        hook!(FLUSH, "glFlush", flush as VoidFn, false);
-        hook!(CLIENT_WAIT_SYNC, "glClientWaitSync", client_wait_sync as ClientWaitSyncFn, false);
-        hook!(WAIT_SYNC, "glWaitSync", wait_sync as WaitSyncFn, false);
+        // Not those hooked above already (`calls`, `uploads`): a slot takes one detour, and a
+        // second turned single pass off.
         hook!(GET_SYNC_IV, "glGetSynciv", get_synciv as GetSyncivFn, false);
         hook!(GET_BUFFER_SUB_DATA, "glGetBufferSubData", get_buffer_sub_data as GetBufferSubDataFn, false);
-        hook!(MAP_BUFFER_RANGE, "glMapBufferRange", map_buffer_range as MapBufferRangeFn, false);
-        hook!(MAP_BUFFER, "glMapBuffer", map_buffer as MapBufferFn, false);
         hook!(GET_INTEGER_V, "glGetIntegerv", get_integer_v as GetvFn, false);
         hook!(GET_BOOLEAN_V, "glGetBooleanv", get_boolean_v as GetvFn, false);
         hook!(GET_FLOAT_V, "glGetFloatv", get_float_v as GetvFn, false);
-        hook!(GET_TEX_IMAGE, "glGetTexImage", get_tex_image as GetTexImageFn, false);
     }
     hook!(GET_QUERY_OBJECT_UIV, "glGetQueryObjectuiv", get_query_object_uiv as GetQueryObjectFn, false);
     hook!(GET_QUERY_OBJECT_UI64V, "glGetQueryObjectui64v", get_query_object_ui64v as GetQueryObjectFn, false);
@@ -1282,6 +1417,15 @@ fn install() -> bool {
     hook!(GET_QUERY_OBJECT_UIV_ARB, "glGetQueryObjectuivARB", get_query_object_uiv_arb as GetQueryObjectFn, false);
     hook!(GET_QUERY_OBJECT_IV_ARB, "glGetQueryObjectivARB", get_query_object_iv_arb as GetQueryObjectFn, false);
     hook!(GET_QUERY_OBJECT_I64V, "glGetQueryObjecti64v", get_query_object_i64v as GetQueryObjectFn, false);
+    super::cull::install(&mut hooks, &exe);
+    let site = *SURFACE_SITE.locked();
+    match site {
+        Some(site) => match hooks.site(&SURFACE_DRAW, &exe, &site, surface_draw as SurfaceDrawFn) {
+            Ok(()) => log!("single pass: the right eye's carried draws skipped at the engine's surface draw ({site:?})"),
+            Err(e) => log!("single pass: the engine's surface draw not hooked ({e}): the right eye's draws skipped at their GL call only"),
+        },
+        None => log!("single pass: the engine's surface draw is not mapped for this build: the right eye's draws skipped at their GL call only"),
+    }
     Shadow::take();
     UNIT_TRUSTED.store(unit > 0, Relaxed);
     SHADOW_TRUSTED.store(state_kept.iter().all(|&n| n > 0), Relaxed);
@@ -1314,6 +1458,7 @@ fn set_switch(gl: &Gl, program: &mut Program, on: bool) {
 /// Uniform rows uploaded to `program` from `location` on: the position rows among them kept.
 fn uploaded(state: &mut State, program: u32, location: i32, count: i32, values: *const f32) {
     let pass = state.pass;
+    let id = program;
     let Some(program) = state.programs.get_mut(&program) else { return };
     if let Some((at, _)) = program.converted.unproject
         && !values.is_null()
@@ -1341,6 +1486,9 @@ fn uploaded(state: &mut State, program: u32, location: i32, count: i32, values: 
             // SAFETY: the engine's buffer holds `count` vec4s.
             program.rows[row] = unsafe { *values.add(offset as usize * 4).cast::<[f32; 4]>() };
         }
+    }
+    if program.converted.motion.is_some() {
+        super::motion::uploaded(id, location, count, values);
     }
     if let Some(screen) = program.converted.screen {
         kept(&mut program.vertex, screen.vertex_rows, location, count, values);
@@ -1536,8 +1684,14 @@ fn draw(geometry: u64, shape: u64) -> bool {
 #[derive(Clone, Copy, Debug)]
 struct LeftQuery {
     id: u32,
-    rows: Rows,
+    /// Its rows carried into the right eye ([`eye_matrix::carry`]), made once at the left eye's
+    /// draw: the right eye's draws compare their own rows to them, no matrix product each.
+    carried: Rows,
     geometry: u64,
+    /// The engine's surface draw ([`surface_key`]; 0: not made through it): looked up by
+    /// [`State::queries_by_surface`], kept for the tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    surface: u64,
     /// Already the answer to one of the right eye's queries.
     taken: bool,
 }
@@ -1558,23 +1712,65 @@ enum QueryMatch {
 /// start; each left query answers one right query. Rows alone do not tell the queries apart (the
 /// world's bounding boxes all share the view's rows): answered by another box's query, the right
 /// eye's pass culled what it sees and drew what it does not, a wall here and a floor there.
-fn left_query(left: &mut [LeftQuery], cursor: &mut usize, matrix: &Rows, rows: &Rows, geometry: u64) -> QueryMatch {
-    let start = (*cursor).min(left.len());
-    let mut rows_only = false;
-    for i in (start..left.len()).chain(0..start) {
-        let query = &mut left[i];
-        if query.taken || eye_matrix::misfit(matrix, &query.rows, rows) > eye_matrix::AGREES * 10.0 {
-            continue;
-        }
-        if query.geometry != geometry {
-            rows_only = true;
-            continue;
-        }
-        query.taken = true;
+///
+/// The geometry is compared first: the rows' check is a matrix product, and a right query of
+/// something the left eye did not query (a hundred a frame) looked at every left query (four
+/// hundred): 2 ms a frame. Whether another thing's query had the rows is looked for only with
+/// `rows_only_too` (the checking frames), for the counts.
+#[cfg_attr(not(test), allow(dead_code))]
+fn left_query(left: &mut [LeftQuery], cursor: &mut usize, rows: &Rows, geometry: u64, rows_only_too: bool) -> QueryMatch {
+    if let Some(i) = find_left_query(left, *cursor, rows, |q| q.geometry == geometry) {
+        left[i].taken = true;
         *cursor = i + 1;
-        return QueryMatch::Same(query.id);
+        return QueryMatch::Same(left[i].id);
     }
-    if rows_only { QueryMatch::RowsOnly } else { QueryMatch::None }
+    let agrees = |q: &LeftQuery| eye_matrix::close(&q.carried, rows, eye_matrix::AGREES * 10.0);
+    if rows_only_too && left.iter().any(|q| !q.taken && q.geometry != geometry && agrees(q)) { QueryMatch::RowsOnly } else { QueryMatch::None }
+}
+
+/// The first left query, from `cursor` on and then from the start, not yet taken, of the `same`
+/// thing, whose rows the right eye's `rows` copy.
+/// The first of the left queries at `candidates` (those of one mesh) not yet taken whose rows
+/// the right eye's `rows` copy.
+fn find_indexed(left: &[LeftQuery], candidates: Option<&mut QueryIndex>, rows: &Rows) -> Option<usize> {
+    let index = candidates?;
+    // Past the taken ones at the front: the passes make their queries in much the same order, so
+    // most lists are taken from the front, and scanning them from their start each time made the
+    // right eye's queries quadratic (an eighth of the render thread).
+    while index.at.get(index.start).is_some_and(|&i| left[i].taken) {
+        index.start += 1;
+    }
+    let end = index.at.len().min(index.start + QUERY_SCAN);
+    index.at[index.start..end].iter().copied().find(|&i| {
+        if PROFILING {
+            SCAN_QUERIES.fetch_add(1, Relaxed);
+        }
+        let query = &left[i];
+        !query.taken && eye_matrix::close(&query.carried, rows, eye_matrix::AGREES * 10.0)
+    })
+}
+
+/// The left eye's queries of one mesh or surface, in the order made, and the first not yet taken.
+#[derive(Default)]
+struct QueryIndex {
+    at: Vec<usize>,
+    start: usize,
+}
+
+/// The left queries looked at for one of the right eye's, from the first not yet taken: one not
+/// found among them is answered as seen.
+const QUERY_SCAN: usize = 64;
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn find_left_query(left: &[LeftQuery], cursor: usize, rows: &Rows, same: impl Fn(&LeftQuery) -> bool) -> Option<usize> {
+    let start = cursor.min(left.len());
+    (start..left.len()).chain(0..start).find(|&i| {
+        let query = &left[i];
+        if PROFILING {
+            SCAN_QUERIES.fetch_add(1, Relaxed);
+        }
+        !query.taken && same(query) && eye_matrix::close(&query.carried, rows, eye_matrix::AGREES * 10.0)
+    })
 }
 
 fn draw_locked(geometry: u64, shape: u64) -> bool {
@@ -1583,8 +1779,13 @@ fn draw_locked(geometry: u64, shape: u64) -> bool {
     if !state.live {
         return true;
     }
+    DRAWS_MADE.fetch_add(1, Relaxed);
     if !PROFILING {
-        return draw_in(state, geometry, shape);
+        let goes_ahead = draw_in(state, geometry, shape);
+        if goes_ahead {
+            motion_draw(state, geometry);
+        }
+        return goes_ahead;
     }
     let started = Instant::now();
     if matches!(state.profile.part, 2 | 4) {
@@ -1597,21 +1798,63 @@ fn draw_locked(geometry: u64, shape: u64) -> bool {
         }
     }
     let goes_ahead = draw_in(state, geometry, shape);
+    if goes_ahead {
+        motion_draw(state, geometry);
+    }
     state.profile.draws[state.profile.part] += 1;
     let now = Instant::now();
     state.profile.ours += now - started;
+    let part = state.profile.part;
+    state.profile.ours_by[part] += now - started;
     state.profile.last_draw = Some(now);
     goes_ahead
 }
 
-fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
-    if state.inspect.is_none() {
-        return draw_decided(state, geometry, shape);
+/// A draw going ahead of a program drawing for DLSS's motion ([`super::motion`]), into an eye
+/// framebuffer with the scene depth: drawn again into the motion's target after it.
+fn motion_draw(state: &State, geometry: u64) {
+    if !(1..=2).contains(&state.pass) || !super::motion::is_wanted() {
+        super::motion::pending(None);
+        return;
     }
-    state.last_path = "?";
-    let pass = state.pass;
-    let goes_ahead = draw_decided(state, geometry, shape);
-    inspected_draw(state, pass, geometry, shape, goes_ahead);
+    super::motion::pending(motion_of_draw(state, geometry));
+}
+
+fn motion_of_draw(state: &State, geometry: u64) -> Option<super::motion::Draw> {
+    let program = state.programs.get(&state.current)?;
+    let (kind, name) = (program.converted.motion?, program.converted.name);
+    let layers = state.layers.as_ref()?;
+    let framebuffer = state.draw_framebuffer;
+    let (stand, (depth, size)) = (layers.stand(framebuffer)?, layers.scene_depth(framebuffer)?);
+    let mapped = state.mapped(framebuffer);
+    let target = if Some(mapped) == stand.layered {
+        super::motion::Target::Both
+    } else if mapped == stand.layer[0] {
+        super::motion::Target::Eye(0)
+    } else if mapped == stand.layer[1] {
+        super::motion::Target::Eye(1)
+    } else {
+        return None;
+    };
+    Some(super::motion::Draw { program: state.current, name, kind, target, depth, size, geometry, bound: mapped })
+}
+
+fn draw_in(state: &mut State, geometry: u64, shape: u64) -> bool {
+    let current = state.current;
+    let goes_ahead = if state.inspect.is_none() {
+        draw_decided(state, geometry, shape)
+    } else {
+        state.last_path = "?";
+        let pass = state.pass;
+        let goes_ahead = draw_decided(state, geometry, shape);
+        inspected_draw(state, pass, geometry, shape, goes_ahead);
+        goes_ahead
+    };
+    match SAID.swap(SAID_NOTHING, Relaxed) {
+        SAID_SKIP => state.entry.checked(current, goes_ahead, state.last_path),
+        SAID_GO if !goes_ahead => *state.entry.left_to_draw.entry(state.last_path).or_default() += 1,
+        _ => {}
+    }
     goes_ahead
 }
 
@@ -1686,8 +1929,40 @@ fn bound_2d(unit: u32) -> u32 {
     u32::try_from(texture).unwrap_or(0)
 }
 
+/// The right eye's own draw of a program reading the self-shadow (a chair, ropes, a character's
+/// misfit part): its map units given the right eye's layer of the kept self-shadow. The engine's
+/// own map there is never drawn for the right eye (its pass drew into our layer), so it read stale
+/// texels: flickering neon over whatever the character's shadow falls on.
+fn right_self_shadow(state: &mut State, current: u32) {
+    let Some(view) = state.layers.as_ref().and_then(Layers::kept_right) else { return };
+    let units: Vec<u32> = state.programs.get(&current).map(|p| p.map_units.clone()).unwrap_or_default();
+    let Some(gl) = state.gl.as_ref() else { return };
+    for unit in units {
+        let bound = bound_2d(unit);
+        if bound == 0 || bound == view {
+            continue;
+        }
+        state.shadow_units.entry(unit).or_insert(bound);
+        // SAFETY: a plain bind of our view to the program's own self-shadow unit.
+        unsafe { (gl.bind_multi_texture)(GL_TEXTURE0 + unit, GL_TEXTURE_2D, view) };
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Relaxed) {
+            log!("single pass: the right eye's own draws reading the self-shadow given its layer of the kept one (unit {unit}, in place of texture {bound})");
+        }
+    }
+}
+
 /// The engine's textures bound again where the right eye's pass was given its depth's copy.
 fn depth_given_back(state: &mut State) {
+    let shadows: Vec<(u32, u32)> = state.shadow_units.drain().collect();
+    if let (Some(gl), Some(view)) = (state.gl.as_ref(), state.layers.as_ref().and_then(Layers::kept_right)) {
+        for (unit, texture) in shadows {
+            if bound_2d(unit) == view {
+                // SAFETY: a plain bind of the engine's own texture back to its unit.
+                unsafe { (gl.bind_multi_texture)(GL_TEXTURE0 + unit, GL_TEXTURE_2D, texture) };
+            }
+        }
+    }
     let units: Vec<(u32, u32)> = state.depth_units.drain().collect();
     state.depth_copied = false;
     let Some(gl) = state.gl.as_ref() else { return };
@@ -1722,6 +1997,7 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
         }
     }
     let stand = state.layers.as_ref().and_then(|l| l.stand(framebuffer));
+    let no_stand = stand.is_none();
     state.counts.stood_in += u64::from(stand.is_some());
     let mut stretch = stand.is_some() && !state.cut && (state.pass == 1 || state.pass == 2);
     if stretch && !(perspective && stand.is_some_and(|s| s.layered.is_some())) {
@@ -1734,6 +2010,14 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
         }
     }
     state.counts.in_stretch += u64::from(stretch);
+    if no_stand && state.layers.is_some() && matches!(state.pass, 1 | 2) {
+        if !state.cut && shadow_map_draw(state, framebuffer, geometry, rows) {
+            return false;
+        }
+        if state.cut && state.pass == 1 {
+            state.shadow_maps.drawn_over(framebuffer);
+        }
+    }
     let Some(rows) = rows else {
         state.last_path = "not converted";
         return true;
@@ -1754,14 +2038,22 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
     let Some(gl) = state.gl.as_ref() else { return true };
     let misfit = stretch && (state.misfits.misfits.contains(&current) || state.programs.get(&current).is_some_and(|p| p.converted.reads_screen) && screen_arrays.is_none());
     let own_projection = misfit || stretch && state.world_depth.zip(ratio).is_some_and(|(world, ratio)| (ratio - world).abs() > 1e-3 * world.abs().max(1e-6));
-    if PENDING.load(Relaxed) == PENDING_OPEN && stretch && state.pass == 2 && !own_projection && let Some(matrix) = state.matrix.as_ref() {
-        let matched = left_query(&mut state.left_queries, &mut state.query_cursor, matrix, &rows, geometry);
-        state.counts.queries_rows_only += u64::from(matched == QueryMatch::RowsOnly);
+    if PENDING.load(Relaxed) == PENDING_OPEN && stretch && state.pass == 2 && !own_projection && state.matrix.is_some() {
+        let matched = match find_indexed(&state.left_queries, state.queries_by_geometry.get_mut(&geometry), &rows) {
+            Some(i) => {
+                state.left_queries[i].taken = true;
+                QueryMatch::Same(state.left_queries[i].id)
+            }
+            None if checking && state.left_queries.iter().any(|q| !q.taken && q.geometry != geometry && eye_matrix::close(&q.carried, &rows, eye_matrix::AGREES * 10.0)) => QueryMatch::RowsOnly,
+            None => QueryMatch::None,
+        };
+        // Looked for on the checking frames only: counted for each frame they stand for.
+        state.counts.queries_rows_only += if matched == QueryMatch::RowsOnly { CHECK_EVERY } else { 0 };
         if let QueryMatch::Same(left) = matched {
             // Found: counted for the program's judgment too, or only the draws not found would be.
             if checking {
                 let name = state.programs.get(&current).map_or("?", |p| p.converted.name);
-                state.misfits.check(current, name, &rows, matrix);
+                state.misfits.check(current, name, &rows);
             }
             let right = PENDING_ID.load(Relaxed);
             QUERIES_SHARED.lock().unwrap_or_else(|e| e.into_inner()).insert(right, left);
@@ -1770,6 +2062,12 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
             state.last_path = "right: its query answered by the left eye's, not made";
             return false;
         }
+        // No left query of it: answered as seen, not made, and the draw skipped.
+        QUERIES_SHARED.lock().unwrap_or_else(|e| e.into_inner()).insert(PENDING_ID.load(Relaxed), VISIBLE);
+        PENDING.store(PENDING_SHARED, Relaxed);
+        QUERIES_VISIBLE.fetch_add(1, Relaxed);
+        state.last_path = "right: its query with no left one answered as seen, not made";
+        return false;
     }
     let program = state.programs.get_mut(&current).expect("looked up above");
     if own_projection {
@@ -1781,6 +2079,9 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
         state.last_path = if misfit { "each eye its own (a misfit)" } else { "each eye its own (its own depth projection)" };
         if state.pass == 2 {
             *state.own_by.entry(current).or_default() += 1;
+            if eye_maps.is_some() {
+                right_self_shadow(state, current);
+            }
         }
         return true;
     }
@@ -1789,8 +2090,8 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
             if state.left.len() < RECORDED {
                 state.left.push((current, rows));
             }
-            if checking {
-                state.misfits.left.entry(current).or_default().push(rows);
+            if checking && let Some(matrix) = state.matrix.as_ref() {
+                state.misfits.left.entry(current).or_default().push(eye_matrix::carry(matrix, &rows));
             }
             let Some(matrix) = state.matrix else {
                 set_switch(gl, program, false);
@@ -1828,10 +2129,17 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
             }
             state.counts.stereo += 1;
             state.last_path = "left: carried into the right eye";
-            state.carried.keep(current, geometry, shape, eye_matrix::carry(&matrix, &rows));
+            let surface = SURFACE_KEY.load(Relaxed);
+            let carried = eye_matrix::carry(&matrix, &rows);
+            state.carried.keep(current, geometry, shape, surface, carried);
             let query = ACTIVE_QUERY_ID.load(Relaxed);
             if query != 0 && state.left_queries.last().is_none_or(|q| q.id != query) {
-                state.left_queries.push(LeftQuery { id: query, rows, geometry, taken: false });
+                let at = state.left_queries.len();
+                state.left_queries.push(LeftQuery { id: query, carried, geometry, surface, taken: false });
+                state.queries_by_geometry.entry(geometry).or_default().at.push(at);
+                if surface != 0 {
+                    state.queries_by_surface.entry(surface).or_default().at.push(at);
+                }
             }
             true
         }
@@ -1839,9 +2147,9 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
             if state.right.len() < RECORDED {
                 state.right.push((current, rows));
             }
-            if checking && let Some(matrix) = state.matrix.as_ref() {
+            if checking && state.matrix.is_some() {
                 let name = state.programs.get(&current).map_or("?", |p| p.converted.name);
-                state.misfits.check(current, name, &rows, matrix);
+                state.misfits.check(current, name, &rows);
             }
             let program = state.programs.get_mut(&current).expect("looked up above");
             set_switch(gl, program, false);
@@ -1891,11 +2199,19 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
                     state.last_path = "right: moved between the passes, skipped";
                     return false;
                 }
+                if carried_prop(name) {
+                    // Drawn by the left eye's pass into both layers: the right eye's own copy
+                    // would read the virtual texture mid-update.
+                    state.last_path = "right: a virtual-textured prop, carried from the left eye's pass, skipped";
+                    return false;
+                }
                 state.counts.right_only_same_geometry += u64::from(nearest.is_some());
-                // Culled for the left eye: the right eye's pass draws it into its own layer.
+                // Not among the left eye's draws: skipped all the same, the left eye's pass culled
+                // for both eyes ([`super::cull`]); counted, for the log.
                 state.counts.right_only += 1;
                 *state.right_only_by.entry(current).or_default() += 1;
-                state.last_path = "right: not among the left eye's, drawn";
+                state.last_path = "right: not among the left eye's, skipped";
+                return false;
             } else {
                 state.last_path = "right: no eye matrix, drawn";
             }
@@ -1907,6 +2223,299 @@ fn draw_decided(state: &mut State, geometry: u64, shape: u64) -> bool {
             true
         }
     }
+}
+
+// ---- The engine's surface draws ----
+
+static SURFACE_DRAW: Original<SurfaceDrawFn> = Original::new();
+static SURFACE_SITE: Mutex<Option<Site<SurfaceDrawFn>>> = Mutex::new(None);
+/// The surface draw being made ([`surface_key`]); 0 outside one.
+static SURFACE_KEY: AtomicU64 = AtomicU64::new(0);
+/// What the surface draw being made said of the right eye's draw, for its GL draw to check.
+static SAID: AtomicU32 = AtomicU32::new(SAID_NOTHING);
+const SAID_NOTHING: u32 = 0;
+/// Not known before its GL draw: left to it.
+const SAID_GO: u32 = 1;
+/// Carried by the left eye's pass, made anyway for its GL draw to check ([`Entry`]).
+const SAID_SKIP: u32 = 2;
+/// Profiling the decisions: how many, their time and the skips' (ns), and the entries looked at.
+static DECISIONS: AtomicU64 = AtomicU64::new(0);
+static DECIDE_NS: AtomicU64 = AtomicU64::new(0);
+static SKIPPED_NS: AtomicU64 = AtomicU64::new(0);
+static SCAN_QUERIES: AtomicU64 = AtomicU64::new(0);
+static SCAN_SURFACES: AtomicU64 = AtomicU64::new(0);
+/// The checking frames' skips looked for among the left eye's draws, and those not found there.
+static NO_TWIN_CHECKED: AtomicU64 = AtomicU64::new(0);
+static NO_TWIN: AtomicU64 = AtomicU64::new(0);
+/// Skips agreeing with their GL draws' own decision before the surface draw skips any.
+const TRUSTED_AFTER: u64 = 2000;
+/// A program's wrong skips (its GL draw went ahead) that end its skips at the surface draw, and
+/// how many of its checked skips each may stand against.
+const WRONG_REFUSES: u64 = 3;
+const WRONG_SHARE: u64 = 200;
+/// Programs refused before the surface draw skips none.
+const REFUSED_OFF: usize = 12;
+
+/// The build's surface draw ([`crate::providers::engine::Build::surface_draw`]), hooked with the
+/// draws.
+pub fn surface_draw_site(site: Option<Site<SurfaceDrawFn>>) {
+    *SURFACE_SITE.locked() = site;
+}
+
+/// The right eye's draws skipped at the engine's surface draw, and how their check went: a skip
+/// made anyway and decided again at its GL draw agreed (skipped there too) or was wrong (drawn
+/// there: a surface the right eye would have missed).
+#[derive(Default)]
+struct Entry {
+    /// Checked enough against the GL draws' own decision to skip.
+    trusted: bool,
+    off: bool,
+    /// Skipped there (the engine's draw not made), since the last report.
+    skipped: u64,
+    /// Found carried.
+    candidates: u64,
+    agreed: u64,
+    wrong: u64,
+    by_program: HashMap<u32, (u64, u64)>,
+    wrong_paths: HashMap<&'static str, u64>,
+    refused: HashSet<u32>,
+    /// Left to their GL draw and skipped there, by why, since the last report.
+    left_to_draw: HashMap<&'static str, u64>,
+    /// The frames counted at the last report.
+    frames_at: u64,
+}
+
+impl Entry {
+    /// A checked skip's GL draw of `program`: `goes_ahead` or not, by `path`.
+    fn checked(&mut self, program: u32, goes_ahead: bool, path: &'static str) {
+        let (agreed, wrong) = self.by_program.entry(program).or_default();
+        if goes_ahead {
+            *wrong += 1;
+            self.wrong += 1;
+            *self.wrong_paths.entry(path).or_default() += 1;
+            if *wrong >= WRONG_REFUSES && *wrong * WRONG_SHARE > *agreed && self.refused.insert(program) {
+                log!("single pass: program {program}: its draws no longer skipped at the engine's surface draw: {wrong} of its checked skips went ahead at their GL draw ({path}; {agreed} agreed)");
+                if self.refused.len() > REFUSED_OFF && !self.off {
+                    self.off = true;
+                    log!("single pass: no draws skipped at the engine's surface draw from now on: {} programs refused", self.refused.len());
+                }
+            }
+            return;
+        }
+        *agreed += 1;
+        self.agreed += 1;
+        if !self.trusted && self.agreed >= TRUSTED_AFTER && self.wrong * 1000 <= self.agreed {
+            self.trusted = true;
+            log!(
+                "single pass: the right eye's carried draws skipped at the engine's surface draw from now on ({} checked against their GL draws, {} went ahead there)",
+                self.agreed,
+                self.wrong
+            );
+        }
+    }
+
+    fn report(&mut self, frames_on: u64, programs: &HashMap<u32, Program>) -> String {
+        let frames = frames_on.saturating_sub(self.frames_at).max(1) as f64;
+        self.frames_at = frames_on;
+        let cost = if PROFILING {
+            let take = |a: &AtomicU64| a.swap(0, Relaxed) as f64 / frames;
+            format!(
+                "; its decisions a frame: {:.0} taking {:.3} ms, the skips' own work {:.3} ms, left queries looked at {:.0}, carried surfaces looked at {:.0}",
+                take(&DECISIONS),
+                take(&DECIDE_NS) / 1e6,
+                take(&SKIPPED_NS) / 1e6,
+                take(&SCAN_QUERIES),
+                take(&SCAN_SURFACES)
+            ) + &format!(
+                "; on the checking frames, skips without a twin among the left eye's draws {} of {}",
+                NO_TWIN.swap(0, Relaxed),
+                NO_TWIN_CHECKED.swap(0, Relaxed)
+            )
+        } else {
+            String::new()
+        };
+        let name = |p: &u32| programs.get(p).map_or("?", |p| p.converted.name);
+        let mut wrong: Vec<_> = self.by_program.iter().filter(|(_, (_, w))| *w > 0).map(|(p, (a, w))| format!("{} ({p}) {w} of {}", name(p), a + w)).collect();
+        wrong.sort();
+        let mut left: Vec<_> = self.left_to_draw.iter().map(|(why, n)| (*n, *why)).collect();
+        left.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let left: Vec<_> = left.iter().take(8).map(|(n, why)| format!("{why} {:.1}", *n as f64 / frames)).collect();
+        let paths: Vec<_> = self.wrong_paths.iter().map(|(p, n)| format!("{p} {n}")).collect();
+        let text = format!(
+            "the right eye's draws skipped at the engine's surface draw ({}): {:.1} a frame; checked against their GL draws {}, {} of them went ahead there ({}; by {}); left to their GL draw and skipped there, a frame: {}",
+            if self.off { "off" } else { "on" },
+            self.skipped as f64 / frames,
+            self.agreed + self.wrong,
+            self.wrong,
+            wrong.join(", "),
+            paths.join(", "),
+            left.join(", ")
+        );
+        self.skipped = 0;
+        self.left_to_draw.clear();
+        let visible = format!("; the right eye's queries with no left one, answered as seen and not made, {:.1} a frame", QUERIES_VISIBLE.swap(0, Relaxed) as f64 / frames);
+        text + &cost + &visible
+    }
+}
+
+/// The key of a surface draw: the engine's geometry, vertex layout and flag (the same surface in
+/// both passes: its own geometry, not a copy made for each view).
+fn surface_key(geometry: usize, layout: usize, flag: u8) -> u64 {
+    (geometry as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (layout as u64).rotate_left(29) ^ u64::from(flag)
+}
+
+/// The engine's surface draw: skipped for a right eye's stretch draw the left eye's pass carried
+/// ([`surface_skips`]); otherwise made, its GL draw keyed by it.
+unsafe extern "system" fn surface_draw(geometry: usize, layout: usize, flag: u8) -> usize {
+    let flight = InFlight::enter();
+    let key = surface_key(geometry, layout, flag);
+    if surface_skips(key) {
+        return 0;
+    }
+    let outer = SURFACE_KEY.swap(key, Relaxed);
+    // SAFETY: forwards the game's own call.
+    let made = unsafe { SURFACE_DRAW.get(&flight)(geometry, layout, flag) };
+    SURFACE_KEY.store(outer, Relaxed);
+    // Made without a GL draw (too few indices): nothing to check.
+    SAID.store(SAID_NOTHING, Relaxed);
+    made
+}
+
+/// Whether the surface draw `key` is skipped: the right eye's stretch draw of a program the eye
+/// matrix carries, writing colour or depth, that the left eye's pass carried (the same surface,
+/// with the rows the matrix carried); in a query held back, the left eye's query of the same
+/// surface answers it. Until trusted ([`Entry`]), and for a share of them after, made anyway and
+/// checked at its GL draw.
+fn surface_skips(key: u64) -> bool {
+    SAID.store(SAID_NOTHING, Relaxed);
+    let mut guard = STATE.locked();
+    let Some(state) = guard.as_mut() else { return false };
+    if state.pass != 2 || state.cut || !state.live {
+        return false;
+    }
+    let started = PROFILING.then(Instant::now);
+    let decision = surface_decision(state, key);
+    if let Some(started) = started {
+        DECISIONS.fetch_add(1, Relaxed);
+        DECIDE_NS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+    }
+    let skips = match decision {
+        None => {
+            SAID.store(SAID_GO, Relaxed);
+            false
+        }
+        // Skipped at once, none made to be checked at its GL draw: the left eye's pass drew both
+        // eyes (RDRVR's).
+        Some(query) => {
+            state.entry.candidates += 1;
+            let at = PROFILING.then(Instant::now);
+            surface_skipped(state, query);
+            if let Some(at) = at {
+                SKIPPED_NS.fetch_add(at.elapsed().as_nanos() as u64, Relaxed);
+            }
+            true
+        }
+    };
+    if let Some(started) = started {
+        let part = state.profile.part;
+        let spent = started.elapsed();
+        state.profile.ours += spent;
+        state.profile.ours_by[part] += spent;
+        state.profile.draws[part] += u64::from(skips);
+    }
+    skips
+}
+
+/// [`surface_skips`]'s decision, changing nothing: skipped (with the index of the left eye's
+/// query answering a held-back one) or not known before its GL draw.
+fn surface_decision(state: &mut State, key: u64) -> Option<Option<usize>> {
+    if state.entry.off || state.inspect.is_some() || state.self_shadow_pending || !SHADOW_TRUSTED.load(Relaxed) {
+        return None;
+    }
+    let current = state.current;
+    if state.entry.refused.contains(&current) || state.misfits.misfits.contains(&current) {
+        return None;
+    }
+    let program = state.programs.get(&current)?;
+    let converted = &program.converted;
+    if converted.screen.is_some() || converted.reads_screen || converted.unproject.is_some() {
+        return None;
+    }
+    let rows = &program.rows;
+    if !rows[3][..3].iter().any(|v| v.abs() > 1e-6) {
+        return None;
+    }
+    state.layers.as_ref()?.stand(state.draw_framebuffer)?.layered?;
+    state.matrix.as_ref()?;
+    if let (Some(world), Some(ratio)) = (state.world_depth, depth_ratio(rows))
+        && (ratio - world).abs() > 1e-3 * world.abs().max(1e-6)
+    {
+        return None;
+    }
+    if PENDING.load(Relaxed) == PENDING_OPEN {
+        // A held-back query's first draw (most often a culling box, writing nothing): answered by
+        // the left eye's query of the same surface, the query is not made and the draw skipped,
+        // as at its GL draw; otherwise left to it.
+        // Without one, left to its GL draw, which looks by the mesh drawn (and answers it as seen
+        // when that finds none either).
+        return find_indexed(&state.left_queries, state.queries_by_surface.get_mut(&key), rows).map(Some);
+    }
+    // Writing neither colour nor depth: in a query not made, skipped; in one made (not held back),
+    // drawn, or it would count nothing.
+    if !Shadow::shadowed().any() {
+        return (PENDING.load(Relaxed) == PENDING_SHARED).then_some(None);
+    }
+    // Everything else of a program both eyes share is skipped (RDRVR's): the left eye's pass,
+    // culled for both eyes ([`super::cull`]), drew it into both. On the checking frames, whether
+    // the left eye's pass drew it is still looked for, for the log: a draw of the right eye's with
+    // no twin there is one the right eye now misses.
+    if PROFILING && state.live_frames % CHECK_EVERY == 0 {
+        NO_TWIN_CHECKED.fetch_add(1, Relaxed);
+        if !state.carried.found_surface(current, key, rows) {
+            NO_TWIN.fetch_add(1, Relaxed);
+        }
+    }
+    Some(None)
+}
+
+/// The right eye's surface draw skipped: counted as its GL draw's skip would be, the held-back
+/// query answered by the left eye's.
+fn surface_skipped(state: &mut State, query: Option<usize>) {
+    let current = state.current;
+    state.entry.skipped += 1;
+    let checking = state.live_frames % CHECK_EVERY == 0;
+    if let Some(i) = query {
+        let left = &mut state.left_queries[i];
+        left.taken = true;
+        state.query_cursor = i + 1;
+        state.counts.queries_shared += 1;
+        let answer = left.id;
+        QUERIES_SHARED.lock().unwrap_or_else(|e| e.into_inner()).insert(PENDING_ID.load(Relaxed), answer);
+        PENDING.store(PENDING_SHARED, Relaxed);
+        if checking
+            && let (Some(program), true) = (state.programs.get(&current), state.matrix.is_some())
+        {
+            let (rows, name) = (program.rows, program.converted.name);
+            state.misfits.check(current, name, &rows);
+        }
+        return;
+    }
+    let c = &mut state.counts;
+    c.draws += 1;
+    c.converted += 1;
+    c.perspective += 1;
+    c.stood_in += 1;
+    c.in_stretch += 1;
+    c.skipped += 1;
+    let Some(program) = state.programs.get(&current) else { return };
+    let (rows, name) = (program.rows, program.converted.name);
+    if state.right.len() < RECORDED {
+        state.right.push((current, rows));
+    }
+    if checking && state.matrix.is_some() {
+        state.misfits.check(current, name, &rows);
+    }
+    state.misfits.carried(current, name, true);
 }
 
 // ---- Inspected frames ----
@@ -1976,6 +2585,7 @@ fn inspect_frame(state: &mut State) {
         "Each line: pass, framebuffer, program, how it was drawn, depth projection ratio (world's in the header), GL state (depth test function, depth writes, polygon offset, blend, cull, the scissor while its test is on: \"opened\" when turned off for the right eye's copy), where the model's origin lands (NDC x y z), for the left eye's carried draws where their copy lands in the right eye, and for the right eye's own the farthest-apart of the left eye's carried copies of the same mesh. Draws of decals, particles and unconverted programs add, after bars: GL errors raised since the draw before, the framebuffer bound and its attachments, the stencil test, the colour mask and cull face, each sampler's unit and texture (ours: a layer's view or an array), and the fragment rows.".into(),
         format!("world depth ratio {:?}, eye matrix {:?}", state.world_depth, state.matrix),
     ];
+    super::motion::dump_into(capture.clone());
     state.inspect = Some(Inspect { folder: capture, frames: INSPECTED_FRAMES, lines });
 }
 
@@ -2212,7 +2822,16 @@ const PENDING_NONE: u32 = 0;
 const PENDING_OPEN: u32 = 1;
 const PENDING_SHARED: u32 = 2;
 const GL_SAMPLES_PASSED: u32 = 0x8914;
-/// The right eye's queries answered by the left eye's: right id to left id.
+/// The answer to one of the right eye's queries the left eye's pass made none for: seen. The right
+/// eye's pass draws nothing of its own in the stretch, so what its queries say decides only what it
+/// would draw there (skipped either way) and what it draws later itself: answered seen, nothing
+/// of that is left out.
+const VISIBLE: u32 = u32::MAX;
+/// The samples a query answered [`VISIBLE`] counts.
+const VISIBLE_SAMPLES: u64 = 65_536;
+/// The right eye's queries answered [`VISIBLE`], since the last report.
+static QUERIES_VISIBLE: AtomicU64 = AtomicU64::new(0);
+/// The right eye's queries answered by the left eye's: right id to left id (or [`VISIBLE`]).
 static QUERIES_SHARED: std::sync::LazyLock<Mutex<HashMap<u32, u32>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The held-back query begun as the engine began it.
@@ -2392,7 +3011,158 @@ fn clear_goes_ahead(mask: u32) -> bool {
         state.counts.clears_skipped += 1;
         return false;
     }
+    let stood_in = state.layers.as_ref().map(|l| l.stand(state.draw_framebuffer).is_some());
+    if stood_in == Some(false) && matches!(state.pass, 1 | 2) {
+        let framebuffer = state.draw_framebuffer;
+        if state.pass == 1 {
+            if state.cut {
+                state.shadow_maps.drawn_over(framebuffer);
+            }
+        } else if !state.cut {
+            let scissored = SHADOW.load(Relaxed) & SCISSOR_TEST != 0;
+            let known = SHADOW_TRUSTED.load(Relaxed) && (!scissored || state.scissor.is_some());
+            if known && state.shadow_maps.clear_skipped(framebuffer, if scissored { state.scissor } else { None }) {
+                return false;
+            }
+        }
+    }
     true
+}
+
+/// A shadow map: its framebuffer and rectangle (the scissor's within the viewport).
+type Region = (u32, [i32; 4]);
+
+/// How close the right eye's rows of a shadow map draw must be to the left eye's to be the same
+/// draw (a light's view, the same in both eyes to the float).
+const SHADOW_MAP_SAME: f64 = 1e-5;
+
+/// The shadow maps both eyes share. The engine draws each eye's shadow maps at the start of its
+/// pass, before its scene, into a framebuffer of no eye texture, one viewport a map (the sun's
+/// cascades). Most come out the same for both eyes: a light's view, not the eye's (the farthest
+/// cascade, fitted to each eye's view, is the exception). The left eye's maps are still there when
+/// the right eye's pass begins, its lighting done with them. So a map whose draws in the right
+/// eye's pass were all the left eye's last frame (the same geometry with the same rows, as many)
+/// is taken from the left eye's: the right eye's clear of it and its draws the same as the left
+/// eye's are skipped. A draw there not among the left eye's is drawn all the same (over the left
+/// eye's map, that frame), and the map is the right eye's own again from the next frame. A
+/// framebuffer drawn into by the left eye's pass after its scene (another light's map) is the
+/// right eye's own that frame.
+#[derive(Default)]
+struct ShadowMaps {
+    /// This frame's left-eye draws by map: geometry, rows (none: not converted), taken by the
+    /// right eye's.
+    left: HashMap<Region, Vec<(u64, Option<Rows>, bool)>>,
+    /// Framebuffers drawn into or cleared by the left eye's pass after its scene, this frame.
+    spoiled: HashSet<u32>,
+    /// This frame's right-eye draws by map: made, and the same as one of the left eye's.
+    right: HashMap<Region, (usize, usize)>,
+    /// The maps taken from the left eye's this frame, and the maps the right eye drew last frame.
+    shared: HashSet<Region>,
+    last: HashSet<Region>,
+    /// Counts since the last report.
+    draws_skipped: u64,
+    clears_skipped: u64,
+    drawn_in_shared: u64,
+    maps: u64,
+    maps_shared: u64,
+}
+
+impl ShadowMaps {
+    fn drawn_over(&mut self, framebuffer: u32) {
+        if self.left.keys().any(|r| r.0 == framebuffer) {
+            self.spoiled.insert(framebuffer);
+        }
+    }
+
+    fn takes(&self, region: &Region) -> bool {
+        self.shared.contains(region) && !self.spoiled.contains(&region.0)
+    }
+
+    /// Whether the right eye's clear of `framebuffer` (within `area`; all of it with none) is
+    /// skipped: every map there it clears is taken from the left eye's.
+    fn clear_skipped(&mut self, framebuffer: u32, area: Option<[i32; 4]>) -> bool {
+        let overlaps = |v: &[i32; 4], a: &[i32; 4]| v[0] < a[0] + a[2] && a[0] < v[0] + v[2] && v[1] < a[1] + a[3] && a[1] < v[1] + v[3];
+        let inside = |v: &[i32; 4], a: &[i32; 4]| v[0] >= a[0] && v[1] >= a[1] && v[0] + v[2] <= a[0] + a[2] && v[1] + v[3] <= a[1] + a[3];
+        let mut cleared = self.last.iter().filter(|r| r.0 == framebuffer && area.is_none_or(|a| overlaps(&r.1, &a))).peekable();
+        if cleared.peek().is_none() {
+            return false;
+        }
+        let skipped = cleared.all(|r| self.takes(r) && area.is_none_or(|a| inside(&r.1, &a)));
+        self.clears_skipped += u64::from(skipped);
+        skipped
+    }
+
+    fn end_frame(&mut self) {
+        let left = std::mem::take(&mut self.left);
+        let right = std::mem::take(&mut self.right);
+        self.spoiled.clear();
+        self.shared = right
+            .iter()
+            .filter(|&(region, &(made, same))| made > 0 && made == same && left.get(region).is_some_and(|l| l.len() == made))
+            .map(|(region, _)| *region)
+            .collect();
+        self.last = right.into_keys().collect();
+        self.maps += self.last.len() as u64;
+        self.maps_shared += self.shared.len() as u64;
+    }
+
+    fn report(&mut self, frames: f64) -> String {
+        let take = |n: &mut u64| std::mem::take(n) as f64 / frames;
+        format!(
+            "the shadow maps: {:.1} of the right eye's {:.1} a frame taken from the left eye's pass; the right eye's draws skipped there {:.1} a frame, clears {:.1}; draws there not the left eye's, drawn all the same {:.2}",
+            take(&mut self.maps_shared),
+            take(&mut self.maps),
+            take(&mut self.draws_skipped),
+            take(&mut self.clears_skipped),
+            take(&mut self.drawn_in_shared)
+        )
+    }
+}
+
+/// A draw before the pass's scene into a framebuffer of no eye texture ([`ShadowMaps`]): whether
+/// it is skipped.
+fn shadow_map_draw(state: &mut State, framebuffer: u32, geometry: u64, rows: Option<Rows>) -> bool {
+    // The maps share one viewport (the whole atlas), each its own scissor rectangle.
+    let viewport = state.viewport;
+    let scissored = SHADOW_TRUSTED.load(Relaxed) && SHADOW.load(Relaxed) & SCISSOR_TEST != 0;
+    let area = match state.scissor.filter(|_| scissored) {
+        Some(s) => {
+            let (x0, y0) = (s[0].max(viewport[0]), s[1].max(viewport[1]));
+            let (x1, y1) = ((s[0] + s[2]).min(viewport[0] + viewport[2]), (s[1] + s[3]).min(viewport[1] + viewport[3]));
+            [x0, y0, (x1 - x0).max(0), (y1 - y0).max(0)]
+        }
+        None => viewport,
+    };
+    let region = (framebuffer, area);
+    let maps = &mut state.shadow_maps;
+    match state.pass {
+        1 => {
+            maps.left.entry(region).or_default().push((geometry, rows, false));
+            false
+        }
+        2 => {
+            let found = rows.and_then(|rows| {
+                let left = maps.left.get_mut(&region)?;
+                let found = left.iter_mut().find(|(g, r, taken)| !*taken && *g == geometry && r.is_some_and(|r| eye_matrix::close(&r, &rows, SHADOW_MAP_SAME)))?;
+                found.2 = true;
+                Some(())
+            });
+            let entry = maps.right.entry(region).or_default();
+            entry.0 += 1;
+            entry.1 += usize::from(found.is_some());
+            if !maps.takes(&region) {
+                return false;
+            }
+            if found.is_some() {
+                maps.draws_skipped += 1;
+                state.last_path = "right: a shadow map draw the same as the left eye's, skipped";
+                return true;
+            }
+            maps.drawn_in_shared += 1;
+            false
+        }
+        _ => false,
+    }
 }
 
 // ---- The trace ----
@@ -2628,23 +3398,51 @@ timed_detour!(get_integer_v, GET_INTEGER_V, 9, (pname: u32, out: *mut c_void));
 timed_detour!(get_boolean_v, GET_BOOLEAN_V, 10, (pname: u32, out: *mut c_void));
 timed_detour!(get_float_v, GET_FLOAT_V, 11, (pname: u32, out: *mut c_void));
 timed_detour!(get_tex_image, GET_TEX_IMAGE, 12, (target: u32, level: i32, format: u32, kind: u32, out: *mut c_void));
+/// A query answered [`VISIBLE`]: its result written for `pname` (none for another), as 64 bits
+/// with `wide`.
+fn answer_visible(pname: u32, out: *mut c_void, wide: bool) {
+    const GL_QUERY_RESULT: u32 = 0x8866;
+    const GL_QUERY_RESULT_AVAILABLE: u32 = 0x8867;
+    const GL_QUERY_RESULT_NO_WAIT: u32 = 0x9194;
+    let value = match pname {
+        GL_QUERY_RESULT | GL_QUERY_RESULT_NO_WAIT => VISIBLE_SAMPLES,
+        GL_QUERY_RESULT_AVAILABLE => 1,
+        _ => return,
+    };
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: the engine's result, as wide as the call it made.
+    unsafe {
+        if wide {
+            out.cast::<u64>().write_unaligned(value);
+        } else {
+            out.cast::<u32>().write_unaligned(value as u32);
+        }
+    }
+}
+
 macro_rules! query_detour {
-    ($name:ident, $original:ident, $index:expr) => {
+    ($name:ident, $original:ident, $index:expr, $wide:expr) => {
         unsafe extern "system" fn $name(id: u32, pname: u32, out: *mut c_void) {
             let flight = InFlight::enter();
             let id = answering(id);
+            if id == VISIBLE {
+                answer_visible(pname, out, $wide);
+                return;
+            }
             // SAFETY: forwards the game's own call (for the query answering it).
             timed($index, || unsafe { $original.get(&flight)(id, pname, out) })
         }
     };
 }
 
-query_detour!(get_query_object_uiv, GET_QUERY_OBJECT_UIV, 13);
-query_detour!(get_query_object_ui64v, GET_QUERY_OBJECT_UI64V, 14);
-query_detour!(get_query_object_iv, GET_QUERY_OBJECT_IV, 15);
-query_detour!(get_query_object_uiv_arb, GET_QUERY_OBJECT_UIV_ARB, 16);
-query_detour!(get_query_object_iv_arb, GET_QUERY_OBJECT_IV_ARB, 17);
-query_detour!(get_query_object_i64v, GET_QUERY_OBJECT_I64V, 18);
+query_detour!(get_query_object_uiv, GET_QUERY_OBJECT_UIV, 13, false);
+query_detour!(get_query_object_ui64v, GET_QUERY_OBJECT_UI64V, 14, true);
+query_detour!(get_query_object_iv, GET_QUERY_OBJECT_IV, 15, false);
+query_detour!(get_query_object_uiv_arb, GET_QUERY_OBJECT_UIV_ARB, 16, false);
+query_detour!(get_query_object_iv_arb, GET_QUERY_OBJECT_IV_ARB, 17, false);
+query_detour!(get_query_object_i64v, GET_QUERY_OBJECT_I64V, 18, true);
 
 unsafe extern "system" fn active_texture(unit: u32) {
     let flight = InFlight::enter();
@@ -2927,6 +3725,52 @@ unsafe extern "system" fn bind_textures(first: u32, count: i32, textures: *const
     unsafe { BIND_TEXTURES.get(&flight)(first, count, pointer) }
 }
 
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16;
+    fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+}
+
+/// The engine's code issuing the right eye's stretch draws: each draw's three callers (offsets into
+/// the game's executable, from the draw call out), with how many went ahead and how many were
+/// skipped. Where the right eye's draws come from is where its whole per-draw work can be cut
+/// (RDRVR's lesson: skipping the API calls leaves the engine's own work for them).
+static CALLERS: Mutex<Option<HashMap<[usize; 3], (u64, u64)>>> = Mutex::new(None);
+
+fn census(goes_ahead: bool) {
+    if PROFILE_PART.load(Relaxed) != 3 {
+        return;
+    }
+    let mut frames = [std::ptr::null_mut::<c_void>(); 4];
+    // SAFETY: the calling thread's own return addresses, into a local array of their count.
+    let got = unsafe { RtlCaptureStackBackTrace(1, 4, frames.as_mut_ptr(), std::ptr::null_mut()) } as usize;
+    // SAFETY: the process's own executable, no reference taken.
+    let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
+    let mut key = [0usize; 3];
+    for (k, frame) in key.iter_mut().zip(frames.iter().take(got.min(3))) {
+        *k = (*frame as usize).wrapping_sub(base);
+    }
+    let mut callers = CALLERS.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = callers.get_or_insert_with(HashMap::new).entry(key).or_default();
+    if goes_ahead {
+        entry.0 += 1;
+    } else {
+        entry.1 += 1;
+    }
+}
+
+/// The census's most frequent callers since the last report, per frame.
+fn callers_report(frames: f64) -> String {
+    let taken = CALLERS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut rows: Vec<_> = taken.into_iter().collect();
+    rows.sort_by(|a, b| (b.1.0 + b.1.1).cmp(&(a.1.0 + a.1.1)));
+    rows.iter()
+        .take(12)
+        .map(|(k, (drawn, skipped))| format!("{:#x}<{:#x}<{:#x} drawn {:.1} skipped {:.1}", k[0], k[1], k[2], *drawn as f64 / frames, *skipped as f64 / frames))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 macro_rules! draw_detour {
     ($name:ident, $original:ident, $type:ty, ($($arg:ident: $ty:ty),*), [$($counted:ident),*]) => {
         unsafe extern "system" fn $name($($arg: $ty),*) {
@@ -2938,10 +3782,28 @@ macro_rules! draw_detour {
             $(geometry = (geometry ^ $arg as usize as u64).wrapping_mul(0x0000_0100_0000_01b3);)*
             let mut shape = call;
             $(shape = (shape ^ $counted as usize as u64).wrapping_mul(0x0000_0100_0000_01b3);)*
-            if draw(geometry, shape) {
+            let goes_ahead = draw(geometry, shape);
+            if PROFILING {
+                census(goes_ahead);
+            }
+            if goes_ahead {
                 super::pieces::before_draw();
+                let started = PROFILING.then(Instant::now);
                 // SAFETY: forwards the game's own call.
                 unsafe { $original.get(&flight)($($arg),*) }
+                let drawn = PROFILING.then(Instant::now);
+                let mut redrawn = false;
+                // SAFETY: the game's own call again, for the motion (our target bound).
+                super::motion::after_draw(|| {
+                    redrawn = true;
+                    unsafe { $original.get(&flight)($($arg),*) }
+                });
+                if let (Some(started), Some(drawn)) = (started, drawn) {
+                    let part = PROFILE_PART.load(Relaxed).min(4);
+                    DRIVER_NS[part].fetch_add((drawn - started).as_nanos() as u64, Relaxed);
+                    MOTION_NS[part].fetch_add(drawn.elapsed().as_nanos() as u64, Relaxed);
+                    MOTION_DRAWS[part].fetch_add(u64::from(redrawn), Relaxed);
+                }
             }
             close_scissor(&flight);
         }
@@ -2988,14 +3850,14 @@ mod tests {
     #[test]
     fn a_mesh_streamed_at_another_offset_is_found_by_shape_once() {
         let mut carried = Carried::default();
-        carried.keep(7, 100, 5, rows(0.2));
+        carried.keep(7, 100, 5, 0, rows(0.2));
         assert_eq!(carried.find(7, 100, 5, &rows(0.2)), Some(Found::Geometry));
-        carried.keep(7, 200, 9, rows(0.4));
+        carried.keep(7, 200, 9, 0, rows(0.4));
         // The same shape at another offset: found once, as the left eye's draw stands for one.
         assert_eq!(carried.find(7, 201, 9, &rows(0.4)), Some(Found::Shape));
         assert_eq!(carried.find(7, 202, 9, &rows(0.4)), None);
         // Another place, or another program: not found.
-        carried.keep(7, 300, 11, rows(0.4));
+        carried.keep(7, 300, 11, 0, rows(0.4));
         assert_eq!(carried.find(7, 301, 11, &rows(0.9)), None);
         assert_eq!(carried.find(8, 301, 11, &rows(0.4)), None);
     }
@@ -3003,7 +3865,7 @@ mod tests {
     #[test]
     fn a_mesh_moved_a_little_between_the_passes_is_near_and_a_repeat_elsewhere_is_not() {
         let mut carried = Carried::default();
-        carried.keep(7, 100, 5, rows(0.20));
+        carried.keep(7, 100, 5, 0, rows(0.20));
         // Swayed between the passes: the same geometry, rows a little apart.
         let near = carried.nearest(7, 100, &rows(0.205)).unwrap();
         assert!(near > eye_matrix::AGREES * 10.0 && near <= MOVED_BETWEEN, "{near}");
@@ -3022,14 +3884,14 @@ mod query_tests {
     #[test]
     fn a_right_query_is_answered_only_by_the_left_query_of_the_same_box() {
         // Three world boxes sharing the view's rows, each its own geometry.
-        let mut left: Vec<LeftQuery> = [(10, 1), (11, 2), (12, 3)].map(|(id, geometry)| LeftQuery { id, rows: IDENTITY, geometry, taken: false }).to_vec();
+        let mut left: Vec<LeftQuery> = [(10, 1), (11, 2), (12, 3)].map(|(id, geometry)| LeftQuery { id, carried: IDENTITY, geometry, surface: 0, taken: false }).to_vec();
         let mut cursor = 0;
         // The right eye's pass skips box 1 (culled for it): box 2 is answered by box 2's query.
-        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, &IDENTITY, 2), QueryMatch::Same(11));
-        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, &IDENTITY, 3), QueryMatch::Same(12));
+        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, 2, true), QueryMatch::Same(11));
+        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, 3, true), QueryMatch::Same(12));
         // A box the left eye's pass made no query for: rows alike, not answered.
-        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, &IDENTITY, 4), QueryMatch::RowsOnly);
+        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, 4, true), QueryMatch::RowsOnly);
         // Each left query answers once.
-        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, &IDENTITY, 2), QueryMatch::RowsOnly);
+        assert_eq!(left_query(&mut left, &mut cursor, &IDENTITY, 2, true), QueryMatch::RowsOnly);
     }
 }
